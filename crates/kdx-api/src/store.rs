@@ -454,6 +454,22 @@ impl View {
         Ok(ready && self.sender_index)
     }
 
+    /// `(user, coinbase)` rows stored for `(kind, entity)` on `chain` or all chains, or `None`
+    /// when the stored counts are not ready (PR #48; `kdx_hot::rowcount`).
+    pub fn row_count(
+        &self,
+        kind: kdx_decode::rowcount::CountKind,
+        entity: u64,
+        chain: Option<u8>,
+    ) -> ApiResult<Option<(u64, u64)>> {
+        if !kdx_hot::rowcount::ready(&self.txn)? {
+            return Ok(None);
+        }
+        Ok(Some(kdx_hot::rowcount::sum(
+            &self.txn, kind, entity, chain,
+        )?))
+    }
+
     pub fn check_deadline(&self) -> ApiResult<()> {
         if Instant::now() >= self.deadline {
             Err(ApiError::Deadline)

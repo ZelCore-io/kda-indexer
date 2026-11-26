@@ -3,9 +3,9 @@
 kda-indexer stores the mainnet history in about a tenth of chainweb-data's disk, answers most
 REST routes several times faster, and matches the node where chainweb-data does not. It is
 slower on the slowest `/txs/search` requests. On GraphQL, the account Transactions and Transfers
-tabs of an explorer take about 2.5 s on kda-indexer today, because of its own `totalCount` walk;
-a bounded count (default 200 ms) is fixed, not released yet. The stock GraphQL indexer's
-times are not measured yet. See [explorer.md](explorer.md#speed). Every slower row is listed below with what is known about the reason.
+tabs of an explorer took about 2.5 s on kda-indexer, because of its own `totalCount` walk;
+`totalCount` is now exact, as stock's, and its new times are not measured yet. The stock
+GraphQL indexer's times are not measured yet. See [explorer.md](explorer.md#speed). Every slower row is listed below with what is known about the reason.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
 validation is in progress (it ends 2026-11-19 17:05Z); not yet serving production traffic.
@@ -260,9 +260,11 @@ The G4 replay of real traffic (below) met most of these classes again; its
   lists the node's order (`graphql-r75-single-block-cut`). On the first page of a block larger
   than the page, stock held other rows than ours in 51 records (G4 class 7, see
   [graphql.md](graphql.md#schema), Row order); the rest of those lists was not compared.
-- GraphQL `totalCount` above 10,000 answers 10,000 (`graphql-totalcount-cap`); a count that ran out
-  of its deadline is a lower bound flagged in `extensions.totalCountLowerBound`
-  (`graphql-r58-count-lower-bound`).
+- GraphQL `totalCount` is exact, as stock's, with no cap (the `graphql-totalcount-cap` and
+  `graphql-r58-count-lower-bound` rules are retired). A count the 5 s deadline cuts answers
+  `COUNT_TIMEOUT` at the field where stock answers a number; that happens only on decoding
+  lists with tens of thousands of rows or more that the stored per-key counts do not hold
+  (height, depth and row filters; [graphql.md](graphql.md#transactions-events-and-transfers), `totalCount`).
 - `Transfer.orderIndex` is the TRANSFER event's index in the transaction
   (`graphql-h8-transfer-order-index`).
 - `creationTime` has whole seconds, as the node's command; stock adds a fraction

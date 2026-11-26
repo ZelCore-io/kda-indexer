@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kdx_api::{Api, ApiSettings, Store, TipWatch};
 use kdx_decode::{decode_block, index_block, DecodedBlock, IndexedBlock, VerifyReport};
@@ -52,6 +52,8 @@ enum Shape {
     /// One `coin.NOTE` event whose only param is Carol's name: not a principal and not a
     /// transfer side, so the tx has no `acct` posting of Carol's (audit F-27).
     Note,
+    /// One coin transfer from Alice to herself (only in a reorg fork, never in [`BLOCKS`]).
+    SelfXfer,
 }
 
 /// The fixture's blocks: `(chain, height, user txs)`. Heights below [`FRONTIER`] are frozen.
@@ -103,6 +105,7 @@ fn events(s: Shape) -> Vec<Value> {
         ],
         Shape::One => vec![coin(json!([ALICE, BOB, 1.5]))],
         Shape::Note => vec![ev(None, "coin", "NOTE", json!([CAROL]))],
+        Shape::SelfXfer => vec![coin(json!([ALICE, ALICE, 3.0]))],
     }
 }
 
@@ -773,7 +776,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
         want(|s| match s {
             Shape::Many => &[0, 1, 3, 4, 5],
             Shape::Nft => &[0, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::SelfXfer => &[0],
             Shape::Note => &[],
         })
     );
@@ -789,7 +792,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
         want(|s| match s {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::SelfXfer => &[0],
             Shape::Note => &[],
         })
     );
@@ -1010,221 +1013,172 @@ async fn crafted_well_formed_cursors_answer_at_most_a_page() {
     );
 }
 
-/// The count budget (`count_budget`): a `totalCount` walk that runs out of it answers the
-/// rows counted so far, flagged in the response `extensions`; one that finishes in time is
-/// exact and unflagged.
-mod count_budget {
+/// `totalCount` is exact, as stock's (GQ-10, owner ruling 2026-11-26): no 10,000 cap and no
+/// count budget. It runs to the request deadline; a count the deadline cuts answers a
+/// `COUNT_TIMEOUT` error at the field, never a number.
+mod exact_count {
     use super::*;
 
-    const QUERIES: [&str; 2] = [
-        "{ transfers(accountName: \"k:alice\", first: 1) { totalCount } }",
-        "{ transactions(accountName: \"k:alice\", first: 1) { totalCount } }",
+    /// Lists whose count is checked against their full walk on the long fixture: the account
+    /// lists the old budget cut, with the key filters (chain, heights) and row rules.
+    const LISTS: [&str; 8] = [
+        "transfers(accountName: \"k:alice\", ARGS)",
+        "transfers(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+        "transfers(accountName: \"k:alice\", chainId: \"0\", ARGS)",
+        "transactions(accountName: \"k:alice\", ARGS)",
+        "transactions(accountName: \"k:alice\", minHeight: 100, maxHeight: 5000, ARGS)",
+        "transactions(accountName: \"k:alice\", isCoinbase: true, ARGS)",
+        "transactionsByPublicKey(publicKey: \"alice-key\", ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)",
     ];
 
-    async fn total(s: &KdxSchema, q: &str) -> (i64, bool) {
-        let r = s.execute(q).await;
-        assert!(r.errors.is_empty(), "{q}: {:?}", r.errors);
-        let d = serde_json::to_value(&r.data).unwrap();
-        let n = d.as_object().unwrap().values().next().unwrap()["totalCount"]
-            .as_i64()
-            .unwrap();
-        (n, r.extensions.contains_key("totalCountLowerBound"))
+    fn field(l: &str) -> &str {
+        &l[..l.find('(').unwrap()]
     }
 
-    /// An account with a few postings is counted exactly under the default budget, with no flag.
-    #[tokio::test]
-    async fn a_small_account_is_counted_exactly_and_unflagged() {
-        let fx = fixture();
-        for q in QUERIES {
-            let (n, flagged) = total(&fx.schema, q).await;
-            assert!(n > 1, "{q}: the fixture account has several rows");
-            assert!(!flagged, "{q}");
-        }
+    async fn total(s: &KdxSchema, l: &str) -> i64 {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        run(s, &q).await[field(l)]["totalCount"].as_i64().unwrap()
     }
 
-    /// A budget that is spent before the walk reads a key stops it at once: a flagged lower
-    /// bound that never exceeds the true count (the page itself is still served). A sender
-    /// list read from the sender index (FIX-2) is a key-only walk that reads the clock every
-    /// 64 keys, so the fixture's few keys are counted exactly even with a spent budget.
-    #[tokio::test]
-    async fn a_spent_budget_answers_a_flagged_lower_bound() {
-        let exact = fixture();
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        let (full, _) = total(&exact.schema, QUERIES[1]).await;
-        assert_eq!(total(&cut.schema, QUERIES[1]).await, (full, false));
-        for q in &QUERIES[..1] {
-            let (full, _) = total(&exact.schema, q).await;
-            let (n, flagged) = total(&cut.schema, q).await;
-            assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
-            assert!(
-                (0..=full).contains(&n),
-                "{q}: {n} is a lower bound of {full}"
+    /// Rows of the full walk of `l`, pages of 1,000.
+    async fn walk(s: &KdxSchema, l: &str) -> i64 {
+        let (mut n, mut after) = (0i64, None::<String>);
+        loop {
+            let args = match &after {
+                None => "first: 1000".to_string(),
+                Some(c) => format!("first: 1000, after: \"{c}\""),
+            };
+            let q = format!(
+                "{{ {} {{ pageInfo {{ hasNextPage endCursor }} edges {{ cursor }} }} }}",
+                l.replace("ARGS", &args)
             );
-            assert!(n < full, "{q}: nothing is counted past a spent budget");
+            let v = run(s, &q).await;
+            let c = &v[field(l)];
+            n += c["edges"].as_array().unwrap().len() as i64;
+            if c["pageInfo"]["hasNextPage"] != true {
+                return n;
+            }
+            after = c["pageInfo"]["endCursor"].as_str().map(str::to_owned);
         }
-        let page = run(
-            &cut.schema,
-            "{ transfers(accountName: \"k:alice\", first: 2) { totalCount edges { cursor } } }",
-        )
-        .await;
-        assert_eq!(page["transfers"]["edges"].as_array().unwrap().len(), 2);
     }
 
-    /// FIX-2 fix 6: the old decode path (`sender_index = false`, or a store add-index has not
-    /// finished) stays live, and there a sender list decodes every record of the account's
-    /// `acct` list: a spent budget answers a flagged lower bound below the true count.
+    /// Above the old 10,000 cap the count is the true one: the long account's transfers and
+    /// sends are counted in full, and each equals its full walk.
     #[tokio::test]
-    async fn a_spent_budget_cuts_the_old_sender_path() {
-        let exact = fixture();
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        let q = QUERIES[1];
-        // The sender index answers the same spent-budget count exactly (see above) ...
-        let (full, _) = total(&exact.schema, q).await;
-        assert_eq!(total(&cut.schema, q).await, (full, false));
-        // ... and the old path, switched on for both stores, is cut.
-        for fx in [&exact, &cut] {
-            fx.store.set_sender_index(false);
+    async fn a_count_above_ten_thousand_is_exact() {
+        let fx = fixture_big(GraphqlSettings::default(), 10_050);
+        for l in &LISTS[..2] {
+            let n = total(&fx.schema, l).await;
+            assert!(n > 10_000, "{l}: {n} is above the old cap");
+            assert_eq!(n, walk(&fx.schema, l).await, "{l}");
         }
-        let (full, flagged) = total(&exact.schema, q).await;
+    }
+
+    /// Every list's count equals the rows its full walk lists, filters included, on a long
+    /// account (thousands of hot txs beside the frozen ranges).
+    #[tokio::test]
+    async fn the_count_equals_the_full_walk_with_filters() {
+        let fx = fixture_big(GraphqlSettings::default(), 3_000);
+        for l in LISTS {
+            let n = total(&fx.schema, l).await;
+            assert!(n > 0, "{l}: the fixture list is not empty");
+            assert_eq!(n, walk(&fx.schema, l).await, "{l}");
+        }
+    }
+
+    /// After a reorg rolls blocks back (and other blocks take their place) every count is
+    /// still the length of its full walk, and it moved with the rollback.
+    #[tokio::test]
+    async fn the_count_follows_a_reorg_rollback() {
+        let fx = fixture_big(GraphqlSettings::default(), 400);
+        let before = total(&fx.schema, LISTS[0]).await;
+        let mut t = fx.store.hot.rw().unwrap();
+        let undone = kdx_hot::tail::unwind_to(&mut t, 0, 300).unwrap();
+        assert!(undone > 0);
+        let mut dict = HotDict::load(&t).unwrap();
+        // The new fork: half as many blocks, each with a `Many` tx (five transfers).
+        for h in 301..301 + undone / 2 {
+            let (b, _) = decoded(0, h, &[Shape::Many]);
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        }
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        let after = total(&fx.schema, LISTS[0]).await;
+        assert_ne!(
+            after, before,
+            "the rollback changed the account's transfers"
+        );
+        for l in LISTS {
+            assert_eq!(total(&fx.schema, l).await, walk(&fx.schema, l).await, "{l}");
+        }
+    }
+
+    /// A count the deadline cuts is a `COUNT_TIMEOUT` error at `totalCount`, never a number
+    /// and never a response flag. The same count with time is exact.
+    #[tokio::test]
+    async fn a_count_cut_by_the_deadline_is_an_error() {
+        let fx = fixture_big(GraphqlSettings::default(), 2_000);
+        for l in LISTS {
+            let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+            let req = async_graphql::Request::new(q.clone()).data(kdx_graphql::ReqCtx {
+                deadline: std::time::Instant::now(),
+            });
+            let r = fx.schema.execute(req).await;
+            assert!(!r.errors.is_empty(), "{q}: a cut count must fail");
+            let codes: Vec<String> = r
+                .errors
+                .iter()
+                .filter_map(|e| e.extensions.as_ref()?.get("code").map(|c| c.to_string()))
+                .collect();
+            assert!(
+                codes
+                    .iter()
+                    .all(|c| c.contains("COUNT_TIMEOUT") || c.contains("TIMEOUT")),
+                "{q}: {codes:?}"
+            );
+            let d = serde_json::to_value(&r.data).unwrap();
+            assert!(
+                d.get(field(l))
+                    .is_none_or(|c| c.is_null() || c["totalCount"].is_null()),
+                "{q}: no number is answered: {d}"
+            );
+            assert!(r.extensions.is_empty(), "{q}: {:?}", r.extensions);
+        }
+        // A spent deadline on a list with a page still serves no partial count.
+        let q = "{ transfers(accountName: \"k:alice\", first: 2) { totalCount edges { cursor } } }";
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: std::time::Instant::now(),
+        });
+        let r = fx.schema.execute(req).await;
+        assert!(!r.errors.is_empty());
+        let d = serde_json::to_value(&r.data).unwrap();
         assert!(
-            full > 1 && !flagged,
-            "{q}: exact on the old path with a budget"
+            d["transfers"].is_null() || d["transfers"]["totalCount"].is_null(),
+            "{d}"
         );
-        let (n, flagged) = total(&cut.schema, q).await;
-        assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
-        assert!(n < full, "{q}: {n} is below {full} past a spent budget");
     }
 
-    /// The budget bounds an account's walk only: an event-name or public-key count with a spent
-    /// budget is exact and unflagged, as before.
-    #[tokio::test]
-    async fn a_non_account_count_ignores_the_budget() {
-        let exact = fixture();
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        for q in [
-            "{ events(qualifiedEventName: \"coin.TRANSFER\", first: 1) { totalCount } }".to_string(),
-            format!(
-                "{{ transactionsByPublicKey(publicKey: \"{ALICE_KEY}\", first: 1) {{ totalCount }} }}"
-            ),
-        ] {
-            let (full, _) = total(&exact.schema, &q).await;
-            let (n, flagged) = total(&cut.schema, &q).await;
-            assert!(full > 1, "{q}: the fixture has several rows");
-            assert_eq!((n, flagged), (full, false), "{q}");
-        }
-    }
-
-    /// A cut count is never below the edges served in the same response.
-    #[tokio::test]
-    async fn a_cut_count_covers_the_edges_served() {
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        for field in ["transfers", "transactions"] {
-            let d = run(
-                &cut.schema,
-                &format!(
-                    "{{ {field}(accountName: \"k:alice\", first: 3) {{ totalCount edges {{ cursor }} }} }}"
-                ),
-            )
-            .await;
-            let edges = d[field]["edges"].as_array().unwrap().len() as i64;
-            let n = d[field]["totalCount"].as_i64().unwrap();
-            assert!(edges > 1, "{field}: several edges are served");
-            assert!(n >= edges, "{field}: totalCount {n} < {edges} edges served");
-        }
-    }
-
-    /// A walk cut partway answers a count above zero and below the true one, flagged. The
-    /// account has thousands of postings and the budget is a few ms: the walk takes far longer
-    /// (debug or release) yet gets past its first records.
-    #[tokio::test]
-    async fn a_walk_cut_partway_is_a_flagged_partial_count() {
-        let n_extra = 8000;
-        let exact = fixture_big(
-            GraphqlSettings {
-                count_budget: Duration::from_secs(60),
-                ..GraphqlSettings::default()
-            },
-            n_extra,
-        );
-        let cut = fixture_big(
-            GraphqlSettings {
-                count_budget: Duration::from_millis(5),
-                ..GraphqlSettings::default()
-            },
-            n_extra,
-        );
-        for q in QUERIES {
-            let (full, flagged) = total(&exact.schema, q).await;
-            assert!(full > i64::from(n_extra), "{q}");
-            assert!(!flagged, "{q}");
-            let (n, flagged) = total(&cut.schema, q).await;
-            assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
-            assert!(n > 1 && n < full, "{q}: {n} is partway to {full}");
-        }
-    }
-
-    /// A block's or a request key's list is counted with its page, exactly, whatever the budget.
-    #[tokio::test]
-    async fn a_block_list_ignores_the_budget() {
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        let q = format!(
-            "{{ transfers(blockHash: \"{}\", first: 1) {{ totalCount }} }}",
-            block_hash(0, 6)
-        );
-        let (n, flagged) = total(&cut.schema, &q).await;
-        assert!(n > 0 && !flagged);
-    }
-
-    /// Timing of the count walk on a long account, run by hand (`--ignored --nocapture`, best
-    /// in release): `KDX_COUNT_BENCH_TXS` extra txs (default 6000). Prints the time and answer
-    /// of `totalCount` with the budget off (a minute, so half the 5 s deadline decides: the
-    /// walk as it was) and with the default 200 ms budget and a 10 ms one (the fixture's hot records decode in
-    /// microseconds, far faster than cold segment records, so only a tight budget cuts it).
+    /// Timing of exact counts on a long account, run by hand (`--ignored --nocapture`, best in
+    /// release): `KDX_COUNT_BENCH_TXS` extra txs (default 50,000). Prints the time and answer
+    /// of each list's `totalCount`, cold (first) and warm.
     #[tokio::test]
     #[ignore = "timing run"]
-    async fn timing_of_the_count_walk_on_a_long_account() {
+    async fn timing_of_exact_counts_on_a_long_account() {
         let n: u32 = std::env::var("KDX_COUNT_BENCH_TXS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(6000);
-        let default = GraphqlSettings::default();
-        for (label, budget) in [
-            ("before (half the deadline)", Duration::from_secs(60)),
-            ("after (200 ms budget)", default.count_budget),
-            ("after (10 ms budget)", Duration::from_millis(10)),
-        ] {
-            let fx = fixture_big(
-                GraphqlSettings {
-                    count_budget: budget,
-                    ..default.clone()
-                },
-                n,
-            );
-            for q in QUERIES {
-                for round in 0..3 {
-                    let t = std::time::Instant::now();
-                    let (rows, flagged) = total(&fx.schema, q).await;
-                    println!(
-                        "{label}: {} round {round}: {:>7.1} ms, totalCount {rows}, lower bound {flagged}",
-                        &q[2..14],
-                        t.elapsed().as_secs_f64() * 1e3
-                    );
-                }
+            .unwrap_or(50_000);
+        let fx = fixture_big(GraphqlSettings::default(), n);
+        for l in LISTS {
+            for round in 0..2 {
+                let t = Instant::now();
+                let rows = total(&fx.schema, l).await;
+                println!(
+                    "{l:<80} round {round}: {:>8.1} ms, totalCount {rows}",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
     }
@@ -1769,14 +1723,14 @@ async fn one_block_lists_are_in_node_order() {
         match s {
             Shape::Many => &[0, 1, 2, 3, 4, 5],
             Shape::Nft => &[0, 1, 2, 3, 4],
-            Shape::One | Shape::Note => &[0],
+            Shape::One | Shape::Note | Shape::SelfXfer => &[0],
         }
     }
     fn coin_transfers(s: Shape) -> &'static [u32] {
         match s {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::SelfXfer => &[0],
             Shape::Note => &[],
         }
     }
@@ -2257,34 +2211,24 @@ mod audit_pr3 {
         assert_eq!(code(&r), bad_input(), "{:?}", r.errors);
     }
 
-    /// F-50: a block's `totalCount` (counted with the page) that the deadline cuts is a
-    /// flagged lower bound, as a deferred count is, not an exact 0.
+    /// F-50, GQ-10: a block's `totalCount` (counted with the page) that the deadline cuts is
+    /// a `COUNT_TIMEOUT` error, as a deferred count is, not a partial number or an exact 0.
     #[tokio::test]
-    async fn a_bounded_count_cut_by_the_deadline_is_flagged() {
+    async fn a_bounded_count_cut_by_the_deadline_is_an_error() {
         let fx = fixture();
         let q = format!(
             "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
             block_hash(0, 6)
         );
-        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+        let req = async_graphql::Request::new(q.clone()).data(kdx_graphql::ReqCtx {
             deadline: std::time::Instant::now(),
         });
         let r = fx.schema.execute(req).await;
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert!(
-            r.extensions.contains_key("totalCountLowerBound"),
-            "{:?}",
-            r.extensions
-        );
-        // With time, the same count is exact and unflagged.
-        let r = fx
-            .schema
-            .execute(format!(
-                "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
-                block_hash(0, 6)
-            ))
-            .await;
-        assert!(!r.extensions.contains_key("totalCountLowerBound"));
+        assert!(!r.errors.is_empty(), "a cut count is an error");
+        assert!(r.extensions.is_empty(), "{:?}", r.extensions);
+        // With time, the same count is exact.
+        let v = run(&fx.schema, &q).await;
+        assert!(v["transfers"]["totalCount"].as_i64().unwrap() > 0);
     }
 
     /// F-51: the id of a `transfers(isNFT: true)` node resolves through `node(id)` to the
@@ -2810,5 +2754,671 @@ async fn last_pages_of_other_sources_keep_the_key_cap() {
             .and_then(|x| x.get("code"))
             .map(|c| c.to_string());
         assert_eq!(code.as_deref(), Some("\"LIMIT\""), "{q}: {e:?}");
+    }
+}
+
+/// PR #48 part 2: stored per-key row counts (`kdx_hot::rowcount`) built by
+/// `reconcile-counts` (`kdx_ingest::row_counts`) and kept by the tail answer `totalCount` of
+/// the plain posting-keyed lists, equal to the full walk; filters they do not hold walk.
+mod stored_count {
+    use super::*;
+    use kdx_hot::rowcount::{self, Tally};
+    use kdx_hot::Txn;
+    use kdx_ingest::row_counts;
+
+    /// Lists the stored counts answer (no filter, `chainId`, `isCoinbase`), over several kinds,
+    /// both chains, frozen and hot rows, coinbase rows and a module with only 4-param
+    /// `TRANSFER` events (no transfer row).
+    const STORED: &[&str] = &[
+        "transfers(accountName: \"k:alice\", ARGS)",
+        "transfers(accountName: \"k:alice\", chainId: \"1\", ARGS)",
+        "transfers(accountName: \"k:carol\", ARGS)",
+        "transfers(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+        "transfers(accountName: \"k:carol\", fungibleName: \"kaddex.kdx\", ARGS)",
+        "transfers(fungibleName: \"coin\", ARGS)",
+        "transfers(fungibleName: \"kaddex.kdx\", chainId: \"0\", ARGS)",
+        "transfers(fungibleName: \"marmalade-v2.ledger\", ARGS)",
+        "transactions(accountName: \"k:alice\", ARGS)",
+        "transactions(accountName: \"k:alice\", chainId: \"0\", ARGS)",
+        "transactions(accountName: \"k:alice\", isCoinbase: true, ARGS)",
+        "transactions(fungibleName: \"coin\", ARGS)",
+        "transactions(fungibleName: \"coin\", isCoinbase: true, ARGS)",
+        "transactionsByPublicKey(publicKey: \"alice-key\", ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)",
+        "events(qualifiedEventName: \"coin.NOTE\", chainId: \"1\", ARGS)",
+        "events(qualifiedEventName: \"coin.COINBASE\", ARGS)",
+    ];
+
+    /// Lists that keep the walk: heights, depth, `fungibleName` on an account's txs, event
+    /// parameter / order filters, NFT transfers.
+    const WALKED: &[&str] = &[
+        "transactions(accountName: \"k:alice\", minHeight: 5, ARGS)",
+        "transactions(accountName: \"k:alice\", minimumDepth: 1, ARGS)",
+        "transactions(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", minHeight: 5, ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", orderIndex: 0, ARGS)",
+        "transfers(accountName: \"k:alice\", isNFT: true, ARGS)",
+    ];
+
+    fn field(l: &str) -> &str {
+        &l[..l.find('(').unwrap()]
+    }
+
+    async fn total(s: &KdxSchema, l: &str) -> i64 {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let v = run(s, &q).await;
+        v[field(l)]["totalCount"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{q}: {v}"))
+    }
+
+    async fn walk(s: &KdxSchema, l: &str) -> i64 {
+        let q = format!(
+            "{{ {} {{ edges {{ cursor }} }} }}",
+            l.replace("ARGS", "first: 1000")
+        );
+        let v = run(s, &q).await;
+        v[field(l)]["edges"].as_array().unwrap().len() as i64
+    }
+
+    /// `totalCount` of `l` with the request deadline already spent: `Some` only when no walk
+    /// ran (the stored count answered).
+    async fn total_spent(s: &KdxSchema, l: &str) -> Option<i64> {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: Instant::now(),
+        });
+        let r = s.execute(req).await;
+        let d = serde_json::to_value(&r.data).unwrap();
+        d.get(field(l))
+            .and_then(|c| c.get("totalCount"))
+            .and_then(Value::as_i64)
+    }
+
+    fn reconcile(fx: &Fx) -> row_counts::Report {
+        let r =
+            row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, false, &|| false).unwrap();
+        assert!(r.ready && r.unrendered == 0, "{r:?}");
+        r
+    }
+
+    fn stored(fx: &Fx) -> Tally {
+        rowcount::read_all(&fx.store.hot.ro().unwrap()).unwrap()
+    }
+
+    fn recount(fx: &Fx) -> Tally {
+        row_counts::tally(&fx.store.segdir, &fx.store.hot, 3, &|| false)
+            .unwrap()
+            .0
+    }
+
+    fn ready(fx: &Fx) -> bool {
+        rowcount::ready(&fx.store.hot.ro().unwrap()).unwrap()
+    }
+
+    /// Every stored-count list equals its walk; every walk-only list still walks.
+    async fn check_lists(fx: &Fx) {
+        for l in STORED.iter().chain(WALKED) {
+            assert_eq!(total(&fx.schema, l).await, walk(&fx.schema, l).await, "{l}");
+        }
+    }
+
+    /// The backfill builds exactly the counts ingest maintains: every fixture block applied by
+    /// the tail alone (in the fixture's interning order, so ids match) gives the table the
+    /// backfill builds from the fixture's frozen ranges and hot blocks.
+    #[test]
+    fn backfill_equals_ingest() {
+        let fx = fixture();
+        let built = recount(&fx);
+        assert!(built.len() > 20, "a real fixture: {}", built.len());
+        let kinds: HashSet<u8> = built.iter().map(|(k, _)| k.0 as u8).collect();
+        assert_eq!(kinds.len(), 7, "every kind is exercised: {kinds:?}");
+        let chains: HashSet<u8> = built.iter().map(|(k, _)| k.2).collect();
+        assert_eq!(chains, HashSet::from([0, 1]));
+
+        let d = tempfile::tempdir().unwrap();
+        let hot = kdx_hot::HotStore::open(d.path(), kdx_hot::Geometry::default()).unwrap();
+        let mut t = hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let order = BLOCKS
+            .iter()
+            .filter(|b| b.1 < FIRST_RANGE_END)
+            .chain(
+                BLOCKS
+                    .iter()
+                    .filter(|b| (FIRST_RANGE_END..FRONTIER).contains(&b.1)),
+            )
+            .chain(BLOCKS.iter().filter(|b| b.1 >= FRONTIER));
+        for &(c, h, shapes) in order {
+            let (b, _) = decoded(c, h, shapes);
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        }
+        let ingest = rowcount::read_all(&t).unwrap();
+        // Ingest keeps the table but never marks it ready: only the backfill does.
+        assert!(!rowcount::ready(&t).unwrap());
+        t.commit().unwrap();
+        assert_eq!(ingest, built);
+    }
+
+    /// Stored counts equal the full walk on every plain list, and the backfill is idempotent.
+    #[tokio::test]
+    async fn stored_counts_equal_the_walk() {
+        let fx = fixture();
+        let walked: Vec<i64> = {
+            let mut v = Vec::new();
+            for l in STORED {
+                v.push(walk(&fx.schema, l).await);
+            }
+            v
+        };
+        assert!(!ready(&fx));
+        let r = reconcile(&fx);
+        assert!(r.frozen_txs > 0 && r.hot_txs > 0, "{r:?}");
+        for (l, w) in STORED.iter().zip(&walked) {
+            assert_eq!(total(&fx.schema, l).await, *w, "{l}");
+            assert_eq!(total_spent(&fx.schema, l).await, Some(*w), "{l}: stored");
+        }
+        assert!(walked.contains(&0) && walked.iter().any(|&w| w > 10));
+        let once = stored(&fx);
+        reconcile(&fx);
+        assert_eq!(stored(&fx), once, "idempotent");
+        check_lists(&fx).await;
+    }
+
+    /// Counts stay right through a reorg: unwind two hot blocks of chain 0, apply a different
+    /// fork, with the marker set (stored counts answer) and unset (the walk answers; the
+    /// table still follows, and a backfill marks it ready again).
+    #[tokio::test]
+    async fn counts_follow_a_reorg_with_and_without_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let reorg = |chain: u8, to: u32, fork: &[(u32, &[Shape])]| {
+            let mut t = fx.store.hot.rw().unwrap();
+            let mut dict = HotDict::load(&t).unwrap();
+            assert!(kdx_hot::tail::unwind_to(&mut t, chain, to).unwrap() > 0);
+            for &(h, shapes) in fork {
+                let (mut b, _) = decoded(chain, h, shapes);
+                // Another fork: another block hash.
+                b.header.hash = kdx_types::Hash32(hash_of(0xC0, chain, h));
+                let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+                kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+            }
+            dict.persist(&mut t).unwrap();
+            t.commit().unwrap();
+        };
+        let before = stored(&fx);
+        reorg(0, FRONTIER, &[(11, &[Shape::One, Shape::Nft, Shape::Many])]);
+        assert!(ready(&fx), "a reorg keeps the marker");
+        assert_ne!(stored(&fx), before, "the reorg changed counts");
+        assert_eq!(stored(&fx), recount(&fx), "marker set: table = recount");
+        check_lists(&fx).await;
+        for l in STORED {
+            assert!(total_spent(&fx.schema, l).await.is_some(), "{l}: stored");
+        }
+
+        // Marker unset: the walk answers; the tail still keeps the table exact.
+        let mut t = fx.store.hot.rw().unwrap();
+        assert!(rowcount::clear_ready(&mut t).unwrap());
+        t.commit().unwrap();
+        reorg(1, 11, &[(12, &[Shape::Note]), (13, &[Shape::Many])]);
+        assert!(!ready(&fx));
+        assert_eq!(stored(&fx), recount(&fx), "marker unset: table = recount");
+        check_lists(&fx).await;
+        reconcile(&fx);
+        check_lists(&fx).await;
+    }
+
+    /// A count answered from storage on a list far longer than the walk can finish in the
+    /// deadline: the request deadline is already spent, the walk cannot read one key, the
+    /// stored count still answers, and equals the walk under a normal deadline.
+    #[tokio::test]
+    async fn a_stored_count_answers_where_the_walk_cannot() {
+        let fx = fixture_big(GraphqlSettings::default(), 3_000);
+        let l = "transfers(accountName: \"k:alice\", ARGS)";
+        let walked = total(&fx.schema, l).await;
+        assert!(walked > 3_000);
+        assert_eq!(
+            total_spent(&fx.schema, l).await,
+            None,
+            "no marker: the walk is cut"
+        );
+        // Review M-5: the cut `totalCount` is left out of its connection, which is `null`
+        // when that was its only field (async-graphql does no null propagation).
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let r = fx
+            .schema
+            .execute(async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+                deadline: Instant::now(),
+            }))
+            .await;
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        let d = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(d.get(field(l)), Some(&Value::Null), "{d}");
+        reconcile(&fx);
+        assert_eq!(total_spent(&fx.schema, l).await, Some(walked));
+        let e = "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)";
+        assert_eq!(
+            total_spent(&fx.schema, e).await,
+            Some(walk_all(&fx.schema, e).await)
+        );
+        // Walk-only lists (each over thousands of keys here) still walk: a spent deadline
+        // gives no number.
+        for l in WALKED {
+            assert_eq!(total_spent(&fx.schema, l).await, None, "{l}");
+        }
+    }
+
+    /// Unwind chain `chain` to `to` and apply `fork` (another block hash) in one txn.
+    fn reorg(fx: &Fx, chain: u8, to: u32, fork: &[(u32, &[Shape])]) {
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        assert!(kdx_hot::tail::unwind_to(&mut t, chain, to).unwrap() > 0);
+        for &(h, shapes) in fork {
+            let (mut b, _) = decoded(chain, h, shapes);
+            b.header.hash = kdx_types::Hash32(hash_of(0xC0, chain, h));
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        }
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+    }
+
+    fn marker_set(fx: &Fx) -> bool {
+        rowcount::marker_set(&fx.store.hot.ro().unwrap()).unwrap()
+    }
+
+    fn check(fx: &Fx) -> u64 {
+        let r = row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, true, &|| false).unwrap();
+        r.differing.unwrap()
+    }
+
+    /// Review I-1, the rollback guard: a build without stored counts moves a chain's tip
+    /// (here: the `Tail` checkpoint written directly, as its `apply` does) or unwinds blocks
+    /// without the counts' `row_counts_at` following. The marker stays set but `ready` is
+    /// false, so lists walk; the startup check clears the marker and says why.
+    #[tokio::test]
+    async fn an_old_build_moving_the_tips_unsets_ready() {
+        let fx = fixture();
+        reconcile(&fx);
+        assert!(ready(&fx));
+        let l = "transfers(accountName: \"k:alice\", ARGS)";
+        assert!(total_spent(&fx.schema, l).await.is_some());
+        // Normal path: nothing to clear at startup.
+        assert_eq!(row_counts::startup_guard(&fx.store.hot).unwrap(), None);
+
+        // An old build applies a block on chain 0.
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut t,
+            kdx_hot::Stage::Tail,
+            0,
+            13,
+            kdx_types::Hash32(hash_of(0xD0, 0, 13)),
+        )
+        .unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx) && !ready(&fx));
+        assert_eq!(total_spent(&fx.schema, l).await, None, "the walk answers");
+        check_lists(&fx).await;
+        let why = row_counts::startup_guard(&fx.store.hot).unwrap().unwrap();
+        assert!(why.contains("chain 0"), "{why}");
+        assert!(!marker_set(&fx), "startup cleared the marker");
+        assert_eq!(row_counts::startup_guard(&fx.store.hot).unwrap(), None);
+
+        // An old build unwinds a block on chain 0: the counts move, their stamp does not.
+        reconcile(&fx);
+        assert!(ready(&fx));
+        let key = rowcount::at_key(0);
+        let old = fx.store.hot.ro().unwrap().meta(&key).unwrap().unwrap();
+        let mut t = fx.store.hot.rw().unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.set_meta(&key, &old).unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx), "marker");
+        assert!(!ready(&fx), "ready");
+        check_lists(&fx).await;
+        assert!(row_counts::startup_guard(&fx.store.hot).unwrap().is_some());
+        assert!(!marker_set(&fx));
+    }
+
+    /// The new build's own apply and unwind keep `row_counts_at` on the tips: a reorg, a
+    /// whole chain unwound to below its hot blocks and re-applied, all stay ready.
+    #[tokio::test]
+    async fn the_tails_own_apply_and_unwind_stay_ready() {
+        let fx = fixture();
+        reconcile(&fx);
+        reorg(&fx, 0, 11, &[(12, &[Shape::One]), (13, &[Shape::Many])]);
+        reorg(&fx, 1, 11, &[(12, &[Shape::Note])]);
+        assert!(ready(&fx));
+        assert_eq!(row_counts::startup_guard(&fx.store.hot).unwrap(), None);
+        assert!(marker_set(&fx));
+        // Unwound below every hot block: the `Tail` checkpoint and the stamp both go.
+        let mut t = fx.store.hot.rw().unwrap();
+        assert!(kdx_hot::tail::unwind_to(&mut t, 1, FRONTIER - 1).unwrap() > 0);
+        t.commit().unwrap();
+        assert!(ready(&fx));
+        assert_eq!(stored(&fx), recount(&fx));
+        assert_eq!(check(&fx), 0);
+    }
+
+    /// Review M-1: an undo whose tx record is missing cannot subtract its counts: the marker
+    /// is cleared.
+    #[test]
+    fn an_undo_without_its_record_clears_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let mut t = fx.store.hot.rw().unwrap();
+        let from = kdx_types::TxKey::new(12, 0, 0).to_be_bytes();
+        let recs = t.scan(kdx_hot::Table::TailTxs, &from, |_| true).unwrap();
+        let (k, _) = recs
+            .iter()
+            .find(|(_, v)| kdx_types::record::decode_tx(v).unwrap().key.chain() == 0)
+            .unwrap();
+        t.del(kdx_hot::Table::TailTxs, k).unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.commit().unwrap();
+        assert!(!marker_set(&fx));
+    }
+
+    /// Review round 2 N-1: `kda-indexer unwind` (and any other caller) runs no startup
+    /// guard. An old build moved chain 0's tip without the counts; `unwind_to` must not
+    /// stamp over that and come back ready: it checks the guard in its own txn and clears
+    /// the marker.
+    #[tokio::test]
+    async fn unwind_after_an_old_build_moved_the_tip_clears_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut t,
+            kdx_hot::Stage::Tail,
+            0,
+            13,
+            kdx_types::Hash32(hash_of(0xD0, 0, 13)),
+        )
+        .unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx) && !ready(&fx));
+        let mut t = fx.store.hot.rw().unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.commit().unwrap();
+        assert!(!marker_set(&fx), "the unwind cleared the marker");
+        assert!(!ready(&fx));
+        check_lists(&fx).await;
+    }
+
+    /// N-1 for `apply`: an old build unwound chain 0 (tip moved, stamp left behind), then the
+    /// new build applies a block on it. The apply must not stamp the mismatch away.
+    #[test]
+    fn apply_after_an_old_build_moved_the_tip_clears_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let key = rowcount::at_key(0);
+        let old = fx.store.hot.ro().unwrap().meta(&key).unwrap().unwrap();
+        let mut t = fx.store.hot.rw().unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.set_meta(&key, &old).unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx) && !ready(&fx));
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let (mut b, _) = decoded(0, 12, &[Shape::One]);
+        b.header.hash = kdx_types::Hash32(hash_of(0xC0, 0, 12));
+        let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+        kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        assert!(!marker_set(&fx), "the apply cleared the marker");
+        assert!(!ready(&fx));
+    }
+
+    /// Review I-2: `--check` reads both sides in one snapshot and merges against the table:
+    /// 0 on a healthy store (also after reorgs), and each missing, extra or wrong row counts.
+    #[test]
+    fn check_is_zero_on_a_healthy_store_and_counts_each_bad_row() {
+        let fx = fixture();
+        reconcile(&fx);
+        assert_eq!(check(&fx), 0);
+        reorg(&fx, 0, FRONTIER, &[(11, &[Shape::Many, Shape::Nft])]);
+        assert_eq!(check(&fx), 0, "the tail keeps the table exact");
+        let rows = fx
+            .store
+            .hot
+            .ro()
+            .unwrap()
+            .scan(kdx_hot::Table::RowCounts, &[], |_| true)
+            .unwrap();
+        let mut t = fx.store.hot.rw().unwrap();
+        t.del(kdx_hot::Table::RowCounts, &rows[0].0).unwrap();
+        t.put(
+            kdx_hot::Table::RowCounts,
+            &rows[1].0,
+            &rowcount::encode_val((999, 0)),
+        )
+        .unwrap();
+        let extra = rowcount::key(kdx_decode::rowcount::CountKind::Pk, 1 << 40, 3);
+        t.put(
+            kdx_hot::Table::RowCounts,
+            &extra,
+            &rowcount::encode_val((1, 0)),
+        )
+        .unwrap();
+        t.put(
+            kdx_hot::Table::RowCounts,
+            &[9u8; 10],
+            &rowcount::encode_val((1, 0)),
+        )
+        .unwrap();
+        t.commit().unwrap();
+        assert_eq!(check(&fx), 4);
+    }
+
+    /// Review M-4: `reconcile-counts` clears the marker before it counts, so a run stopped
+    /// while counting leaves it cleared.
+    #[test]
+    fn a_run_stopped_while_counting_leaves_the_marker_cleared() {
+        let fx = fixture();
+        reconcile(&fx);
+        assert!(marker_set(&fx));
+        let r = row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, false, &|| true);
+        assert!(r.is_err());
+        assert!(!marker_set(&fx));
+    }
+
+    /// Review M-10: a transfer from an account to itself counts once, like the walk.
+    #[tokio::test]
+    async fn a_self_transfer_counts_once() {
+        let fx = fixture();
+        reconcile(&fx);
+        reorg(&fx, 0, 11, &[(12, &[Shape::SelfXfer, Shape::One])]);
+        assert!(ready(&fx));
+        assert_eq!(stored(&fx), recount(&fx));
+        check_lists(&fx).await;
+        for l in STORED {
+            assert_eq!(
+                total_spent(&fx.schema, l).await,
+                Some(walk(&fx.schema, l).await),
+                "{l}"
+            );
+        }
+    }
+
+    /// Review M-10: `transactionsByPublicKey` has no `chainId` argument (as stock); the stored
+    /// sum for one chain is that chain's rows, and the chains add up to the all-chain sum.
+    #[test]
+    fn public_key_counts_per_chain_add_up() {
+        let fx = fixture();
+        reconcile(&fx);
+        let built = recount(&fx);
+        let ro = fx.store.hot.ro().unwrap();
+        let pks: HashSet<u64> = built
+            .iter()
+            .filter(|(k, _)| k.0 == kdx_decode::rowcount::CountKind::Pk)
+            .map(|(k, _)| k.1)
+            .collect();
+        assert!(!pks.is_empty());
+        for e in pks {
+            let all = rowcount::sum(&ro, kdx_decode::rowcount::CountKind::Pk, e, None).unwrap();
+            let (mut u, mut c) = (0, 0);
+            for ch in [0u8, 1] {
+                let one =
+                    rowcount::sum(&ro, kdx_decode::rowcount::CountKind::Pk, e, Some(ch)).unwrap();
+                let want = built
+                    .get((kdx_decode::rowcount::CountKind::Pk, e, ch))
+                    .unwrap_or((0, 0));
+                assert_eq!(one, want);
+                (u, c) = (u + one.0, c + one.1);
+            }
+            assert_eq!(all, (u, c));
+        }
+    }
+
+    /// Rows of the full walk of `l`, pages of 1,000.
+    async fn walk_all(s: &KdxSchema, l: &str) -> i64 {
+        let (mut n, mut after) = (0i64, None::<String>);
+        loop {
+            let args = match &after {
+                None => "first: 1000".to_string(),
+                Some(c) => format!("first: 1000, after: \"{c}\""),
+            };
+            let q = format!(
+                "{{ {} {{ pageInfo {{ hasNextPage endCursor }} edges {{ cursor }} }} }}",
+                l.replace("ARGS", &args)
+            );
+            let v = run(s, &q).await;
+            let c = &v[field(l)];
+            n += c["edges"].as_array().unwrap().len() as i64;
+            if c["pageInfo"]["hasNextPage"] != true {
+                return n;
+            }
+            after = c["pageInfo"]["endCursor"].as_str().map(str::to_owned);
+        }
+    }
+
+    /// A mainnet-like block for the backfill timing: a coinbase paying one of 50 miners
+    /// (`coin.TRANSFER ["", miner, reward]`) and `users` coin transfers, each from a sender out
+    /// of 2M accounts (its own signer key) to another, with the gas payment to the miner: two
+    /// `coin.TRANSFER` events per user tx, as most mainnet txs.
+    fn mainnet_like(c: u8, h: u32, users: usize) -> DecodedBlock {
+        let acct = |x: u64| {
+            format!(
+                "k:{:016x}",
+                x.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 2_000_000
+            )
+        };
+        let miner = format!("k:miner{}", (u64::from(h) * 7 + u64::from(c)) % 50);
+        let mut txs = Vec::new();
+        for i in 0..users {
+            let seed = (u64::from(h) << 20) ^ (u64::from(c) << 12) ^ i as u64;
+            let (from, to) = (acct(seed), acct(seed ^ 0xABCD_EF01));
+            let ct = 1_700_000_000u64 + u64::from(h);
+            let cmd = json!({
+                "payload": {"exec": {"data": null, "code": format!("(coin.transfer \"{from}\" \"{to}\" 1.0)")}},
+                "meta": {"sender": from, "chainId": c.to_string(), "creationTime": ct,
+                         "gasLimit": 1000, "gasPrice": 1e-8, "ttl": 600},
+                "signers": [{"pubKey": format!("{:064x}", seed % 2_000_000)}],
+                "nonce": format!("n-{c}-{h}-{i}"),
+                "networkId": "mainnet01",
+            })
+            .to_string();
+            let rk = blake2b_256(cmd.as_bytes()).to_b64url();
+            let tx = serde_json::to_vec(&json!({"hash": rk, "sigs": [{"sig": "ab"}], "cmd": cmd}))
+                .unwrap();
+            let evs = [
+                ev(None, "coin", "TRANSFER", json!([from, miner, 0.0000115])),
+                ev(None, "coin", "TRANSFER", json!([from, to, 1.0])),
+            ];
+            let out = serde_json::to_vec(&json!({"gas": 1150,
+                "result": {"status": "success", "data": "Write succeeded"}, "reqKey": rk,
+                "logs": b64url_encode(&hash_of(0x10, c, h)), "events": evs,
+                "metaData": null, "continuation": null, "txId": 1234567}))
+            .unwrap();
+            txs.push(json!([b64url_encode(&tx), b64url_encode(&out)]));
+        }
+        let cb = serde_json::to_vec(
+            &json!({"gas": 0, "result": {"status": "success", "data": "Write succeeded"},
+            "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null,
+            "events": [ev(None, "coin", "TRANSFER", json!(["", miner, 2.304523]))],
+            "metaData": null, "continuation": null, "txId": 1234566}),
+        )
+        .unwrap();
+        let md = format!(r#"{{"account":"{miner}","predicate":"keys-all","public-keys":["m"]}}"#);
+        let payload_hash = b64url_encode(&hash_of(0xA4, c, h));
+        let header = json!({
+            "nonce": "1", "creationTime": 1_700_000_000_000_000u64 + u64::from(h) * 30_000_000,
+            "parent": b64url_encode(&hash_of(0xB0, c, h.saturating_sub(1))),
+            "adjacents": {"5": b64url_encode(&hash_of(0xAD, c, h))},
+            "target": b64url_encode(&[0xff; 32]), "payloadHash": payload_hash, "chainId": c,
+            "weight": b64url_encode(&[1; 32]), "height": h, "chainwebVersion": "mainnet01",
+            "epochStart": 1, "featureFlags": 0, "hash": block_hash(c, h)
+        });
+        let payload = json!({
+            "transactions": txs, "minerData": b64url_encode(md.as_bytes()),
+            "transactionsHash": b64url_encode(&hash_of(0xA7, c, h)),
+            "outputsHash": b64url_encode(&hash_of(0xA8, c, h)),
+            "payloadHash": payload_hash, "coinbase": b64url_encode(&cb),
+        });
+        decode_block(&header, &payload).expect("block decodes")
+    }
+
+    /// Backfill rate, run by hand (`--release -- --ignored --nocapture`): a store of
+    /// `KDX_COUNT_BENCH_BLOCKS` frozen mainnet-like blocks (default 100,000) on 20 chains,
+    /// alternating 1 and 2 user txs (about 40% coinbase records, as mainnet), counted on 1, 2
+    /// and 6 threads (KDA-03's default `history_walk_threads`).
+    #[test]
+    #[ignore = "timing run"]
+    fn timing_of_the_backfill() {
+        let n: u32 = std::env::var("KDX_COUNT_BENCH_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 4,
+            growth_mb: 64,
+        };
+        let hot = kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap();
+        let mut t = hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let segdir = d.path().join("segments");
+        let end = n.div_ceil(20);
+        let mut w = RangeWriter::create(
+            &segdir,
+            &d.path().join("etl-0"),
+            "mainnet01",
+            RangeKind::Step,
+            0,
+            end,
+            0,
+            WriteOpts::new(1, 0),
+        )
+        .unwrap();
+        for h in 0..end {
+            for c in 0..20u8 {
+                let b = mainnet_like(c, h, 1 + (h as usize + c as usize) % 2);
+                w.push(&index_block(&b, &VerifyReport::default(), &mut dict).unwrap())
+                    .unwrap();
+            }
+        }
+        let entry = w.finish().unwrap();
+        let mut m = Manifest::new("mainnet01");
+        let next = entry.end_txnum();
+        m.push(entry).unwrap();
+        m.commit(&segdir).unwrap();
+        t.set_frozen_frontier(end).unwrap();
+        t.set_next_txnum(next).unwrap();
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        for threads in [1usize, 2, 6] {
+            let (_, r) = row_counts::tally(&segdir, &hot, threads, &|| false).unwrap();
+            println!(
+                "threads {threads}: {} records in {:.2} s = {:.0} records/s ({} keys)",
+                r.frozen_txs + r.hot_txs,
+                r.count_secs,
+                r.rate,
+                r.keys
+            );
+        }
     }
 }

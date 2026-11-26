@@ -175,6 +175,12 @@ pub async fn run(
     dry_run: bool,
 ) -> Result<RebuildReport> {
     let net = ctx.opts.network.clone();
+    if !dry_run {
+        // A rebuilt range may store other records: the stored row counts no longer hold.
+        let mut txn = ctx.hot.rw()?;
+        kdx_hot::rowcount::clear_ready(&mut txn)?;
+        txn.commit()?;
+    }
     {
         // Snapshots hold this shared while they place segment files (m14), and a manual
         // `search rebuild` for its whole run: a rebuild started meanwhile waits here.

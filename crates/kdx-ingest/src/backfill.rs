@@ -230,6 +230,8 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
     drop(txn);
     if stale {
         let mut txn = ctx.hot.rw()?;
+        // Frozen ranges written outside the freezer: the stored row counts no longer hold.
+        kdx_hot::rowcount::clear_ready(&mut txn)?;
         txn.set_frozen_frontier(m.frontier)?;
         txn.set_next_txnum(m.next_txnum)?;
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
@@ -806,6 +808,8 @@ fn build_and_commit(
     }
     txn.set_next_txnum(entry.end_txnum())?;
     txn.set_frozen_frontier(entry.end)?;
+    // A range written outside the freezer: the stored row counts no longer hold (PR #48).
+    kdx_hot::rowcount::clear_ready(&mut txn)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
     let tc = Instant::now();
     txn.commit()?;

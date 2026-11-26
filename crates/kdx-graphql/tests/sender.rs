@@ -413,10 +413,7 @@ fn build(layout: Layout, txs: impl Fn(u8, u32, u8) -> Vec<TxSpec>, top: u32, fro
 
     let store = Arc::new(Store::open(hot, d.path()).unwrap());
     let state = Api::new(store.clone(), settings(), TipWatch::default()).state();
-    let gs = GraphqlSettings {
-        count_budget: Duration::from_secs(30),
-        ..GraphqlSettings::default()
-    };
+    let gs = GraphqlSettings::default();
     Fx {
         _dir: d,
         store,

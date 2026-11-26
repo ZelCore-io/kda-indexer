@@ -1821,6 +1821,7 @@ dependencies = [
  "kdx-api",
  "kdx-decode",
  "kdx-hot",
+ "kdx-ingest",
  "kdx-metrics",
  "kdx-segment",
  "kdx-types",
@@ -1847,6 +1848,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

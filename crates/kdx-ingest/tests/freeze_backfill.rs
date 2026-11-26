@@ -50,9 +50,14 @@ async fn freeze_equals_backfill(range: u64) {
     let base = fake_node(&pool, &[(0, chain)]);
     let db = tempfile::tempdir().unwrap();
     let c = Arc::new(ctx_with_node(db.path(), 2, range, 2, &base));
+    set_count_marker(&c);
     kdx_ingest::backfill::run(c.clone(), 0, 19, kdx_ingest::HeaderMode::Cut)
         .await
         .unwrap();
+    assert!(
+        !count_marker(&c),
+        "PR #48: backfill clears the stored-counts marker"
+    );
     let backfilled = kdx_segment::manifest::Manifest::load(&c.segdir)
         .unwrap()
         .unwrap();
@@ -138,6 +143,7 @@ async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
         .unwrap()
         .entries[3]
         .clone();
+    set_count_marker(&c);
     let rep = kdx_ingest::rebuild::run(
         c.clone(),
         e.kind,
@@ -148,6 +154,10 @@ async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
     .await
     .unwrap();
     assert!(rep.swapped && rep.bytes_equal, "{rep:?}");
+    assert!(
+        !count_marker(&c),
+        "PR #48: rebuild-range clears the stored-counts marker"
+    );
     assert_eq!(rep.content_equal, Some(true));
     assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
     deep_check(&c);
@@ -663,4 +673,14 @@ fn startup_cleanup_keeps_listed_optional_files() {
     assert_eq!(files(&c.segdir), want);
     assert_eq!(want.keys().filter(|n| n.contains("-kf-")).count(), 10);
     assert_eq!(want.keys().filter(|n| n.contains("-sndr-")).count(), 10);
+}
+
+fn set_count_marker(c: &kdx_ingest::Ctx) {
+    let mut t = c.hot.rw().unwrap();
+    kdx_hot::rowcount::set_ready(&mut t, 0).unwrap();
+    t.commit().unwrap();
+}
+
+fn count_marker(c: &kdx_ingest::Ctx) -> bool {
+    kdx_hot::rowcount::marker_set(&c.hot.ro().unwrap()).unwrap()
 }

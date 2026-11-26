@@ -27,6 +27,7 @@ fn drop_family_sndr_removes_rows_undo_ops_and_the_ready_key() {
         apply_linear(&c, &pool, &branch(&(0..12).collect::<Vec<_>>(), 0, 0, 0), 4);
         let mut txn = c.hot.rw().unwrap();
         txn.set_meta_u64(kdx_hot::env::meta::SNDR_HOT, 1).unwrap();
+        kdx_hot::rowcount::set_ready(&mut txn, 0).unwrap();
         txn.commit().unwrap();
         let ro = c.hot.ro().unwrap();
         assert!(!ro
@@ -52,6 +53,10 @@ fn drop_family_sndr_removes_rows_undo_ops_and_the_ready_key() {
     {
         let ro = c.hot.ro().unwrap();
         assert!(!kdx_hot::sndr::hot_ready(&ro).unwrap());
+        assert!(
+            !kdx_hot::rowcount::marker_set(&ro).unwrap(),
+            "PR #48: counts marker cleared"
+        );
         for (k, _) in ro.scan(Table::TailPostings, &[], |_| true).unwrap() {
             assert!(k[0] <= 5, "{k:?}");
         }

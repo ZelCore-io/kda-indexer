@@ -2,7 +2,7 @@
 
 ## Commands that write
 
-`run`, `backfill`, `rebuild-range`, `unwind` and `segments add-index` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range`, `unwind`, `segments add-index` and `reconcile-counts` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill`, `unwind` or `segments add-index` by hand. Read-only commands (`inspect`,
@@ -213,6 +213,63 @@ silently lose a range. Recovery, with the service stopped: delete that `sndr.pst
 `kf.fil` only turns that range's filter off (WARN, `kdx_key_filter_untrusted`); the
 same rerun rebuilds it. If the writer cannot build a filter at all, it writes the step or
 range without `kf.fil` (WARN) rather than stall the freeze or merge.
+
+## Stored totalCount counts
+
+GraphQL `totalCount` of the plain account, token, public-key and event-name lists is read
+from a hot table of row counts per (list kind, key, chain) instead of a walk
+([graphql.md](graphql.md#transactions-events-and-transfers), `totalCount`). The tail keeps
+the table at every block and every reorg (an unwound block's counts are recomputed from its
+record and subtracted; the undo format is unchanged), and the freezer leaves it alone. It is
+used only while `Meta row_counts_ready` is set; until then, every count walks as before.
+
+Build it once after upgrading, and again after any command that clears the marker
+(`backfill`, `rebuild-range`, `segments add-index`, `hot drop-family`; each logs
+`row counts: readiness marker cleared`):
+
+```sh
+systemctl stop kda-indexer-<network>
+kda-indexer -c <config> reconcile-counts      # [--threads N] [--data-dir D]
+systemctl start kda-indexer-<network>
+```
+
+- It clears the marker first, reads every frozen record on `--threads` workers (default
+  `[balances] history_walk_threads`, else the cores less 2), then the hot records, rebuilds
+  the whole table and sets the marker last. It takes the data-dir lock, so the service must
+  be stopped. It is idempotent: run it again at any time. A run stopped or killed at any
+  point leaves the marker cleared, and the service walks until the next full run.
+- It prints a JSON report (`frozen_txs`, `hot_txs`, `keys`, `rate` in records a second,
+  `ready`). A record whose output does not render leaves the marker unset and exits with an
+  error (the walk cannot list that tx either).
+- `reconcile-counts --check` counts the same way without the lock or any write and reports
+  `differing`, the rows of the stored table that differ from a fresh count (0 on a healthy
+  store). It can run beside the service. It holds no hot read transaction over the frozen
+  walk; one later snapshot reads the heights frozen meanwhile, the hot records and the stored
+  table, so both sides of the compare come from the same state. It compares one kind at a
+  time against the table read in chunks, so it needs no more memory than a full run. Mind
+  the memory below next to the service's own.
+- `--check` keeps that one hot read transaction open beside the service for the whole
+  second phase, the streamed compare included (minutes on mainnet). While it is open MDBX
+  cannot reuse the pages the tail and the freezer free, so the hot `mdbx.dat` can grow by
+  what they write meanwhile. Run it when the store has room, and not in a loop.
+- Time: measured at about 80,000 records a second per thread and 256,000 on 6 threads
+  (mainnet-like synthetic records, release build, warm cache). Mainnet holds about 371
+  million records, so plan on 25 minutes at that rate, up to about 50 minutes on slower
+  cores or a cold disk.
+- Memory: one map per kind of every (key, chain), 44-55 bytes a key measured (2-3 million
+  synthetic keys, release build), up to about 75 depending on how full the hash tables
+  are. Writing (or comparing) turns one kind at a time into a sorted list. That kind's map
+  and its list are alive together until the list is built (per kind, not chunked), so the
+  peak is the maps plus the largest kind's list: 54-64 bytes a key measured, up to about 90.
+  At 30-60 million keys plan on 2-5.5 GB.
+- Hot store: the table holds one row per (kind, key, chain), about 40-60 bytes each in the
+  B-tree, so the hot store grows from about 0.85 GB to about 3-4 GB on mainnet. The default
+  `storage.mdbx_max_gb = 64` covers it; check that a config that lowers it leaves room.
+- The counts are tied to the tail: every block the tail applies or unwinds records the
+  chain's new tip in `Meta row_counts_at@<chain>`, and the run writes it for every chain. A
+  build before PR #48 moves the tips without it. The counts are then not used (lists walk),
+  and `run` clears the marker at startup with a warning that names the chain and heights.
+  Run `reconcile-counts` again after such a rollback.
 
 ## Rolling back to a build before FIX-2
 

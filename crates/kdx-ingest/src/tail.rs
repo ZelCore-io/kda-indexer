@@ -520,6 +520,8 @@ fn log_progress(ctx: &Ctx, blocks: u64, reorgs: u32) {
 /// Run the tail until `shutdown` (or until every follower has stopped: `--until`, halts).
 pub async fn run(ctx: Arc<Ctx>, shutdown: CancellationToken) -> Result<()> {
     let keep = u32::try_from(ctx.opts.finality_depth)? + 1;
+    // PR #48 review I-1: stored counts a build without them left behind are not trusted.
+    crate::row_counts::startup_guard(&ctx.hot)?;
     let cut = ctx.node.cut().await.context("tail: /cut")?;
     let tip_h = cut.hashes.values().map(|e| e.height).min().unwrap_or(0);
     let chains: Vec<u8> = ctx.graph.chains_at(tip_h).to_vec();

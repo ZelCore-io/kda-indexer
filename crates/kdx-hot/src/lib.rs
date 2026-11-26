@@ -12,6 +12,7 @@ pub mod dict;
 pub mod env;
 pub mod nft;
 pub mod prices;
+pub mod rowcount;
 pub mod sndr;
 pub mod tables;
 pub mod tail;

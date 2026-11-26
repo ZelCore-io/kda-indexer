@@ -83,7 +83,7 @@ Errors carry `extensions.code`:
 | `BAD_USER_INPUT` | a bad argument, cursor or request body |
 | `LIMIT` | a resource limit; `extensions.limit` names it (table below) |
 | `TIMEOUT` | the request deadline passed |
-| `COUNT_TIMEOUT` | reserved; a count cut short answers a lower bound instead (see `totalCount`) |
+| `COUNT_TIMEOUT` | `totalCount` could not be counted exactly before the request deadline; the field answers no number (see `totalCount`) |
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
 | `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
@@ -172,7 +172,7 @@ The other limits are this indexer's own, in `[graphql]` (defaults shown). A refu
 | NFT holdings of one account | 10,000 (fixed) | `nft_holdings`: partial data, the first 10,000 are answered with this error at the list field ("holdings cut at 10000: the account holds more") |
 | page size | `default_page = 20` when `first`/`last` are omitted or 0 | — |
 | request deadline | `api.deadline_ms` (5 s), shared by a batch | `TIMEOUT` code |
-| `totalCount` walk | half the remaining deadline; an account's transactions/transfers also `count_budget_ms = 200` (1..=60000) if sooner | none: a lower bound is answered (see `totalCount`) |
+| `totalCount` walk | the request deadline (`api.deadline_ms`); no row cap | `COUNT_TIMEOUT` at the field (see `totalCount`) |
 
 Rate: a request takes one token of the per-IP rate limit (`api.rate_per_ip`); a batch of N
 operations takes N.
@@ -548,16 +548,57 @@ the oracle puts them.
   `requestKey` list no rows, all without an error. A coinbase is never answered by
   `transaction(requestKey)`, in stock or here. Other bad arguments beside it (a malformed
   `blockHash`, `minimumDepth` out of range) keep their errors.
-- **`totalCount`** is computed only when selected: a count walk of at most 10,000 rows
-  within half of the remaining deadline. An account's `transactions` or `transfers` list is
-  bounded further by `count_budget_ms` (200 ms by default, counted from when the read
-  starts), whichever is sooner; other lists keep the half-deadline limit. Larger lists show 10,000. Cold records decode
-  at about 1 ms each, so an account with more than a few hundred rows to decode answers a
-  lower bound. A sender list served from the sender index counts keys only, no decode. When the time share runs out, `totalCount` answers the rows counted so far (a
-  lower bound, never below the edges served), the edges are kept, and the response carries
-  `"extensions": {"totalCountLowerBound": true}` (R-P5P9-14). A block's or a request key's
-  list counts with its page within the scan window; when the deadline cuts that count it is
-  flagged the same way, never below the edges served (audit F-50).
+- **`totalCount`** is exact, as stock's (GQ-10, owner ruling 2026-11-26): it is the number
+  of rows the full walk of the list returns, with every filter applied, and has no cap. It
+  is computed only when selected: from the stored per-key counts where they hold the list
+  (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s).
+  A walk the deadline cuts answers a `COUNT_TIMEOUT` error at
+  `totalCount` (the error has the field's path; the field is left out of the connection
+  object, which is `null` when `totalCount` was its only field; the rest of the response
+  stays); it never answers a
+  partial number and sets no response flag. A block's or a request key's list counts with
+  its page, under the same rule (audit F-50). There is no `totalCountLowerBound` flag and no
+  `count_budget_ms` setting any more (an old config file that sets it still loads; it is
+  ignored).
+  - *Key-only counts* (no record is decoded): `transactions(accountName)` and
+    `FungibleChainAccount.transactions` served from the sender index,
+    `transactionsByPublicKey`, `transactions(isCoinbase: true)` beside them, and these with
+    `chainId`, `minHeight`, `maxHeight` or `minimumDepth`. Measured at about 17 million keys
+    a second (50,014 keys in 3 ms, release build, warm), they finish well inside the
+    deadline for any list the store holds.
+  - *Decoding counts* (each tx's record is read to count its rows): `transfers` and `events`
+    lists (an account, `fungibleName`, `qualifiedEventName`, `parametersFilter`,
+    `orderIndex`), `transactions(accountName, fungibleName)`, NFT filters, and sender lists
+    on the old path. They read frozen records ahead 256 at a time. Measured at about 220,000
+    rows a second on warm records (50,048 transfer rows in about 230 ms); cold records on the
+    production store counted about 12,500 rows a second (2,507 rows in 200 ms). **Known
+    difference:** a decoding list with more rows than the deadline can read cold (roughly
+    50,000 rows and up, fewer on a busy host; for example `events(qualifiedEventName:
+    "coin.TRANSFER")` over all heights, or the transfers of an exchange account) answers
+    `COUNT_TIMEOUT` where stock answers a number, unless the stored counts answer it (next
+    item).
+  - *Stored counts* (no walk; PR #48): a table of rows per (list kind, key, chain), user and
+    coinbase rows apart, kept by the tail at each block and each reorg and built once by
+    `kda-indexer reconcile-counts` ([operations.md](operations.md#stored-totalcount-counts)).
+    While it is marked ready, these lists answer `totalCount` from it, at any length, as a
+    sum over the chains (or one chain's row):
+    - `transfers(accountName)` and `FungibleChainAccount.transfers`; `transfers(accountName,
+      fungibleName)`; `transfers(fungibleName)`;
+    - `transactions(accountName)` and `FungibleChainAccount.transactions` (sender index);
+      `transactions(fungibleName)`; `transactionsByPublicKey`;
+    - `events(qualifiedEventName)`;
+    - each with `chainId`, and the transaction lists with `isCoinbase: true`.
+
+    These keep the walk (and its `COUNT_TIMEOUT` on very long lists): `minHeight`,
+    `maxHeight`, `minimumDepth`; `transactions(accountName, fungibleName)` (the module filter
+    reads each record); `events` with `parametersFilter`, `orderIndex` or `moduleName`;
+    `transfers(isNFT: true)`; sender lists on the old path (no sender index); lists without
+    a selective argument (the height walk); a block's or a request key's list (counted with
+    the page). Per-height buckets were left out: a height range would still walk its two edge
+    buckets, which on the lists that need them (a popular event) is the same cut. While the
+    counts are not ready (never built, or cleared by `backfill`, `rebuild-range`,
+    `segments add-index` or `hot drop-family`), every list walks as above: slower, never
+    wrong.
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
   payload `data` and capability `args` are compact JSON text of the node's values (numbers
   keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.

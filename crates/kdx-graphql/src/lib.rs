@@ -92,9 +92,6 @@ pub struct GraphqlSettings {
     pub network_host: String,
     /// Automatic persisted queries (not built; the config refuses `true`).
     pub apq: bool,
-    /// Longest a `totalCount` walk may run (a lower bound is answered past it). The walk also
-    /// stops at half of the remaining request deadline, whichever comes first.
-    pub count_budget: Duration,
     /// Keys a `last`/`before` page of a source with no oldest-first walk may collect between
     /// its cursor and the newest end ([`txlist::BACK_KEYS`]; tests lower it).
     pub back_keys: usize,
@@ -147,7 +144,6 @@ impl Default for GraphqlSettings {
             network_id: "mainnet01".into(),
             network_host: String::new(),
             apq: false,
-            count_budget: Duration::from_millis(200),
             back_keys: txlist::BACK_KEYS,
             balance_touch_keys: types::account::BALANCE_TOUCH_KEYS,
         }

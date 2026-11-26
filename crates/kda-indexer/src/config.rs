@@ -402,10 +402,9 @@ pub struct GraphqlConfig {
     pub feed_poll_ms: u64,
     /// Byte budget (MB) of the decoded blocks the subscription feed's ring holds.
     pub feed_ring_mb: u32,
-    /// Longest a `totalCount` walk runs (ms); past it the count is a lower bound, flagged in
-    /// the response `extensions`. The walk also stops at half of the remaining
-    /// `api.deadline_ms`.
-    pub count_budget_ms: u64,
+    /// Retired: `totalCount` is exact and runs to `api.deadline_ms` (a cut count is a
+    /// `COUNT_TIMEOUT` error). Still accepted, and ignored, so older config files load.
+    pub count_budget_ms: Option<u64>,
     /// Serve sender lists (`transactions(accountName)`, `FungibleChainAccount.transactions`,
     /// REST `role=sender`) from the `sndr` postings once the sender index is complete
     /// (FIX-2). `false` forces the old path (the account's postings filtered on
@@ -441,7 +440,7 @@ impl Default for GraphqlConfig {
             ws_tx_wait_secs: 3600,
             feed_poll_ms: 1000,
             feed_ring_mb: 64,
-            count_budget_ms: 200,
+            count_budget_ms: None,
             sender_index: true,
             network_host: String::new(),
             apq: false,
@@ -487,10 +486,6 @@ impl GraphqlConfig {
             "graphql.feed_ring_mb must be in 8..=4096"
         );
         anyhow::ensure!(
-            (1..=60_000).contains(&self.count_budget_ms),
-            "graphql.count_budget_ms must be in 1..=60000"
-        );
-        anyhow::ensure!(
             !self.apq,
             "graphql.apq: automatic persisted queries are not built in this version"
         );
@@ -531,7 +526,6 @@ impl GraphqlConfig {
             network_id: network.to_owned(),
             network_host: self.network_host.clone(),
             apq: self.apq,
-            count_budget: Duration::from_millis(self.count_budget_ms),
             back_keys: kdx_graphql::txlist::BACK_KEYS,
             balance_touch_keys: kdx_graphql::types::account::BALANCE_TOUCH_KEYS,
         }
@@ -882,11 +876,6 @@ mod balances_tests {
             ),
             (20, 100, 10, 2000, 10)
         );
-        assert_eq!(
-            s.count_budget,
-            std::time::Duration::from_millis(200),
-            "the count budget defaults to 200 ms"
-        );
         for bad in [
             GraphqlConfig {
                 apq: true,
@@ -902,14 +891,6 @@ mod balances_tests {
             },
             GraphqlConfig {
                 max_query_bytes: 1 << 20,
-                ..ok.clone()
-            },
-            GraphqlConfig {
-                count_budget_ms: 0,
-                ..ok.clone()
-            },
-            GraphqlConfig {
-                count_budget_ms: 60_001,
                 ..ok.clone()
             },
         ] {
@@ -1109,9 +1090,10 @@ mod ws_bound_tests {
         assert!(format!("{e:#}").contains("v1txs_deadline_ms"), "{e:#}");
     }
 
-    /// `graphql.count_budget_ms` parses from the file, defaults to 200 and reaches the settings.
+    /// `graphql.count_budget_ms` is retired (GQ-10: `totalCount` is exact): a file that still
+    /// sets it loads and validates, and nothing reads it.
     #[test]
-    fn count_budget_ms_parses_and_defaults() {
+    fn count_budget_ms_is_accepted_and_ignored() {
         let parse = |g: &str| {
             let text = format!(
                 "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
@@ -1119,13 +1101,12 @@ mod ws_bound_tests {
             );
             toml::from_str::<Config>(&text).unwrap()
         };
-        assert_eq!(parse("").graphql.count_budget_ms, 200);
-        let c = parse("count_budget_ms = 50");
-        c.validate().unwrap();
-        let ms = |c: &Config| c.graphql.settings("mainnet01").count_budget.as_millis();
-        assert_eq!(ms(&c), 50);
-        assert_eq!(ms(&parse("")), 200);
-        assert!(parse("count_budget_ms = 0").validate().is_err());
+        assert_eq!(parse("").graphql.count_budget_ms, None);
+        for old in ["count_budget_ms = 50", "count_budget_ms = 0"] {
+            let c = parse(old);
+            c.validate().unwrap();
+            assert!(c.graphql.count_budget_ms.is_some());
+        }
     }
 
     /// `api.docs_enabled` defaults to true (Swagger UI under `/docs`), parses `false`, and is

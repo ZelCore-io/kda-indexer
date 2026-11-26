@@ -159,6 +159,12 @@ fn need(r: &RangeReader, only: Only) -> Need {
 /// no recovery, swaps nothing and only reads the hot store (which may be opened read-only).
 pub fn run(segdir: &Path, hot: &HotStore, opts: Opts) -> Result<Report> {
     let t0 = Instant::now();
+    if !opts.dry_run {
+        // Segment files written outside the freezer: readers walk until `reconcile-counts`.
+        let mut txn = hot.rw()?;
+        kdx_hot::rowcount::clear_ready(&mut txn)?;
+        txn.commit()?;
+    }
     let _swap = if opts.dry_run {
         None
     } else {

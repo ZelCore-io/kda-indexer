@@ -130,7 +130,7 @@ fn commit_locked(ctx: &Ctx, batches: &[Batch], dict: &mut HotDict) -> Result<Com
                 b.chain,
                 f.height
             );
-            let n = kdx_hot::tail::unwind_to(&mut txn, b.chain, f.height)?;
+            let n = kdx_hot::tail::unwind_to_with(&mut txn, b.chain, f.height, &*dict)?;
             txn.add_counter(counters::REORGS, 1)?;
             txn.add_counter(&counters::reorgs_chain(b.chain), 1)?;
             txn.add_counter(counters::REORG_BLOCKS, i64::from(n))?;

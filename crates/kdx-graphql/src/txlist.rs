@@ -30,15 +30,14 @@
 //!   intersection, `isCoinbase: true`, the height walk) first collect the keys between the
 //!   cursor and the newest end (keys only, at most [`BACK_KEYS`], else `LIMIT`), then load
 //!   from the cursor outward. Both check the request deadline every 64 keys.
-//! - `totalCount` (GQ-10) is a count walk of at most [`COUNT_CAP`] items, run only when the
-//!   field is selected. It stops at the sooner of `count_budget` (200 ms by default, counted
-//!   from when the read starts) and half of the remaining deadline, and then answers the items
-//!   counted so far, a lower bound flagged in the response (`COUNT_TIMEOUT`).
+//! - `totalCount` (GQ-10) is exact, as stock's: a count walk of every item, run only when the
+//!   field is selected, bounded only by the request deadline. A walk the deadline cuts answers
+//!   a `COUNT_TIMEOUT` error at `totalCount`, never a partial number ([`count`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_graphql::Context;
 use kdx_api::compat::shapes::{self, Ev};
@@ -58,8 +57,6 @@ use crate::{deadline, gql};
 /// Keys a backward page of a source with no oldest-first walk ([`oldest_keys`]) may collect
 /// between its cursor and the newest end (`GraphqlSettings::back_keys`).
 pub const BACK_KEYS: usize = 200_000;
-/// `totalCount` cap (GQ-10).
-pub const COUNT_CAP: u64 = 10_000;
 /// Heights a list without a selective argument walks down from the tip (as `/txs/recent`).
 pub const MAX_HEIGHTS: u32 = 20_000;
 /// Longest name (account, module, event, public key) a list argument may carry.
@@ -1159,48 +1156,159 @@ fn run_page_desc(
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
 
-/// When a count walk that starts at `now` must stop: after `budget`, or at half of what is
-/// left of the request deadline `dl`, whichever is sooner.
-pub fn count_until(now: Instant, dl: Instant, budget: Duration) -> Instant {
-    now + budget.min(dl.saturating_duration_since(now) / 2)
-}
-
-/// Items of `spec`, up to [`COUNT_CAP`], and whether the count is exact: when `until`
-/// passes first, the items counted so far (a lower bound) and `false`.
-pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<(u64, bool)> {
+/// Items of `spec`, exactly: every item the full walk lists. A walk still running at `until`
+/// (the request deadline) ends with [`ApiError::Deadline`], never with a partial count.
+pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<u64> {
     let (src, rows) = plan(view, spec)?;
+    if let Some(n) = stored_count(view, spec, &src, &rows)? {
+        return Ok(n);
+    }
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
     let decode = rows.needs_record();
     let mut n = 0u64;
-    // A decoded record costs ~1 ms cold, so the clock is read before each one; a key-only
-    // walk reads it every `CHECK_EVERY` keys.
-    let every = if decode { 1 } else { CHECK_EVERY };
+    // The key walk reads the clock every `CHECK_EVERY` keys; a decoding walk also reads it
+    // before each record it decodes.
+    let every = CHECK_EVERY;
     let b = Bounds {
         until: Some(until),
         ..Bounds::default()
     };
+    // A decoding walk reads its frozen records ahead in batches of `COUNT_PREFETCH` keys:
+    // the cold record reads overlap instead of faulting in one by one.
+    let mut batch: Vec<(TxKey, Option<TxRecord>)> = Vec::new();
+    let flush =
+        |batch: &mut Vec<(TxKey, Option<TxRecord>)>, blocks: &mut Blocks| -> ApiResult<u64> {
+            view.prefetch(batch.iter().filter(|(_, r)| r.is_none()).map(|(k, _)| *k))?;
+            let mut m = 0u64;
+            for (k, rec) in batch.drain(..) {
+                if Instant::now() >= until {
+                    return Err(ApiError::Deadline);
+                }
+                if let Some(d) = load(view, k, rec, blocks)? {
+                    m += rows.rows(&d).len() as u64;
+                }
+            }
+            Ok(m)
+        };
     for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
         if i % every == every - 1 && Instant::now() >= until {
-            return Ok((n, false));
+            return Err(ApiError::Deadline);
         }
-        let (k, rec) = match kr {
-            // The intersection walk gave up at `until`: a lower bound, as above.
-            Err(ApiError::Deadline) if Instant::now() >= until => return Ok((n, false)),
-            r => r?,
-        };
+        let (k, rec) = kr?;
         if decode {
-            if let Some(d) = load(view, k, rec, &mut blocks)? {
-                n += rows.rows(&d).len() as u64;
+            batch.push((k, rec));
+            if batch.len() == COUNT_PREFETCH {
+                n += flush(&mut batch, &mut blocks)?;
             }
         } else {
             n += 1;
         }
-        if n >= COUNT_CAP {
-            return Ok((COUNT_CAP, true));
-        }
     }
-    Ok((n, true))
+    n += flush(&mut batch, &mut blocks)?;
+    Ok(n)
+}
+
+/// The count of `spec` from the stored per-key row counts (PR #48 part 2), or `None` when
+/// they cannot answer it: the counts are not ready, or the list has a filter they do not
+/// hold. They hold rows per (list kind, key, chain) split into user and coinbase rows, so
+/// they answer the plain lists below with no filter, a `chainId`, or `isCoinbase`. Heights,
+/// `minimumDepth`, a sender filter on a view that is not sender-ready, `fungibleName` on an
+/// account's transactions, NFT transfers and event `parametersFilter` / `orderIndex` /
+/// `moduleName` keep the walk.
+fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResult<Option<u64>> {
+    use kdx_decode::rowcount::CountKind as K;
+    let f = &spec.filter;
+    if f.min_h.is_some() || f.max_h.is_some() || f.depth.is_some() {
+        return Ok(None);
+    }
+    let &Src::Post(fam, e) = src else {
+        return Ok(None);
+    };
+    let d = view.dict();
+    let evt = |q: &str| d.find(DictKind::EventName, q).map(u64::from);
+    let acct = |a: &str| d.find(DictKind::Account, a);
+    let plain_txs = |r: &Rows| {
+        matches!(
+            r,
+            Rows::Txs {
+                sender: None,
+                nft: false,
+                module: None,
+                ..
+            }
+        )
+    };
+    let kind = match (fam, rows) {
+        (Family::Sndr, r) if plain_txs(r) => K::Sndr,
+        (Family::Pk, r) if plain_txs(r) => K::Pk,
+        (Family::Evt, r) if plain_txs(r) && e < 1 << 32 => K::EvtTxs,
+        (
+            Family::Acct,
+            Rows::Transfers {
+                module: None,
+                account: Some(a),
+                nft: false,
+            },
+        ) if acct(a).map(u64::from) == Some(e) => K::AcctXfer,
+        (
+            Family::Xfer,
+            Rows::Transfers {
+                module: Some(m),
+                account: Some(a),
+                nft: false,
+            },
+        ) if acct(a)
+            .zip(d.find(DictKind::Module, m))
+            .map(|(a, m)| xfer_entity(a, m))
+            == Some(e) =>
+        {
+            K::Xfer
+        }
+        (
+            Family::Evt,
+            Rows::Transfers {
+                module: Some(m),
+                account: None,
+                nft: false,
+            },
+        ) if evt(&format!("{m}.TRANSFER")) == Some(e) => K::TokenXfer,
+        (
+            Family::Evt,
+            Rows::Events {
+                qual: Some(q),
+                module: None,
+                order_index: None,
+                params: None,
+            },
+        ) if evt(q) == Some(e) => K::EvtRows,
+        _ => return Ok(None),
+    };
+    let Some((user, cb)) = view.row_count(kind, e, f.chain)? else {
+        return Ok(None);
+    };
+    // Coinbase rows are listed unless the keys drop them (`user_only`) or a tx list keeps
+    // only user txs (`isCoinbase` absent).
+    let with_cb = !f.user_only
+        && match rows {
+            Rows::Txs { coinbase, .. } => *coinbase,
+            _ => true,
+        };
+    Ok(Some(user.saturating_add(if with_cb { cb } else { 0 })))
+}
+
+/// Keys a decoding count walk reads ahead at once ([`count`]).
+const COUNT_PREFETCH: usize = 256;
+
+/// The error of a count the deadline cut (`COUNT_TIMEOUT`): `totalCount` is exact or absent.
+pub fn count_error(e: ApiError) -> async_graphql::Error {
+    match e {
+        ApiError::Deadline => err(
+            Code::CountTimeout,
+            "totalCount could not be counted exactly before the request deadline",
+        ),
+        e => from_api(e),
+    }
 }
 
 /// Steps of a pact one outgoing `crossChainTransfer` lookup lists at most, oldest first
@@ -1454,28 +1562,15 @@ async fn list_as(
     // A block's or a request key's rows are few: counted with the page, exactly.
     let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk { .. })
         && selects_direct(ctx, &["totalCount"]);
-    // The time budget bounds an account's count walk only (its postings are long and decode
-    // cold); every other count keeps half of the remaining deadline.
-    let count_budget = matches!(
-        spec.source,
-        SourceSpec::Acct(_)
-            | SourceSpec::Xfer { .. }
-            | SourceSpec::Sndr(_)
-            | SourceSpec::SndrXfer { .. }
-    )
-    .then_some(g.settings.count_budget);
     let sp = spec.clone();
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
-        let dl = dl.min(Instant::now() + SCAN_WINDOW);
-        // The count keeps its exactness: the deadline can cut it too (audit F-50).
-        let exact = if bounded {
-            Some(count(view, &sp, dl)?)
-        } else {
-            None
-        };
+        // The count runs to the request deadline; a cut one is an error, not a number (audit
+        // F-50, GQ-10). It is carried out of the read so the page is still served.
+        let exact = bounded.then(|| count(view, &sp, dl));
         if !reads {
             return Ok((Vec::new(), PageInfo::default(), exact));
         }
+        let dl = dl.min(Instant::now() + SCAN_WINDOW);
         let (mut edges, info) = run_page(view, &sp, &page, dl, back_keys)?;
         if xchain {
             let mut blocks = Blocks::default();
@@ -1490,38 +1585,20 @@ async fn list_as(
     })
     .await
     .map_err(from_api)?;
-    if let Some((n, exact)) = exact {
-        // A cut count is a flagged lower bound, never below the edges served (as the
-        // deferred count below).
-        let total = if exact {
-            Total::Exact(n)
-        } else {
-            Total::LowerBound(n.max(edges.len() as u64))
+    if let Some(n) = exact {
+        let total = match n {
+            Ok(n) => Total::Exact(n),
+            Err(e) => Total::Failed(count_error(e)),
         };
         return Ok(ListPage { edges, info, total });
     }
-    let served = edges.len() as u64;
     let total = Total::Deferred(Arc::new(move || {
         let state = state.clone();
         let spec = spec.clone();
-        let called = Instant::now();
         Box::pin(async move {
-            // An account's budget runs from when the read gets its slot, not from the request:
-            // time queued behind other heavy reads is not spent counting. Any other count
-            // runs to half of what the deadline had left when the count was asked for.
-            read_list(&state, one_block, move |view| {
-                let until = match count_budget {
-                    Some(b) => count_until(Instant::now(), dl, b),
-                    None => count_until(called, dl, Duration::MAX),
-                };
-                count(view, &spec, until)
-            })
-            .await
-            .map_err(from_api)
-            .map(|(n, exact)| {
-                // A cut count is never below the edges served in the same response.
-                (if exact { n } else { n.max(served) }, exact)
-            })
+            read_list(&state, one_block, move |view| count(view, &spec, dl))
+                .await
+                .map_err(count_error)
         })
     }));
     Ok(ListPage { edges, info, total })
@@ -1730,7 +1807,7 @@ mod intersect_tests {
             "pulled {}",
             pulled.get()
         );
-        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
         // With no deadline the same walk is exact.
         let a = (0..1_000u64).rev().map(|k| Ok(TxKey(k + 10)));
         let got: Vec<_> = IntersectDesc::with_until(keys(&[500, 5]).into_iter(), a, None)
@@ -1948,18 +2025,6 @@ mod xchain_tests {
         assert_eq!(read.get(), XCHAIN_BUDGET);
     }
 
-    /// The count walk stops at the sooner of its budget and half the deadline left.
-    #[test]
-    fn the_count_stops_at_the_sooner_of_budget_and_half_the_deadline() {
-        let now = Instant::now();
-        let ms = Duration::from_millis;
-        assert_eq!(count_until(now, now + ms(5000), ms(200)), now + ms(200));
-        assert_eq!(count_until(now, now + ms(300), ms(200)), now + ms(150));
-        assert_eq!(count_until(now, now + ms(5000), Duration::ZERO), now);
-        // A deadline already past: stop at once.
-        assert_eq!(count_until(now + ms(10), now, ms(200)), now + ms(10));
-    }
-
     /// The request deadline stops the walk before a decode.
     #[test]
     fn the_deadline_stops_the_walk() {
@@ -2073,7 +2138,7 @@ mod xchain_store_tests {
 
     fn view(f: &Fixture) -> View {
         f.st.store
-            .view(Instant::now() + Duration::from_secs(60))
+            .view(Instant::now() + std::time::Duration::from_secs(60))
             .unwrap()
     }
 

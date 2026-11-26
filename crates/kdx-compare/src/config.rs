@@ -73,7 +73,8 @@ pub struct GraphqlConfig {
     pub skip_ops: Vec<String>,
     /// Heights per sampled block window and attempts per sample (generator bounds).
     pub window: u64,
-    /// `totalCount` values above this compare as this (GQ-10).
+    /// `totalCount` values above this compare as this. No cap by default: ours is exact, as
+    /// stock's (GQ-10, owner ruling 2026-11-26); a lower value only replays old captures.
     pub total_count_cap: u64,
     /// Node and native pairs (`NodeTx`, `NodeBlock`, `NodeBalance`) run in their own loop,
     /// one step every this many milliseconds, so the oracle limiter does not pace them
@@ -223,7 +224,7 @@ impl Default for GraphqlConfig {
             own_ops_dir: PathBuf::from("compare/graphql"),
             skip_ops: Vec::new(),
             window: 50,
-            total_count_cap: 10_000,
+            total_count_cap: u64::MAX,
             node_step_ms: 10_000,
             redraws: 4,
             field_rules: Vec::new(),
