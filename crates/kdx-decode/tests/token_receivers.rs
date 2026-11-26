@@ -11,8 +11,8 @@
 
 use kdx_decode::receivers::{
     coin_create_accounts, d3_candidates, d3_filter, injected_miner_receivers, token_receivers,
-    MAINNET01, MAX_COIN_CREATE_PER_TX, MAX_EVENT_PAIRS_PER_EVENT, MAX_EVENT_PAIRS_PER_TX,
-    MAX_EXEC_PAIRS_PER_TX, MAX_MODREF_PAIRS_PER_TX,
+    MAINNET01, MAX_COIN_CREATE_LITERALS_PER_TX, MAX_COIN_CREATE_PER_TX, MAX_EVENT_PAIRS_PER_EVENT,
+    MAX_EVENT_PAIRS_PER_TX, MAX_EXEC_PAIRS_PER_TX, MAX_MODREF_PAIRS_PER_TX,
 };
 use serde_json::{json, Value};
 
@@ -1172,21 +1172,78 @@ fn a_symbol_key_stops_at_a_comment() {
     );
 }
 
-/// A code text asking for more creates than [`MAX_COIN_CREATE_PER_TX`] gives that many.
+/// Secpass A I-2: literal-only calls (the account and the guard both stated in the code, the
+/// form a call that never runs can take for parse gas alone) give at most
+/// [`MAX_COIN_CREATE_LITERALS_PER_TX`] (64, as before #56).
 #[test]
-fn exact_creates_are_capped_per_tx() {
+fn literal_only_creates_are_capped_at_64() {
     let code: String = (0..MAX_COIN_CREATE_PER_TX + 500)
         .map(|i| format!("(coin.create-account \"k:acct-{i:05}\" g)"))
         .collect();
     let got = coin_create_accounts(&code, None);
-    assert_eq!(got.len(), MAX_COIN_CREATE_PER_TX);
+    assert_eq!(got.len(), MAX_COIN_CREATE_LITERALS_PER_TX);
     assert_eq!(got[0], "k:acct-00000");
+    // In an untaken branch, with a literal keyset: the same cap.
+    let dead = format!("(if false (do {code}) 1)");
+    assert_eq!(
+        coin_create_accounts(&dead, Some(&json!({}))).len(),
+        MAX_COIN_CREATE_LITERALS_PER_TX
+    );
     let cmd = json!({"payload": {"exec": {"data": null, "code": code}}});
     let o = out(json!("Write succeeded"), json!([]), Value::Null);
     let r = token_receivers(Some(&cmd), &o, 2_000_000, MAINNET01, &tokens);
     let coin = pairs(&r.pairs).iter().filter(|(_, m)| *m == "coin").count();
     assert!(
-        coin <= MAX_COIN_CREATE_PER_TX + MAX_EXEC_PAIRS_PER_TX,
+        coin <= MAX_COIN_CREATE_LITERALS_PER_TX + MAX_EXEC_PAIRS_PER_TX,
         "{coin}"
+    );
+}
+
+/// Secpass A I-2: the data form (the account, or its `(read-keyset k)` guard, read from a
+/// distinct key of `exec.data`, which the sender pays bytes for) keeps the 1,000 cap. A data
+/// key backs one call only: reusing one keyset for every call is the literal form.
+#[test]
+fn data_backed_creates_keep_the_1000_cap() {
+    let n = MAX_COIN_CREATE_PER_TX + 500;
+    let mut data = serde_json::Map::new();
+    let mut code = String::new();
+    for i in 0..n {
+        data.insert(format!("a{i}"), json!(format!("k:msg-{i:05}")));
+        code.push_str(&format!("(coin.create-account (read-msg \"a{i}\") g)"));
+    }
+    let data = Value::Object(data);
+    assert_eq!(
+        coin_create_accounts(&code, Some(&data)).len(),
+        MAX_COIN_CREATE_PER_TX
+    );
+    // Literal accounts guarded by distinct data keysets (the captured bot batches' form).
+    let mut data = serde_json::Map::new();
+    let mut code = String::new();
+    for i in 0..n {
+        data.insert(format!("ks{i}"), json!({"keys": [R1], "pred": "keys-all"}));
+        code.push_str(&format!(
+            "(coin.create-account \"k:lit-{i:05}\" (read-keyset \"ks{i}\"))"
+        ));
+    }
+    let data = Value::Object(data);
+    assert_eq!(
+        coin_create_accounts(&code, Some(&data)).len(),
+        MAX_COIN_CREATE_PER_TX
+    );
+    // One shared keyset: one call is data-backed, the rest are literal-only.
+    let code: String = (0..n)
+        .map(|i| format!("(coin.create-account \"k:one-{i:05}\" (read-keyset \"ks0\"))"))
+        .collect();
+    assert_eq!(
+        coin_create_accounts(&code, Some(&data)).len(),
+        1 + MAX_COIN_CREATE_LITERALS_PER_TX
+    );
+    // A keyset key absent from data backs nothing.
+    let code: String = (0..n)
+        .map(|i| format!("(coin.create-account \"k:no-{i:05}\" (read-keyset \"zz{i}\"))"))
+        .collect();
+    assert_eq!(
+        coin_create_accounts(&code, Some(&data)).len(),
+        MAX_COIN_CREATE_LITERALS_PER_TX
     );
 }

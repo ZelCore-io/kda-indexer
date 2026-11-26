@@ -163,6 +163,38 @@ pub fn untouch_tx(txn: &mut RwTxn<'_>, key: TxKey) -> Result<usize> {
     Ok(rows.len())
 }
 
+/// Remove every entry whose first transfer is at `from` or above (secpass A m-2: a backfill
+/// resume drops the rows of a range whose MDBX commit landed but whose manifest commit did
+/// not, with the names that range interned). Exact only when no tail tx is stored (the
+/// caller's `no_tail`): such a row did not exist before the range, since [`touch`] keeps the
+/// smallest first. One range scan of `HolderByTx` (keyed by TxKey, height first), bounded by
+/// the rows that range added. Returns how many it removed.
+pub fn drop_from(txn: &mut RwTxn<'_>, from: u32) -> Result<usize> {
+    let start = from.to_be_bytes();
+    let rows = txn.scan(Table::HolderByTx, &start, |_| true)?;
+    for (k, _) in &rows {
+        let (Some(first), Some(m), Some(a)) = (
+            k.get(..8)
+                .and_then(|b| b.try_into().ok())
+                .map(TxKey::from_be_bytes),
+            k.get(8..12)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_be_bytes),
+            k.get(12..16)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_be_bytes),
+        ) else {
+            anyhow::bail!("bad HolderByTx key");
+        };
+        txn.del(Table::HolderByTx, k)?;
+        if first_of(txn, a, m, first.chain())? == Some(first) {
+            txn.del(Table::HolderFirst, &bal_key(a, m, first.chain()))?;
+        }
+        txn.del(Table::Holders, &hold_key(m, first.chain(), first, a))?;
+    }
+    Ok(rows.len())
+}
+
 /// First transfers of a batch of records (a backfill range or a rebuild walk): the smallest
 /// TxKey per `(account, module, chain)`, keyed like `Balances`.
 #[derive(Debug, Default, Clone)]

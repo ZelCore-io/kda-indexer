@@ -222,3 +222,30 @@ fn record_bytes_do_not_depend_on_prior_interning() {
     assert_eq!(first, backfill);
     assert_eq!(again, backfill);
 }
+
+/// Secpass A m-6: a name over 256 bytes that is a holder side (at most 1024 bytes) is interned
+/// for the holders table, so it is not "left unindexed"; one that is not a holder side, or is
+/// over 1024 bytes, still is.
+#[test]
+fn a_long_holder_side_is_not_counted_unindexed() {
+    let holder = "h".repeat(300);
+    let b = block(json!([event(
+        "spam",
+        "TRANSFER",
+        json!([holder, "k:ok", 1.0])
+    )]));
+    let mut dict = MemDict::new();
+    let ib = index_block(&b, &VerifyReport::default(), &mut dict).expect("indexes");
+    assert!(dict.find(DictKind::Account, &holder).is_some());
+    assert_eq!(ib.unindexed_accounts, 0);
+    // Not a holder side (the amount is not stock's form): left unindexed and counted.
+    let b = block(json!([event(
+        "spam",
+        "TRANSFER",
+        json!([holder, "k:ok", "1.0"])
+    )]));
+    let mut dict = MemDict::new();
+    let ib = index_block(&b, &VerifyReport::default(), &mut dict).expect("indexes");
+    assert!(dict.find(DictKind::Account, &holder).is_none());
+    assert_eq!(ib.unindexed_accounts, 1);
+}

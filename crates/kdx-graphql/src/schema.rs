@@ -480,22 +480,32 @@ impl Query {
             }
             view.check_deadline()
         };
+        // `None`: the swap history fill has not finished (secpass A I-3).
         let row = crate::gql(ctx)
             .state()?
             .read_heavy(move |view| {
                 spent(view)?;
+                if !kdx_hot::prices::ready(&view.txn)? {
+                    return Ok(None);
+                }
                 let found = kdx_hot::prices::lookup_checked(&view.txn, &module_name, &mut || {
                     spent(view)?;
                     Ok(())
                 });
                 match found {
-                    Ok(row) => Ok(row),
+                    Ok(row) => Ok(Some(row)),
                     // The deadline passed inside the scan: answer it as every read does.
                     Err(e) => spent(view).and(Err(e.into())),
                 }
             })
             .await
             .map_err(crate::error::from_api)?;
+        let Some(row) = row else {
+            return Err(crate::error::err(
+                crate::error::Code::NotAvailable,
+                "token prices are being built (the swap history fill has not finished)",
+            ));
+        };
         Ok(row
             .as_ref()
             .and_then(kdx_hot::prices::price_text)

@@ -525,9 +525,12 @@ pub fn add_tx(txn: &mut RwTxn<'_>, r: &TxRecord, sign: i64) -> Result<()> {
         return Ok(());
     };
     let chain = r.key.chain();
-    if sign >= 0 && !term.priced {
-        // Review M-1: counted with 0 gas where stock has a price.
-        kdx_metrics::get().chain_counters_unpriced("tail", 1);
+    if !term.priced {
+        // Review M-1: counted with 0 gas where stock has a price. Secpass A m-9: an unwind
+        // counts under `mode="unwind"`, so `backfill + tail - unwind` is the net stored
+        // (comparable with `reconcile-counts --check`'s `unpriced`) after any reorg.
+        let mode = if sign >= 0 { "tail" } else { "unwind" };
+        kdx_metrics::get().chain_counters_unpriced(mode, 1);
     }
     let raw = txn.get(Table::ChainCounters, &[chain])?;
     let mut c = match raw.as_deref().map(decode_val) {
@@ -595,6 +598,84 @@ pub fn add_tally(txn: &mut RwTxn<'_>, t: &Tally) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Meta key of the last backfill range's totals (secpass A m-1): start u32, end u32,
+/// unpriced u64, then per chain `chain u8 ‖ encode_val` (at most 20 chains: under 1 KB).
+/// Written in the range's commit with the totals it added, so a resume that finds the range
+/// committed to MDBX but not to the manifest subtracts exactly them ([`undo_range`]).
+pub const RANGE: &str = "chain_counters_range";
+
+/// Store `t` as the totals of backfill range `start..end` ([`RANGE`]), in its commit txn.
+pub fn set_range(txn: &mut RwTxn<'_>, start: u32, end: u32, t: &Tally) -> Result<()> {
+    let mut v = Vec::with_capacity(16 + t.chains.len() * 41);
+    v.extend_from_slice(&start.to_be_bytes());
+    v.extend_from_slice(&end.to_be_bytes());
+    v.extend_from_slice(&t.unpriced.to_be_bytes());
+    for (&c, &n) in &t.chains {
+        v.push(c);
+        v.extend_from_slice(&encode_val(n));
+    }
+    txn.set_meta(RANGE, &v)
+}
+
+fn decode_range(v: &[u8]) -> Option<(u32, u32, Tally)> {
+    let start = u32::from_be_bytes(v.get(..4)?.try_into().ok()?);
+    let end = u32::from_be_bytes(v.get(4..8)?.try_into().ok()?);
+    let unpriced = u64::from_be_bytes(v.get(8..16)?.try_into().ok()?);
+    let mut t = Tally {
+        unpriced,
+        ..Tally::default()
+    };
+    for e in v.get(16..)?.chunks(41) {
+        let (&c, rest) = e.split_first()?;
+        t.chains.insert(c, decode_val(rest)?);
+    }
+    Some((start, end, t))
+}
+
+/// Resume after a kill between a backfill range's MDBX commit and its manifest commit:
+/// subtract the totals of the range `start..end` the hot store holds above the manifest, when
+/// [`RANGE`] stores exactly that range. Returns false (nothing changed; the caller clears the
+/// marker) when it does not, or a subtraction would go below zero.
+pub fn undo_range(txn: &mut RwTxn<'_>, start: u32, end: u32) -> Result<bool> {
+    let Some((s, e, t)) = txn.meta(RANGE)?.as_deref().and_then(decode_range) else {
+        return Ok(false);
+    };
+    if (s, e) != (start, end) {
+        return Ok(false);
+    }
+    let mut next = Vec::with_capacity(t.chains.len());
+    for (&chain, v) in &t.chains {
+        let raw = txn.get(Table::ChainCounters, &[chain])?;
+        let cur = match raw.as_deref().map(decode_val) {
+            None => Counts::default(),
+            Some(Some(c)) => c,
+            Some(None) => return Ok(false),
+        };
+        let Some(n) = cur
+            .user_txs
+            .checked_sub(v.user_txs)
+            .zip(cur.gas.checked_sub(v.gas))
+        else {
+            return Ok(false);
+        };
+        next.push((
+            chain,
+            Counts {
+                user_txs: n.0,
+                gas: n.1,
+            },
+        ));
+    }
+    for (chain, c) in next {
+        put(txn, chain, c)?;
+    }
+    txn.del(Table::Meta, RANGE.as_bytes())?;
+    if t.unpriced > 0 {
+        kdx_metrics::get().chain_counters_unpriced("unwind", t.unpriced);
+    }
+    Ok(true)
 }
 
 /// Replace the whole table with `t` (`reconcile-counts`; the caller sets the marker).

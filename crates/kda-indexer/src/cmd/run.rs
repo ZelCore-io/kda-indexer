@@ -440,8 +440,24 @@ async fn follow(
                     return Ok(());
                 }
                 tracing::info!("prices: swap history fill");
-                let rep = kdx_ingest::price_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled())?;
-                tracing::info!(report = %serde_json::to_string(&rep)?, "prices: fill pass ended");
+                // Secpass A I-3: a failed attempt is retried (growing wait) until it
+                // finishes or the process stops; prices answer NOT_AVAILABLE meanwhile.
+                let rep = kdx_ingest::price_fill::run_with_retry(
+                    || kdx_ingest::price_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled()),
+                    &mut |d| {
+                        let until = std::time::Instant::now() + d;
+                        while std::time::Instant::now() < until {
+                            if s.is_cancelled() {
+                                return false;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                        true
+                    },
+                );
+                if let Some(rep) = rep {
+                    tracing::info!(report = %serde_json::to_string(&rep)?, "prices: fill pass ended");
+                }
                 Ok(())
             })
             .await;

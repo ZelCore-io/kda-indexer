@@ -111,6 +111,8 @@ pub struct Metrics {
     /// User txs counted in the per-chain counters with 0 gas because their `gasPrice` did not
     /// parse (`mode` = backfill | tail): stock has a price for them, so any is an under-count.
     pub chain_counters_unpriced: Count,
+    /// Failed attempts of the swap history fill (each is retried; secpass A I-3).
+    pub price_fill_failures: Counter,
     /// `kf.fil` files present but not trusted at range open (checksum, header or key count
     /// mismatch); the range is probed as if it had no filter.
     pub key_filter_untrusted: Counter,
@@ -359,9 +361,14 @@ impl Metrics {
             "Optional range files listed in range.toml but missing at open, by file",
             Count::default()
         );
+        let price_fill_failures = reg!(
+            "kdx_price_fill_failures",
+            "Failed attempts of the swap history fill (retried; lastTokenPriceInKda is NOT_AVAILABLE until it finishes)",
+            Counter::default()
+        );
         let chain_counters_unpriced = reg!(
             "kdx_chain_counters_unpriced",
-            "User txs added to the per-chain counters with 0 gas (gasPrice did not parse), by mode",
+            "User txs added to the per-chain counters with 0 gas (gasPrice did not parse), by mode; mode=unwind counts their removal, so backfill + tail - unwind is the net stored",
             Count::default()
         );
         let key_filter_untrusted = reg!(
@@ -428,6 +435,7 @@ impl Metrics {
             alloc_mapped_bytes,
             segment_optional_missing,
             chain_counters_unpriced,
+            price_fill_failures,
             key_filter_untrusted,
             key_filter_bytes,
             sender_index_ready,

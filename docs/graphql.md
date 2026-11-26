@@ -695,12 +695,16 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
     when every row is at 0), so its `transfers` and `transactions` stay reachable after it is
     drained. The native `/accounts/{account}/balances` and `/keys/{pubkey}/accounts` follow
     this rule too ([api.md](api.md)).
-  - `balance(...)` lists every row above 0, plus the rows at 0 that a TRANSFER event touched:
-    the account's transfer list in that module (what `transfers(accountName, fungibleName,
-    chainId)` reads) has an entry on the row's chain. A row at 0 that only `create-account`,
-    `rotate` or a token's own `create-account` wrote is left out, as stock leaves it out.
-    This is worked out when the query runs, from the transfer postings; nothing is stored.
-    Our transfer postings come only from node events, which start at the events fork
+  - `balance(...)` lists every row above 0, plus the rows at 0 that a TRANSFER event touched,
+    by stock's rule: the row is in stock's `Balances` set (an event named exactly `TRANSFER`
+    with three params, string sides and stock's amount forms: a number, `{decimal: "<s>"}`
+    or `{integer: "<s>"}`). The holders table holds exactly that set, so each zero row is one
+    `HolderFirst` read. A row at 0 that only `create-account`, `rotate` or a token's own
+    `create-account` wrote is left out, as stock leaves it out. While the holders table is
+    not ready (a store built before it), the check falls back to the account's transfer
+    postings in that module (what `transfers(accountName, fungibleName, chainId)` reads),
+    which follow chainweb-data's wider rule (a name ending in `TRANSFER`, more amount forms),
+    with the caps below. Our transfer postings come only from node events, which start at the events fork
     (1,138,000 on mainnet), as stock's TRANSFER rows do, so a row drained before the fork is
     not counted as touched in either. The check reads at most 10,000 transfer keys per
     account and module, newest first, and at most 40,000 for all modules of one request;
@@ -927,6 +931,11 @@ fill has finished. `dexMetrics` ranges are capped at
 1,100 days.
 
 ### Token price
+
+`lastTokenPriceInKda` answers `NOT_AVAILABLE` until the one-off swap history fill has
+finished on the store (`Meta price_filled`): before that, the table holds only the swaps the
+tail stored since the reindex, and a price from partial history would be wrong. A failed fill
+is retried (30 s, doubling to 10 min; `kdx_price_fill_failures_total`).
 
 `lastTokenPriceInKda(moduleName)` follows stock (indexer-kadena `90a4be1`,
 `last-token-price-in-kda-resolver.ts`). Stock takes the newest transaction

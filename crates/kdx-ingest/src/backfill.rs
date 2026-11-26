@@ -230,11 +230,25 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
     drop(txn);
     if stale {
         let mut txn = ctx.hot.rw()?;
-        // Frozen ranges written outside the freezer: the stored row counts no longer hold.
-        kdx_hot::rowcount::clear_ready(&mut txn)?;
-        // A range whose MDBX commit (with its chain counter totals) landed but whose
-        // manifest commit did not is built again: its totals would count twice.
-        kdx_hot::chaincount::clear_ready(&mut txn)?;
+        let hot_front = txn.frozen_frontier()?;
+        // A range whose MDBX commit (with its chain counter totals and row counts) landed but
+        // whose manifest commit did not is built again: its totals would count twice. The
+        // range's commit stored them (secpass A m-1), so they are subtracted; anything else
+        // (no stored range, a different one) clears the marker as before.
+        kdx_hot::chaincount::guard(&mut txn)?;
+        kdx_hot::rowcount::guard(&mut txn)?;
+        if !(hot_ahead && kdx_hot::chaincount::undo_range(&mut txn, m.frontier, hot_front)?) {
+            kdx_hot::chaincount::clear_ready(&mut txn)?;
+        }
+        if !(hot_ahead && kdx_hot::rowcount::undo_range(&mut txn, m.frontier, hot_front)?) {
+            kdx_hot::rowcount::clear_ready(&mut txn)?;
+        }
+        // Secpass A m-2: with no tail data, the rows that range added (first transfer at or
+        // above the manifest frontier) go with the names truncated below; the rebuilt range
+        // adds them again. With tail data, `touch` keeps the smallest first and the rows stay.
+        if hot_ahead && no_tail {
+            kdx_hot::holders::drop_from(&mut txn, m.frontier)?;
+        }
         txn.set_frozen_frontier(m.frontier)?;
         // The holders keep the rows that range added: the range is built again with the same
         // first transfers (`touch` keeps the smallest), so the table follows the frontier
@@ -242,6 +256,8 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
         kdx_hot::holders::guard(&mut txn)?;
         txn.set_next_txnum(m.next_txnum)?;
         kdx_hot::holders::stamp_txnum(&mut txn)?;
+        kdx_hot::chaincount::stamp_txnum(&mut txn)?;
+        kdx_hot::rowcount::stamp_txnum(&mut txn)?;
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
             match prev.get(&c) {
                 Some(&(h, hash)) => set_checkpoint(&mut txn, Stage::Headers, c, h, hash)?,
@@ -725,6 +741,9 @@ fn build_and_commit(
     let mut unindexed = 0u64;
     // The range's per-chain user-tx and gas totals, added in its MDBX commit.
     let mut chains = kdx_hot::chaincount::Tally::default();
+    // Row counts of the range (secpass A I-1): one entry per distinct (kind, entity, chain).
+    let mut rows = kdx_hot::rowcount::Tally::default();
+    let mut rows_ok = true;
     // The range's first transfer per holder row, added in its MDBX commit (`kdx_hot::holders`).
     let mut holders = kdx_hot::holders::Tally::default();
     let mut w = RangeWriter::create(
@@ -785,6 +804,8 @@ fn build_and_commit(
             unindexed += u64::from(ib.unindexed_accounts);
             for r in &ib.txs {
                 chains.add(r);
+                // Secpass A I-1: the row counts from block 0, as `tail::apply` adds them.
+                rows_ok &= rows.add(r, &*dict);
             }
             for x in &ib.idx {
                 holders.add_sides(&x.holders, x.key);
@@ -827,14 +848,23 @@ fn build_and_commit(
     // Review I-2: counters that do not follow this store (a range an older build added
     // since the last stamp) are cleared before this range moves `next_txnum`, not stamped over.
     kdx_hot::chaincount::guard(&mut txn)?;
-    // PR #54 review I-1: the same for the holders table.
+    // PR #54 review I-1: the same for the holders table, and for the row counts.
     kdx_hot::holders::guard(&mut txn)?;
+    kdx_hot::rowcount::guard(&mut txn)?;
     txn.set_next_txnum(entry.end_txnum())?;
     txn.set_frozen_frontier(entry.end)?;
-    // A range written outside the freezer: the stored row counts no longer hold (PR #48).
-    kdx_hot::rowcount::clear_ready(&mut txn)?;
-    // The chain counters follow backfill from block 0 (`kdx_hot::chaincount`).
+    // The chain counters follow backfill from block 0 (`kdx_hot::chaincount`), and the
+    // range's totals are kept for a resume (secpass A m-1).
     kdx_hot::chaincount::add_tally(&mut txn, &chains)?;
+    kdx_hot::chaincount::set_range(&mut txn, entry.start, entry.end, &chains)?;
+    // The row counts too (secpass A I-1): the range's terms, as `tail::apply` adds them. A tx
+    // whose output does not render clears the marker, as at apply.
+    kdx_hot::rowcount::add_tally(&mut txn, &rows, 1)?;
+    if !rows_ok {
+        kdx_hot::rowcount::clear_ready(&mut txn)?;
+    }
+    kdx_hot::rowcount::set_range(&mut txn, entry.start, entry.end, &rows)?;
+    kdx_hot::rowcount::stamp_txnum(&mut txn)?;
     // Review I-1: a store whose first range starts above height 0 (`backfill --from H` into
     // a new data dir) has no all-time counters.
     let first = manifest.entries.first().map_or(entry.start, |e| e.start);

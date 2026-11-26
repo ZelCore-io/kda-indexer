@@ -821,7 +821,8 @@ fn xfer_touched(
 }
 
 /// `balance(accountName, module, chainIds)`: an account's fungible rows above 0, plus its rows
-/// at 0 that a TRANSFER touched (stock's rule; [`xfer_touched`]), listed by module name then
+/// at 0 that a stock TRANSFER touched (stock's `Balances` set: the holders table, or
+/// [`xfer_touched`] while it is not ready), listed by module name then
 /// chain, filtered by `module` and `chainIds`. Without `accountName`, a module's holders
 /// ([`query_holders`]); without both, stock's error.
 #[allow(clippy::too_many_arguments)]
@@ -947,11 +948,27 @@ pub async fn query_balance(
             // `transfers(accountName, fungibleName, chainId)` reads). Rows above 0 are always
             // listed. Our transfer postings come only from node events, which start at the
             // events fork, as stock's TRANSFER rows do, so no height bound is needed.
+            //
+            // Secpass A I-4 / B M-14: stock's rule is its `Balances` set (an event named exactly
+            // `TRANSFER`, stock's amount forms), which the holders table holds exactly: one
+            // `HolderFirst` read per zero row. The `xfer` postings follow chainweb-data's wider
+            // rule (a name ending in `TRANSFER`, more amount forms), so they are only the
+            // fallback, capped, while the holders table is not ready.
+            let holders_ready = kdx_hot::holders::ready(&view.txn)?;
             let mut budget = touch_keys.saturating_mul(BALANCE_TOUCH_MODULES);
             for (m, (name, rows)) in zero {
                 let want: BTreeSet<u8> = rows.keys().copied().collect();
-                let (touched, capped) =
-                    xfer_touched(view, (a, m), &want, touch_keys, &mut budget, &check)?;
+                let (touched, capped) = if holders_ready {
+                    let mut t = BTreeSet::new();
+                    for &c in &want {
+                        if kdx_hot::holders::first_of(&view.txn, a, m, c)?.is_some() {
+                            t.insert(c);
+                        }
+                    }
+                    (t, false)
+                } else {
+                    xfer_touched(view, (a, m), &want, touch_keys, &mut budget, &check)?
+                };
                 for (c, text) in rows {
                     if touched.contains(&c) {
                         out.push((name.clone(), c, text));

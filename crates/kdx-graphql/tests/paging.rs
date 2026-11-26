@@ -19,7 +19,7 @@ use kdx_hot::balances::{bal_key, BalanceRow};
 use kdx_hot::{HotDict, Table};
 use kdx_segment::{Manifest, RangeKind, RangeWriter, WriteOpts};
 use kdx_types::hash::b64url_encode;
-use kdx_types::{blake2b_256, DictKind, DictMut, TxKey};
+use kdx_types::{blake2b_256, Dict, DictKind, DictMut, TxKey};
 use serde_json::{json, Value};
 
 /// Heights below this are frozen (in segments), the rest hot.
@@ -1541,6 +1541,8 @@ async fn a_capped_transfer_probe_keeps_the_zero_rows_it_could_not_resolve() {
         balance_touch_keys: 1,
         ..GraphqlSettings::default()
     });
+    // The probe runs only while the holders table is not ready (secpass A I-4).
+    clear_holders_marker(&fx);
     let before = kdx_metrics::get().graphql_balance_touch_capped.get();
     let (rows, v) = balance_rows(&fx.schema, CAROL, "").await;
     // Carol's newest coin and kaddex.kdx transfer keys are both on chain 1 (height 12): one
@@ -1565,8 +1567,56 @@ async fn a_capped_transfer_probe_keeps_the_zero_rows_it_could_not_resolve() {
         balance_touch_keys: 1000,
         ..GraphqlSettings::default()
     });
+    clear_holders_marker(&fx);
     let (rows, v) = balance_rows(&fx.schema, CAROL, "").await;
     assert_eq!(rows.len(), 4, "{v}");
+}
+
+fn clear_holders_marker(fx: &Fx) {
+    let mut t = fx.store.hot.rw().unwrap();
+    kdx_hot::holders::clear_ready(&mut t).unwrap();
+    t.commit().unwrap();
+}
+
+/// Secpass A I-4 / B M-14: a row at 0 is listed when stock's `Balances` set has it, i.e. the
+/// holders table (`HolderFirst`) has `(account, module, chain)`: an event named exactly
+/// `TRANSFER` with stock's amount forms. The `xfer` postings follow chainweb-data's wider rule
+/// (a name ending in `TRANSFER`, amounts such as `{"int": 5}` or `"1.0"`), so a posting alone
+/// does not list a zero row while the table is ready. Without the table, the posting probe is
+/// the fallback, and on stock-shaped events both give the same rows.
+#[tokio::test]
+async fn balance_zero_rows_follow_stocks_transfer_rule() {
+    let fx = fixture();
+    let (ready_rows, v) = balance_rows(&fx.schema, CAROL, "").await;
+    assert_eq!(
+        ready_rows,
+        ["coin:0=0", "coin:1=2", "coin:3=1", "kaddex.kdx:0=0"],
+        "{v}"
+    );
+    // Equivalence on the fixture's (stock-shaped) transfers: the posting probe agrees.
+    let fb = fixture();
+    clear_holders_marker(&fb);
+    let (probe_rows, v) = balance_rows(&fb.schema, CAROL, "").await;
+    assert_eq!(probe_rows, ready_rows, "{v}");
+    // A non-stock transfer (say `free.wiz.WIZ_TRANSFER`, or a `TRANSFER` whose amount is
+    // `{"int": 5}`) gives Carol an `xfer` posting in kaddex.kdx on chain 2, and no holder row.
+    for f in [&fx, &fb] {
+        let mut t = f.store.hot.rw().unwrap();
+        let d = HotDict::load(&t).unwrap();
+        let carol = d.mem().find(DictKind::Account, CAROL).unwrap();
+        let kdx = d.mem().find(DictKind::Module, "kaddex.kdx").unwrap();
+        let e = kdx_decode::index::xfer_entity(carol, kdx);
+        let k =
+            kdx_hot::tables::posting_key(kdx_decode::Family::Xfer as u8, e, TxKey::new(12, 2, 0));
+        t.put(Table::TailPostings, &k, &[]).unwrap();
+        t.commit().unwrap();
+    }
+    // Stock leaves kaddex.kdx:2 out: so does the holders rule.
+    let (rows, v) = balance_rows(&fx.schema, CAROL, "").await;
+    assert_eq!(rows, ready_rows, "{v}");
+    // The fallback probe (table not ready) reads the wider posting and lists it.
+    let (rows, v) = balance_rows(&fb.schema, CAROL, "").await;
+    assert!(rows.contains(&"kaddex.kdx:2=0".to_owned()), "{v}");
 }
 
 /// N-12: `balance(...)` honours the request deadline in its row walk and its transfer
@@ -2922,8 +2972,9 @@ mod stored_count {
             kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
         }
         let ingest = rowcount::read_all(&t).unwrap();
-        // Ingest keeps the table but never marks it ready: only the backfill does.
-        assert!(!rowcount::ready(&t).unwrap());
+        // A new store's marker is set and ingest keeps the table from block 0, as backfill
+        // does (secpass A I-1): ready with no `reconcile-counts`.
+        assert!(rowcount::ready(&t).unwrap());
         // The per-chain counters: ingest keeps them ready from block 0, equal to the walk.
         let (both, _) =
             row_counts::tally_both(&fx.store.segdir, &fx.store.hot, 3, &|| false).unwrap();

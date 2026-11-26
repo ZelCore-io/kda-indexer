@@ -287,6 +287,9 @@ The G4 replay of real traffic (below) met most of these classes again; its
   [load-balancer.md](load-balancer.md#4-apply-check-roll-back)).
 - Stock root fields outside Kadena's schema (`pools`, `dexMetrics`, `tokenPrices`) are not
   served, so introspection answers differ ([graphql.md](graphql.md#schema)).
+- Holders (`balance(module:)`): stock stringifies a non-string account of a marmalade
+  `MINT`/`TRANSFER`/`RECONCILE` row in its SQL insert; ours keeps only string accounts (no
+  such event is known on mainnet). Token ids follow stock (any truthy value).
 - `balance(...)` lists fungible balances only; stock also lists marmalade ledger rows at 0
   (R-G4-03, [graphql.md](graphql.md#schema)).
 - Zero rows follow stock's two rules: `fungibleAccount` (and the chain account lists, the

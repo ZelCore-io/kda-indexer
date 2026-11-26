@@ -37,6 +37,8 @@
 //! `Meta price_undo/{chain}/{height}` (like the D3 marks); an unwind restores them newest first,
 //! the freezer drops the log with the block.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Context, Result};
 use kdx_types::record::{EventRec, TxRecord};
 use kdx_types::varint::{get_bytes, get_u8, put_bytes};
@@ -355,6 +357,65 @@ pub fn upsert(
     Ok(n)
 }
 
+/// Whether the swap history fill has finished on this store (`Meta price_filled`; secpass A
+/// I-3). Until then the table holds only what the tail stored since the reindex (and the part
+/// of history a running fill reached): readers answer `NOT_AVAILABLE`, not a partial price.
+pub fn ready(txn: &impl Txn) -> Result<bool> {
+    Ok(txn.meta(meta::PRICE_FILLED)?.is_some())
+}
+
+/// Set the readiness marker (the fill's last write): `height` is the highest tail height then.
+pub fn set_ready(txn: &mut RwTxn<'_>, height: u32) -> Result<()> {
+    txn.set_meta(meta::PRICE_FILLED, &height.to_be_bytes())
+}
+
+/// The `TokenSwaps` keys named in any undo log, per chain, read once per write txn of the
+/// fill (secpass A m-5): a fill row whose key no unfrozen tail block logged needs no log walk.
+/// Valid for one write txn only: the fill patches entry values, never adds keys, and the tail
+/// cannot write meanwhile.
+#[derive(Debug, Default)]
+pub struct FillLogs {
+    keys: HashMap<u8, HashSet<Vec<u8>>>,
+    read: u64,
+}
+
+impl FillLogs {
+    /// Undo logs read to build the key sets (tests).
+    pub fn logs_read(&self) -> u64 {
+        self.read
+    }
+
+    fn holds(&mut self, txn: &impl Txn, chain: u8, k: &[u8]) -> Result<bool> {
+        if let Some(set) = self.keys.get(&chain) {
+            return Ok(set.contains(k));
+        }
+        let prefix = format!("{}{chain:02}/", meta::PRICE_UNDO);
+        let mut from = prefix.clone().into_bytes();
+        let mut set = HashSet::new();
+        loop {
+            let logs = txn.scan_limit(Table::Meta, &from, FILL_LOG_CHUNK, |key| {
+                key.starts_with(prefix.as_bytes())
+            })?;
+            let Some((last, _)) = logs.last() else {
+                break;
+            };
+            let more = logs.len() == FILL_LOG_CHUNK;
+            from = last.clone();
+            from.push(0);
+            for (_, v) in &logs {
+                self.read += 1;
+                set.extend(undo_entries(v)?.into_iter().map(|(key, _)| key));
+            }
+            if !more {
+                break;
+            }
+        }
+        let found = set.contains(k);
+        self.keys.insert(chain, set);
+        Ok(found)
+    }
+}
+
 /// Undo logs [`upsert_fill`] reads per chunk while it walks a chain's tail blocks.
 const FILL_LOG_CHUNK: usize = 32;
 
@@ -373,9 +434,21 @@ const FILL_LOG_CHUNK: usize = 32;
 /// whether or not the fill's row replaced the stored one, and whether that entry holds a tail
 /// row or an earlier fill row (m-1, round 2).
 ///
-/// Cost: at most the undo logs of this chain's unfrozen tail blocks above the row, read in
-/// chunks of [`FILL_LOG_CHUNK`]; most stop at the first block that touched the key.
+/// Cost: one read of the chain's unfrozen undo logs per [`FillLogs`] (per fill batch) to learn
+/// which keys they name; a row whose key none names reads no log. A row whose key one names
+/// reads the logs above its height, in chunks of [`FILL_LOG_CHUNK`], up to the first block
+/// that already restores it or newer (secpass A m-5).
 pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
+    upsert_fill_with(txn, chain, swap, &mut FillLogs::default())
+}
+
+/// [`upsert_fill`] with the batch's [`FillLogs`] (one per write txn).
+pub fn upsert_fill_with(
+    txn: &mut RwTxn<'_>,
+    chain: u8,
+    swap: &Swap,
+    logs: &mut FillLogs,
+) -> Result<u32> {
     let rows =
         (swap.tokens.iter().map(|t| (t, &swap.row))).chain(swap.routed.iter().map(|(t, r)| (t, r)));
     let mut n = 0;
@@ -389,7 +462,9 @@ pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
             txn.put(Table::TokenSwaps, &k, &row.encode())?;
             n += 1;
         }
-        fill_logs(txn, chain, &k, row)?;
+        if logs.holds(txn, chain, &k)? {
+            fill_logs(txn, chain, &k, row)?;
+        }
     }
     Ok(n)
 }
@@ -1620,6 +1695,53 @@ mod tests {
             tokens: vec!["free.t".into()],
             routed: vec![],
         }
+    }
+
+    /// Secpass A m-5: a fill batch reads the chain's undo logs once (`FillLogs`), not once per
+    /// fill row: rows of tokens no tail block touched read no log, and the logs it patches
+    /// are the same as with a walk per row.
+    #[test]
+    fn a_fill_batch_reads_the_undo_logs_once() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        for h in 20..60 {
+            tail_block(&mut txn, &t_swap(1000 + u64::from(h), h, "2"));
+        }
+        let other = |i: u32| Swap {
+            row: row(10, TxKey::new(5, 0, 1), ("coin", "1"), ("free.o", "1")),
+            tokens: vec![format!("free.o{i}")],
+            routed: vec![],
+        };
+        let mut logs = FillLogs::default();
+        for i in 0..100 {
+            upsert_fill_with(&mut txn, 0, &other(i), &mut logs).unwrap();
+        }
+        assert_eq!(logs.logs_read(), 40, "one scan of the chain's 40 logs");
+        // A token the logs hold is walked as before: same entries patched as `upsert_fill`.
+        let d2 = tempfile::tempdir().unwrap();
+        let hot2 = HotStore::open(d2.path(), Geometry::default()).unwrap();
+        let mut t2 = hot2.rw().unwrap();
+        for h in 20..60 {
+            tail_block(&mut t2, &t_swap(1000 + u64::from(h), h, "2"));
+        }
+        upsert_fill_with(&mut txn, 0, &t_swap(5000, 10, "1"), &mut logs).unwrap();
+        upsert_fill(&mut t2, 0, &t_swap(5000, 10, "1")).unwrap();
+        let p = meta::PRICE_UNDO.as_bytes();
+        let a = txn.scan(Table::Meta, p, |k| k.starts_with(p)).unwrap();
+        let b = t2.scan(Table::Meta, p, |k| k.starts_with(p)).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// Secpass A I-3: the readiness marker of the history fill.
+    #[test]
+    fn prices_are_ready_once_the_fill_marker_is_set() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        assert!(!ready(&txn).unwrap());
+        set_ready(&mut txn, 7).unwrap();
+        assert!(ready(&txn).unwrap());
     }
 
     /// I-1 (PR #49 review): a resumed hot pass re-reads a tail block the tail already applied

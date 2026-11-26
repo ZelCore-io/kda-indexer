@@ -58,16 +58,12 @@ async fn freeze_equals_backfill(range: u64) {
     let base = fake_node(&pool, &[(0, chain)]);
     let db = tempfile::tempdir().unwrap();
     let c = Arc::new(ctx_with_node(db.path(), 2, range, 2, &base));
-    set_count_marker(&c);
     kdx_ingest::backfill::run(c.clone(), 0, 19, kdx_ingest::HeaderMode::Cut)
         .await
         .unwrap();
-    assert!(
-        !count_marker(&c),
-        "PR #48: backfill clears the stored-counts marker"
-    );
-    // Backfill keeps the chain counters (and their marker) from block 0.
-    chain_counters_match_the_walk(&c);
+    // Backfill keeps the chain counters, the row counts and the holders (and their markers)
+    // from block 0 (secpass A I-1: the row counts need no `reconcile-counts`).
+    every_derived_table_is_exact(&c);
     // A resume that resets the hot frontier (a range whose MDBX commit landed but whose
     // manifest commit did not) would count that range twice: the marker is cleared.
     {
@@ -78,6 +74,7 @@ async fn freeze_equals_backfill(range: u64) {
     let (_, _, info) = kdx_ingest::backfill::resume(&c).unwrap();
     assert!(info.hot_reset);
     assert!(!kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap());
+    assert!(!count_marker(&c));
     let backfilled = kdx_segment::manifest::Manifest::load(&c.segdir)
         .unwrap()
         .unwrap();
@@ -713,6 +710,87 @@ fn chain_counters_match_the_walk(c: &kdx_ingest::Ctx) {
     assert_eq!(
         kdx_hot::chaincount::differing(&ro, &walked.chains).unwrap(),
         0
+    );
+}
+
+/// Chain counters, row counts and holders are all ready and equal to what
+/// `reconcile-counts --check` and `reconcile-holders --check` build from every record.
+fn every_derived_table_is_exact(c: &kdx_ingest::Ctx) {
+    chain_counters_match_the_walk(c);
+    let ro = c.hot.ro().unwrap();
+    assert!(kdx_hot::rowcount::ready(&ro).unwrap(), "row counts ready");
+    assert!(kdx_hot::holders::ready(&ro).unwrap(), "holders ready");
+    assert!(!kdx_hot::rowcount::read_all(&ro).unwrap().is_empty());
+    drop(ro);
+    let rep = kdx_ingest::row_counts::reconcile(&c.segdir, &c.hot, 2, true, &|| false).unwrap();
+    assert_eq!(rep.differing, Some(0), "row counts: {rep:?}");
+    let rep = kdx_ingest::holders_fill::reconcile(&c.segdir, &c.hot, 2, true, &|| false).unwrap();
+    assert_eq!(rep.differing, Some(0), "holders: {rep:?}");
+    assert!(rep.rows > 0, "{rep:?}");
+}
+
+/// Secpass A I-1, m-1, m-2: a from-scratch backfill killed between a range's MDBX commit and
+/// its manifest commit resumes with every derived table still ready: the chain counters and
+/// row counts subtract the range's stored tally, the holders drop the rows the range added
+/// (their names are truncated with it), and the rebuilt range adds them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_between_the_hot_and_manifest_commits_keeps_every_table_exact() {
+    let pool = pool();
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let base = fake_node(&pool, &[(0, branch(&all, 0, 0, 0))]);
+    let db = tempfile::tempdir().unwrap();
+    let c = Arc::new(ctx_with_node(db.path(), 2, 2, 2, &base));
+    kdx_ingest::backfill::run(c.clone(), 0, 19, kdx_ingest::HeaderMode::Cut)
+        .await
+        .unwrap();
+    every_derived_table_is_exact(&c);
+    let mut m = kdx_segment::manifest::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap();
+    assert!(m.entries.len() >= 2, "{m:?}");
+    // Find a last range that added holders, so m-2 is exercised.
+    let last = m.entries.pop().unwrap();
+    m.frontier = last.start;
+    m.next_txnum = last.first_txnum;
+    m.commit(&c.segdir).unwrap();
+    let before = kdx_hot::holders::read_all(&c.hot.ro().unwrap()).unwrap();
+    let (_, _, info) = kdx_ingest::backfill::resume(&c).unwrap();
+    assert!(info.hot_reset);
+    {
+        let ro = c.hot.ro().unwrap();
+        assert!(
+            kdx_hot::chaincount::ready(&ro).unwrap(),
+            "m-1: counters kept"
+        );
+        assert!(
+            kdx_hot::rowcount::ready(&ro).unwrap(),
+            "m-1: row counts kept"
+        );
+        assert!(kdx_hot::holders::ready(&ro).unwrap());
+        let after = kdx_hot::holders::read_all(&ro).unwrap();
+        assert!(after.iter().all(|h| h.first.height() < last.start), "m-2");
+        assert_eq!(
+            after.len(),
+            before
+                .iter()
+                .filter(|h| h.first.height() < last.start)
+                .count()
+        );
+    }
+    // The tables equal the walk of what the manifest now lists.
+    chain_counters_match_the_walk(&c);
+    let rep = kdx_ingest::row_counts::reconcile(&c.segdir, &c.hot, 2, true, &|| false).unwrap();
+    assert_eq!(rep.differing, Some(0), "row counts after resume: {rep:?}");
+    let rep = kdx_ingest::holders_fill::reconcile(&c.segdir, &c.hot, 2, true, &|| false).unwrap();
+    assert_eq!(rep.differing, Some(0), "holders after resume: {rep:?}");
+    // The range is built again: every table exact and ready.
+    kdx_ingest::backfill::run(c.clone(), 0, 19, kdx_ingest::HeaderMode::Cut)
+        .await
+        .unwrap();
+    every_derived_table_is_exact(&c);
+    assert_eq!(
+        kdx_hot::holders::read_all(&c.hot.ro().unwrap()).unwrap(),
+        before
     );
 }
 
