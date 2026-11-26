@@ -216,37 +216,27 @@ pub fn finish<T, C: Fn(&T) -> String>(
 }
 
 /// `totalCount` of a connection (GQ-10): known up front, computed only when selected, or
-/// not served. A deferred count answers `(n, exact)`; an inexact one (its time share ran out)
-/// is a lower bound, flagged in the response `extensions` (R-P5P9-14 COUNT_TIMEOUT).
-/// A deferred count: `(items, exact)`.
-pub type CountFn = dyn Fn() -> BoxFuture<'static, async_graphql::Result<(u64, bool)>> + Send + Sync;
+/// not served. It is always exact, as stock's: a count that could not finish answers an
+/// error at the field (`COUNT_TIMEOUT`), never a partial number.
+pub type CountFn = dyn Fn() -> BoxFuture<'static, async_graphql::Result<u64>> + Send + Sync;
 
 #[derive(Clone, Default)]
 pub enum Total {
     #[default]
     Unsupported,
     Exact(u64),
-    /// Counted with the page but cut by the deadline: a lower bound, flagged (audit F-50).
-    LowerBound(u64),
+    /// Counted with the page, but the count failed (the deadline cut it; audit F-50).
+    Failed(async_graphql::Error),
     Deferred(Arc<CountFn>),
 }
 
 impl Total {
-    pub async fn resolve(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
+    pub async fn resolve(&self, _ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
         let n = match self {
             Total::Unsupported => return Err(not_supported("totalCount")),
             Total::Exact(n) => *n,
-            Total::LowerBound(n) => {
-                crate::flags::mark(ctx, crate::flags::Flag::CountLowerBound);
-                *n
-            }
-            Total::Deferred(f) => {
-                let (n, exact) = f().await?;
-                if !exact {
-                    crate::flags::mark(ctx, crate::flags::Flag::CountLowerBound);
-                }
-                n
-            }
+            Total::Failed(e) => return Err(e.clone()),
+            Total::Deferred(f) => f().await?,
         };
         Ok(n.min(i32::MAX as u64) as i32)
     }

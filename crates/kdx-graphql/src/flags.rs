@@ -1,8 +1,6 @@
 //! Response-level flags (R-P5P9-14): resolvers mark a request, and the response carries the
 //! marks in its top-level `extensions`.
 //!
-//! - `totalCountLowerBound: true`: a `totalCount` ran out of its share of the deadline; it
-//!   answers the items counted so far (a lower bound) and the edges are kept.
 //! - `searchTruncated: true`: `transactionsByPactCode` stopped at a search cap or its time
 //!   budget; `pageInfo.endCursor` resumes it.
 //! - `truncated: true`: a `fungibleAccountsByPublicKey` or `fungibleChainAccountsByPublicKey`
@@ -23,7 +21,6 @@ use async_graphql::{Context, Request, Response, ServerResult, Value};
 /// The marks of one request.
 #[derive(Debug, Default)]
 pub struct RespFlags {
-    count_lower_bound: AtomicBool,
     search_truncated: AtomicBool,
     key_accounts_truncated: AtomicBool,
 }
@@ -31,7 +28,6 @@ pub struct RespFlags {
 /// Which mark to set.
 #[derive(Debug, Clone, Copy)]
 pub enum Flag {
-    CountLowerBound,
     SearchTruncated,
     KeyAccountsTruncated,
 }
@@ -39,7 +35,6 @@ pub enum Flag {
 impl RespFlags {
     fn cell(&self, f: Flag) -> &AtomicBool {
         match f {
-            Flag::CountLowerBound => &self.count_lower_bound,
             Flag::SearchTruncated => &self.search_truncated,
             Flag::KeyAccountsTruncated => &self.key_accounts_truncated,
         }
@@ -91,7 +86,6 @@ impl Extension for FlagsExt {
     ) -> Response {
         let mut r = next.run(ctx, operation_name).await;
         for (f, name) in [
-            (Flag::CountLowerBound, "totalCountLowerBound"),
             (Flag::SearchTruncated, "searchTruncated"),
             (Flag::KeyAccountsTruncated, "truncated"),
         ] {
@@ -116,14 +110,16 @@ mod tests {
     #[Object]
     impl Q {
         async fn exact(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
-            Total::Deferred(Arc::new(|| Box::pin(async { Ok((7, true)) })))
+            Total::Deferred(Arc::new(|| Box::pin(async { Ok(7) })))
                 .resolve(ctx)
                 .await
         }
-        async fn bound(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
-            Total::Deferred(Arc::new(|| Box::pin(async { Ok((5, false)) })))
-                .resolve(ctx)
-                .await
+        async fn cut(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<i32> {
+            Total::Deferred(Arc::new(|| {
+                Box::pin(async { Err(crate::txlist::count_error(kdx_api::ApiError::Deadline)) })
+            }))
+            .resolve(ctx)
+            .await
         }
     }
 
@@ -159,22 +155,24 @@ mod tests {
         }
     }
 
+    /// GQ-10: `totalCount` is exact or an error. A cut count answers `COUNT_TIMEOUT` at its
+    /// field (the rest of the response stays) and never sets a response flag.
     #[tokio::test]
-    async fn a_count_cut_short_is_a_flagged_lower_bound() {
+    async fn a_cut_count_is_an_error_never_a_flagged_lower_bound() {
         let s = Schema::build(Q, EmptyMutation, EmptySubscription)
             .extension(super::Flags)
             .finish();
         let r = s.execute("{ exact }").await;
         assert!(r.errors.is_empty() && r.extensions.is_empty());
-        let r = s.execute("{ exact bound }").await;
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let r = s.execute("{ exact cut }").await;
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        let code = r.errors[0].extensions.as_ref().and_then(|e| e.get("code"));
         assert_eq!(
-            r.data.into_json().unwrap(),
-            serde_json::json!({"exact": 7, "bound": 5})
+            code,
+            Some(&async_graphql::Value::String("COUNT_TIMEOUT".into()))
         );
-        assert_eq!(
-            r.extensions.get("totalCountLowerBound"),
-            Some(&async_graphql::Value::Boolean(true))
-        );
+        assert!(r.extensions.is_empty(), "{:?}", r.extensions);
+        let d = r.data.into_json().unwrap();
+        assert_eq!(d["exact"], 7);
     }
 }

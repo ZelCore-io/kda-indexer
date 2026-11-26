@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kdx_api::{Api, ApiSettings, Store, TipWatch};
 use kdx_decode::{decode_block, index_block, DecodedBlock, IndexedBlock, VerifyReport};
@@ -1010,221 +1010,172 @@ async fn crafted_well_formed_cursors_answer_at_most_a_page() {
     );
 }
 
-/// The count budget (`count_budget`): a `totalCount` walk that runs out of it answers the
-/// rows counted so far, flagged in the response `extensions`; one that finishes in time is
-/// exact and unflagged.
-mod count_budget {
+/// `totalCount` is exact, as stock's (GQ-10, owner ruling 2026-11-26): no 10,000 cap and no
+/// count budget. It runs to the request deadline; a count the deadline cuts answers a
+/// `COUNT_TIMEOUT` error at the field, never a number.
+mod exact_count {
     use super::*;
 
-    const QUERIES: [&str; 2] = [
-        "{ transfers(accountName: \"k:alice\", first: 1) { totalCount } }",
-        "{ transactions(accountName: \"k:alice\", first: 1) { totalCount } }",
+    /// Lists whose count is checked against their full walk on the long fixture: the account
+    /// lists the old budget cut, with the key filters (chain, heights) and row rules.
+    const LISTS: [&str; 8] = [
+        "transfers(accountName: \"k:alice\", ARGS)",
+        "transfers(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+        "transfers(accountName: \"k:alice\", chainId: \"0\", ARGS)",
+        "transactions(accountName: \"k:alice\", ARGS)",
+        "transactions(accountName: \"k:alice\", minHeight: 100, maxHeight: 5000, ARGS)",
+        "transactions(accountName: \"k:alice\", isCoinbase: true, ARGS)",
+        "transactionsByPublicKey(publicKey: \"alice-key\", ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)",
     ];
 
-    async fn total(s: &KdxSchema, q: &str) -> (i64, bool) {
-        let r = s.execute(q).await;
-        assert!(r.errors.is_empty(), "{q}: {:?}", r.errors);
-        let d = serde_json::to_value(&r.data).unwrap();
-        let n = d.as_object().unwrap().values().next().unwrap()["totalCount"]
-            .as_i64()
-            .unwrap();
-        (n, r.extensions.contains_key("totalCountLowerBound"))
+    fn field(l: &str) -> &str {
+        &l[..l.find('(').unwrap()]
     }
 
-    /// An account with a few postings is counted exactly under the default budget, with no flag.
-    #[tokio::test]
-    async fn a_small_account_is_counted_exactly_and_unflagged() {
-        let fx = fixture();
-        for q in QUERIES {
-            let (n, flagged) = total(&fx.schema, q).await;
-            assert!(n > 1, "{q}: the fixture account has several rows");
-            assert!(!flagged, "{q}");
-        }
+    async fn total(s: &KdxSchema, l: &str) -> i64 {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        run(s, &q).await[field(l)]["totalCount"].as_i64().unwrap()
     }
 
-    /// A budget that is spent before the walk reads a key stops it at once: a flagged lower
-    /// bound that never exceeds the true count (the page itself is still served). A sender
-    /// list read from the sender index (FIX-2) is a key-only walk that reads the clock every
-    /// 64 keys, so the fixture's few keys are counted exactly even with a spent budget.
-    #[tokio::test]
-    async fn a_spent_budget_answers_a_flagged_lower_bound() {
-        let exact = fixture();
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        let (full, _) = total(&exact.schema, QUERIES[1]).await;
-        assert_eq!(total(&cut.schema, QUERIES[1]).await, (full, false));
-        for q in &QUERIES[..1] {
-            let (full, _) = total(&exact.schema, q).await;
-            let (n, flagged) = total(&cut.schema, q).await;
-            assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
-            assert!(
-                (0..=full).contains(&n),
-                "{q}: {n} is a lower bound of {full}"
+    /// Rows of the full walk of `l`, pages of 1,000.
+    async fn walk(s: &KdxSchema, l: &str) -> i64 {
+        let (mut n, mut after) = (0i64, None::<String>);
+        loop {
+            let args = match &after {
+                None => "first: 1000".to_string(),
+                Some(c) => format!("first: 1000, after: \"{c}\""),
+            };
+            let q = format!(
+                "{{ {} {{ pageInfo {{ hasNextPage endCursor }} edges {{ cursor }} }} }}",
+                l.replace("ARGS", &args)
             );
-            assert!(n < full, "{q}: nothing is counted past a spent budget");
+            let v = run(s, &q).await;
+            let c = &v[field(l)];
+            n += c["edges"].as_array().unwrap().len() as i64;
+            if c["pageInfo"]["hasNextPage"] != true {
+                return n;
+            }
+            after = c["pageInfo"]["endCursor"].as_str().map(str::to_owned);
         }
-        let page = run(
-            &cut.schema,
-            "{ transfers(accountName: \"k:alice\", first: 2) { totalCount edges { cursor } } }",
-        )
-        .await;
-        assert_eq!(page["transfers"]["edges"].as_array().unwrap().len(), 2);
     }
 
-    /// FIX-2 fix 6: the old decode path (`sender_index = false`, or a store add-index has not
-    /// finished) stays live, and there a sender list decodes every record of the account's
-    /// `acct` list: a spent budget answers a flagged lower bound below the true count.
+    /// Above the old 10,000 cap the count is the true one: the long account's transfers and
+    /// sends are counted in full, and each equals its full walk.
     #[tokio::test]
-    async fn a_spent_budget_cuts_the_old_sender_path() {
-        let exact = fixture();
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        let q = QUERIES[1];
-        // The sender index answers the same spent-budget count exactly (see above) ...
-        let (full, _) = total(&exact.schema, q).await;
-        assert_eq!(total(&cut.schema, q).await, (full, false));
-        // ... and the old path, switched on for both stores, is cut.
-        for fx in [&exact, &cut] {
-            fx.store.set_sender_index(false);
+    async fn a_count_above_ten_thousand_is_exact() {
+        let fx = fixture_big(GraphqlSettings::default(), 10_050);
+        for l in &LISTS[..2] {
+            let n = total(&fx.schema, l).await;
+            assert!(n > 10_000, "{l}: {n} is above the old cap");
+            assert_eq!(n, walk(&fx.schema, l).await, "{l}");
         }
-        let (full, flagged) = total(&exact.schema, q).await;
+    }
+
+    /// Every list's count equals the rows its full walk lists, filters included, on a long
+    /// account (thousands of hot txs beside the frozen ranges).
+    #[tokio::test]
+    async fn the_count_equals_the_full_walk_with_filters() {
+        let fx = fixture_big(GraphqlSettings::default(), 3_000);
+        for l in LISTS {
+            let n = total(&fx.schema, l).await;
+            assert!(n > 0, "{l}: the fixture list is not empty");
+            assert_eq!(n, walk(&fx.schema, l).await, "{l}");
+        }
+    }
+
+    /// After a reorg rolls blocks back (and other blocks take their place) every count is
+    /// still the length of its full walk, and it moved with the rollback.
+    #[tokio::test]
+    async fn the_count_follows_a_reorg_rollback() {
+        let fx = fixture_big(GraphqlSettings::default(), 400);
+        let before = total(&fx.schema, LISTS[0]).await;
+        let mut t = fx.store.hot.rw().unwrap();
+        let undone = kdx_hot::tail::unwind_to(&mut t, 0, 300).unwrap();
+        assert!(undone > 0);
+        let mut dict = HotDict::load(&t).unwrap();
+        // The new fork: half as many blocks, each with a `Many` tx (five transfers).
+        for h in 301..301 + undone / 2 {
+            let (b, _) = decoded(0, h, &[Shape::Many]);
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        }
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        let after = total(&fx.schema, LISTS[0]).await;
+        assert_ne!(
+            after, before,
+            "the rollback changed the account's transfers"
+        );
+        for l in LISTS {
+            assert_eq!(total(&fx.schema, l).await, walk(&fx.schema, l).await, "{l}");
+        }
+    }
+
+    /// A count the deadline cuts is a `COUNT_TIMEOUT` error at `totalCount`, never a number
+    /// and never a response flag. The same count with time is exact.
+    #[tokio::test]
+    async fn a_count_cut_by_the_deadline_is_an_error() {
+        let fx = fixture_big(GraphqlSettings::default(), 2_000);
+        for l in LISTS {
+            let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+            let req = async_graphql::Request::new(q.clone()).data(kdx_graphql::ReqCtx {
+                deadline: std::time::Instant::now(),
+            });
+            let r = fx.schema.execute(req).await;
+            assert!(!r.errors.is_empty(), "{q}: a cut count must fail");
+            let codes: Vec<String> = r
+                .errors
+                .iter()
+                .filter_map(|e| e.extensions.as_ref()?.get("code").map(|c| c.to_string()))
+                .collect();
+            assert!(
+                codes
+                    .iter()
+                    .all(|c| c.contains("COUNT_TIMEOUT") || c.contains("TIMEOUT")),
+                "{q}: {codes:?}"
+            );
+            let d = serde_json::to_value(&r.data).unwrap();
+            assert!(
+                d.get(field(l))
+                    .is_none_or(|c| c.is_null() || c["totalCount"].is_null()),
+                "{q}: no number is answered: {d}"
+            );
+            assert!(r.extensions.is_empty(), "{q}: {:?}", r.extensions);
+        }
+        // A spent deadline on a list with a page still serves no partial count.
+        let q = "{ transfers(accountName: \"k:alice\", first: 2) { totalCount edges { cursor } } }";
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: std::time::Instant::now(),
+        });
+        let r = fx.schema.execute(req).await;
+        assert!(!r.errors.is_empty());
+        let d = serde_json::to_value(&r.data).unwrap();
         assert!(
-            full > 1 && !flagged,
-            "{q}: exact on the old path with a budget"
+            d["transfers"].is_null() || d["transfers"]["totalCount"].is_null(),
+            "{d}"
         );
-        let (n, flagged) = total(&cut.schema, q).await;
-        assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
-        assert!(n < full, "{q}: {n} is below {full} past a spent budget");
     }
 
-    /// The budget bounds an account's walk only: an event-name or public-key count with a spent
-    /// budget is exact and unflagged, as before.
-    #[tokio::test]
-    async fn a_non_account_count_ignores_the_budget() {
-        let exact = fixture();
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        for q in [
-            "{ events(qualifiedEventName: \"coin.TRANSFER\", first: 1) { totalCount } }".to_string(),
-            format!(
-                "{{ transactionsByPublicKey(publicKey: \"{ALICE_KEY}\", first: 1) {{ totalCount }} }}"
-            ),
-        ] {
-            let (full, _) = total(&exact.schema, &q).await;
-            let (n, flagged) = total(&cut.schema, &q).await;
-            assert!(full > 1, "{q}: the fixture has several rows");
-            assert_eq!((n, flagged), (full, false), "{q}");
-        }
-    }
-
-    /// A cut count is never below the edges served in the same response.
-    #[tokio::test]
-    async fn a_cut_count_covers_the_edges_served() {
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        for field in ["transfers", "transactions"] {
-            let d = run(
-                &cut.schema,
-                &format!(
-                    "{{ {field}(accountName: \"k:alice\", first: 3) {{ totalCount edges {{ cursor }} }} }}"
-                ),
-            )
-            .await;
-            let edges = d[field]["edges"].as_array().unwrap().len() as i64;
-            let n = d[field]["totalCount"].as_i64().unwrap();
-            assert!(edges > 1, "{field}: several edges are served");
-            assert!(n >= edges, "{field}: totalCount {n} < {edges} edges served");
-        }
-    }
-
-    /// A walk cut partway answers a count above zero and below the true one, flagged. The
-    /// account has thousands of postings and the budget is a few ms: the walk takes far longer
-    /// (debug or release) yet gets past its first records.
-    #[tokio::test]
-    async fn a_walk_cut_partway_is_a_flagged_partial_count() {
-        let n_extra = 8000;
-        let exact = fixture_big(
-            GraphqlSettings {
-                count_budget: Duration::from_secs(60),
-                ..GraphqlSettings::default()
-            },
-            n_extra,
-        );
-        let cut = fixture_big(
-            GraphqlSettings {
-                count_budget: Duration::from_millis(5),
-                ..GraphqlSettings::default()
-            },
-            n_extra,
-        );
-        for q in QUERIES {
-            let (full, flagged) = total(&exact.schema, q).await;
-            assert!(full > i64::from(n_extra), "{q}");
-            assert!(!flagged, "{q}");
-            let (n, flagged) = total(&cut.schema, q).await;
-            assert!(flagged, "{q}: a cut count carries totalCountLowerBound");
-            assert!(n > 1 && n < full, "{q}: {n} is partway to {full}");
-        }
-    }
-
-    /// A block's or a request key's list is counted with its page, exactly, whatever the budget.
-    #[tokio::test]
-    async fn a_block_list_ignores_the_budget() {
-        let cut = fixture_with(GraphqlSettings {
-            count_budget: Duration::ZERO,
-            ..GraphqlSettings::default()
-        });
-        let q = format!(
-            "{{ transfers(blockHash: \"{}\", first: 1) {{ totalCount }} }}",
-            block_hash(0, 6)
-        );
-        let (n, flagged) = total(&cut.schema, &q).await;
-        assert!(n > 0 && !flagged);
-    }
-
-    /// Timing of the count walk on a long account, run by hand (`--ignored --nocapture`, best
-    /// in release): `KDX_COUNT_BENCH_TXS` extra txs (default 6000). Prints the time and answer
-    /// of `totalCount` with the budget off (a minute, so half the 5 s deadline decides: the
-    /// walk as it was) and with the default 200 ms budget and a 10 ms one (the fixture's hot records decode in
-    /// microseconds, far faster than cold segment records, so only a tight budget cuts it).
+    /// Timing of exact counts on a long account, run by hand (`--ignored --nocapture`, best in
+    /// release): `KDX_COUNT_BENCH_TXS` extra txs (default 50,000). Prints the time and answer
+    /// of each list's `totalCount`, cold (first) and warm.
     #[tokio::test]
     #[ignore = "timing run"]
-    async fn timing_of_the_count_walk_on_a_long_account() {
+    async fn timing_of_exact_counts_on_a_long_account() {
         let n: u32 = std::env::var("KDX_COUNT_BENCH_TXS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(6000);
-        let default = GraphqlSettings::default();
-        for (label, budget) in [
-            ("before (half the deadline)", Duration::from_secs(60)),
-            ("after (200 ms budget)", default.count_budget),
-            ("after (10 ms budget)", Duration::from_millis(10)),
-        ] {
-            let fx = fixture_big(
-                GraphqlSettings {
-                    count_budget: budget,
-                    ..default.clone()
-                },
-                n,
-            );
-            for q in QUERIES {
-                for round in 0..3 {
-                    let t = std::time::Instant::now();
-                    let (rows, flagged) = total(&fx.schema, q).await;
-                    println!(
-                        "{label}: {} round {round}: {:>7.1} ms, totalCount {rows}, lower bound {flagged}",
-                        &q[2..14],
-                        t.elapsed().as_secs_f64() * 1e3
-                    );
-                }
+            .unwrap_or(50_000);
+        let fx = fixture_big(GraphqlSettings::default(), n);
+        for l in LISTS {
+            for round in 0..2 {
+                let t = Instant::now();
+                let rows = total(&fx.schema, l).await;
+                println!(
+                    "{l:<80} round {round}: {:>8.1} ms, totalCount {rows}",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
     }
@@ -2257,34 +2208,24 @@ mod audit_pr3 {
         assert_eq!(code(&r), bad_input(), "{:?}", r.errors);
     }
 
-    /// F-50: a block's `totalCount` (counted with the page) that the deadline cuts is a
-    /// flagged lower bound, as a deferred count is, not an exact 0.
+    /// F-50, GQ-10: a block's `totalCount` (counted with the page) that the deadline cuts is
+    /// a `COUNT_TIMEOUT` error, as a deferred count is, not a partial number or an exact 0.
     #[tokio::test]
-    async fn a_bounded_count_cut_by_the_deadline_is_flagged() {
+    async fn a_bounded_count_cut_by_the_deadline_is_an_error() {
         let fx = fixture();
         let q = format!(
             "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
             block_hash(0, 6)
         );
-        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+        let req = async_graphql::Request::new(q.clone()).data(kdx_graphql::ReqCtx {
             deadline: std::time::Instant::now(),
         });
         let r = fx.schema.execute(req).await;
-        assert!(r.errors.is_empty(), "{:?}", r.errors);
-        assert!(
-            r.extensions.contains_key("totalCountLowerBound"),
-            "{:?}",
-            r.extensions
-        );
-        // With time, the same count is exact and unflagged.
-        let r = fx
-            .schema
-            .execute(format!(
-                "{{ transfers(blockHash: \"{}\") {{ totalCount }} }}",
-                block_hash(0, 6)
-            ))
-            .await;
-        assert!(!r.extensions.contains_key("totalCountLowerBound"));
+        assert!(!r.errors.is_empty(), "a cut count is an error");
+        assert!(r.extensions.is_empty(), "{:?}", r.extensions);
+        // With time, the same count is exact.
+        let v = run(&fx.schema, &q).await;
+        assert!(v["transfers"]["totalCount"].as_i64().unwrap() > 0);
     }
 
     /// F-51: the id of a `transfers(isNFT: true)` node resolves through `node(id)` to the

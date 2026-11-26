@@ -13,7 +13,7 @@ pub enum Code {
     Limit,
     /// The request deadline passed.
     Timeout,
-    /// `totalCount` could not be counted within its share of the deadline (GQ-10).
+    /// `totalCount` could not be counted exactly before the request deadline (GQ-10).
     CountTimeout,
     /// An `events.parametersFilter` form that is not served (GQ-11).
     UnsupportedFilter,
