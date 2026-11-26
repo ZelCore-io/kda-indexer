@@ -168,7 +168,7 @@ fn last_segment(s: &str) -> &str {
 pub fn ledger_tables(code: &str) -> Vec<String> {
     let clean = code_only(code);
     let t = tokens(&clean);
-    let mut schemas: Vec<&str> = Vec::new();
+    let mut schemas: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut tables: Vec<(&str, &str)> = Vec::new();
     let mut i = 0;
     while i + 1 < t.len() {
@@ -194,7 +194,7 @@ pub fn ledger_tables(code: &str) -> Vec<String> {
                     j += 1;
                 }
                 if has {
-                    schemas.push(name);
+                    schemas.insert(name);
                 }
                 i = j;
             }
@@ -215,13 +215,21 @@ pub fn ledger_tables(code: &str) -> Vec<String> {
             _ => i += 1,
         }
     }
+    // N-10: a set lookup per table, names capped like every name sent to the node, and the
+    // scan stops at MAX_TABLES (the code is the module author's, up to the node's body cap).
     let mut out: Vec<String> = Vec::new();
     for (name, schema) in tables {
-        if schemas.contains(&schema) && valid_ident(name) && !out.iter().any(|o| o == name) {
+        if out.len() == MAX_TABLES {
+            break;
+        }
+        if name.len() <= MAX_NAME_LEN
+            && schemas.contains(schema)
+            && valid_ident(name)
+            && !out.iter().any(|o| o == name)
+        {
             out.push(name.to_owned());
         }
     }
-    out.truncate(MAX_TABLES);
     out
 }
 
@@ -679,6 +687,19 @@ async fn list_chain(
     chain: u8,
     already: u64,
 ) -> Result<ChainResult> {
+    // The I-7 cap the reconcile applies to this module: confirmed `fungible-v2` modules get
+    // the larger one (F-14).
+    let t = balances::token_row(&ctx.hot.ro()?, module)?.unwrap_or_default();
+    let row_cap = if t.fungible_chains != 0 {
+        caps.fungible_module_rows
+    } else {
+        caps.module_rows
+    };
+    // N-10: a listing [`mark_keys`] would drop whole costs no node read.
+    let room = u64::from(row_cap.saturating_sub(t.rows)).saturating_sub(already);
+    if t.kind == KIND_NOT_FUNGIBLE || t.capped() || room == 0 {
+        return Ok(ChainResult::Done(Marked::default()));
+    }
     let code = match local.module_code(chain, name, timeout).await {
         Ok(Local::Absent) => return Ok(ChainResult::Done(Marked::default())),
         Ok(Local::Found { value, .. }) => value,
@@ -704,15 +725,6 @@ async fn list_chain(
             Err(e) => return Ok(ChainResult::Failed(format!("keys {t}: {e}"))),
         }
     }
-    // The I-7 cap the reconcile applies to this module: confirmed `fungible-v2` modules get
-    // the larger one (F-14).
-    let trusted =
-        balances::token_row(&ctx.hot.ro()?, module)?.is_some_and(|t| t.fungible_chains != 0);
-    let row_cap = if trusted {
-        caps.fungible_module_rows
-    } else {
-        caps.module_rows
-    };
     let (hot, dict) = (ctx.hot.clone(), ctx.dict.clone());
     let total = tokio::task::spawn_blocking(move || -> Result<Marked> {
         let mut total = Marked::default();
@@ -795,6 +807,11 @@ pub async fn step(
         already,
     )
     .await?;
+    // N-08: the pacing and any pause run from the end of the read, which may have taken up to
+    // five read timeouts.
+    let now = Instant::now();
+    let t = now_unix();
+    kl.next_at = Some(now + STEP_EVERY);
     let mut txn = ctx.hot.rw()?;
     let mut failed = false;
     match res {
@@ -1872,6 +1889,118 @@ mod tests {
         let st = state(&ro, ids[0]).unwrap();
         assert!(!st.unlistable(), "{st:?}");
         assert!(st.fail_total < FAIL_BUDGET / 2, "{st:?}");
+    }
+
+    /// N-08: the pause after a node error and the step pacing run from the end of the read,
+    /// not from its start: a read that took longer than the pause must not leave the next
+    /// step already due.
+    #[tokio::test]
+    async fn pauses_run_from_the_end_of_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, _, _| Some(json!({"sleep_ms": 3_000})));
+        let (ctx, local, _, _) = setup(dir.path(), &["free.hang"], answer);
+        let mut kl = KeyList {
+            read_timeout: Duration::from_millis(400),
+            ..KeyList::default()
+        };
+        step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+        let after = Instant::now();
+        assert_eq!(kl.node_errors, 1);
+        let left = kl.next_at.unwrap().saturating_duration_since(after);
+        assert!(left + Duration::from_millis(100) >= NODE_PAUSE, "{left:?}");
+
+        // A slow read that succeeds: the next step waits STEP_EVERY after it.
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, _, _| {
+            std::thread::sleep(Duration::from_millis(600));
+            not_deployed("free.slow")
+        });
+        let (ctx, local, _, _) = setup(dir.path(), &["free.slow"], answer);
+        let mut kl = KeyList::default();
+        step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+        let left = kl
+            .next_at
+            .unwrap()
+            .saturating_duration_since(Instant::now());
+        assert!(left + Duration::from_millis(100) >= STEP_EVERY, "{left:?}");
+    }
+
+    /// N-10: a token with no room left under its row cap is not read on its other chains.
+    #[tokio::test]
+    async fn a_token_at_its_row_cap_is_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, code, _| {
+            if code.contains("describe-module") {
+                return ok(json!(KAYC));
+            }
+            let keys: Vec<String> = (0..5).map(|i| format!("junk-{i}")).collect();
+            ok(json!(keys))
+        });
+        let (ctx, local, ids, calls) = setup_chains(dir.path(), &["free.spam"], answer, 4);
+        let caps = Caps {
+            module_rows: 5,
+            ..Caps::default()
+        };
+        let mut kl = KeyList::default();
+        kl.next_at = None;
+        step(&ctx, &local, &caps, &mut kl).await.unwrap();
+        let first = calls.load(Ordering::SeqCst);
+        assert!(first >= 2, "describe-module and keys on chain 0");
+        for _ in 0..3 {
+            kl.next_at = None;
+            step(&ctx, &local, &caps, &mut kl).await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), first, "no reads past the cap");
+        let ro = ctx.hot.ro().unwrap();
+        assert_eq!(ro.count(Table::BalanceDirty).unwrap(), 5);
+        assert_eq!(state(&ro, ids[0]).unwrap().marked_round, 5);
+        drop(ro);
+
+        // A not-fungible verdict reached mid-round stops the reads too.
+        let dir = tempfile::tempdir().unwrap();
+        let answer: Arc<Answer> = Arc::new(move |_, code, _| {
+            if code.contains("describe-module") {
+                return ok(json!(KAYC));
+            }
+            ok(json!(["a"]))
+        });
+        let (ctx, local, ids, calls) = setup_chains(dir.path(), &["free.nf"], answer, 3);
+        let mut kl = KeyList::default();
+        step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+        let first = calls.load(Ordering::SeqCst);
+        let mut txn = ctx.hot.rw().unwrap();
+        balances::update_token(&mut txn, ids[0], |t| t.kind = KIND_NOT_FUNGIBLE).unwrap();
+        txn.commit().unwrap();
+        for _ in 0..2 {
+            kl.next_at = None;
+            step(&ctx, &local, &Caps::default(), &mut kl).await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), first);
+    }
+
+    /// N-10: the table scan is linear, stops at MAX_TABLES and skips over-long names.
+    #[test]
+    fn ledger_tables_is_bounded() {
+        let n = 40_000;
+        let mut code = String::new();
+        for i in 0..n {
+            code.push_str(&format!("(defschema s{i} balance:decimal)\n"));
+        }
+        for i in 0..n {
+            code.push_str(&format!("(deftable t{i}:{{s{}}})\n", n - 1 - i));
+        }
+        let start = Instant::now();
+        let t = ledger_tables(&code);
+        assert_eq!(t, ["t0", "t1", "t2", "t3"]);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        let long = "t".repeat(MAX_NAME_LEN + 1);
+        let code =
+            format!("(defschema s balance:decimal) (deftable {long}:{{s}}) (deftable ok:{{s}})");
+        assert_eq!(ledger_tables(&code), ["ok"]);
     }
 
     /// R-4: a panic in the listing task is not lost: the supervisor restarts the task after

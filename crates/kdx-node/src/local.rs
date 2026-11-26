@@ -508,7 +508,7 @@ impl LocalClient {
         timeout: Duration,
     ) -> LocalResult<Vec<String>> {
         check_module(module)?;
-        if !valid_ident(table) {
+        if table.len() > MAX_NAME_LEN || !valid_ident(table) {
             return Err(LocalError::Skipped("table name fails the B-1 check".into()));
         }
         match self
