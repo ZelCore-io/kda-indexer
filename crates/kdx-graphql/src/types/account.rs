@@ -743,7 +743,7 @@ fn xfer_touched(
             break (found, false);
         };
         read += 1;
-        if read % 64 == 0 {
+        if read.is_multiple_of(64) {
             check()?;
         }
         let c = k?.chain();
