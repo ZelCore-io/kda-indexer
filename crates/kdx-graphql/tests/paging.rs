@@ -3131,8 +3131,8 @@ mod stored_count {
             None,
             "no marker: the walk is cut"
         );
-        // Review M-5: the cut `totalCount` is `Int!` in a non-null connection, so its error
-        // nulls `data` (spec null propagation, as stock's graphql-js answers).
+        // The cut `totalCount` is `Int!`, but `COUNT_TIMEOUT` is this indexer's own error: it
+        // nulls the field in place and keeps the page (final review I-1), not `data`.
         let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
         let r = fx
             .schema
@@ -3142,7 +3142,11 @@ mod stored_count {
             .await;
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         let d = serde_json::to_value(&r.data).unwrap();
-        assert_eq!(d, Value::Null, "{d}");
+        assert_eq!(
+            d,
+            serde_json::json!({"transfers": {"totalCount": null}}),
+            "{d}"
+        );
         reconcile(&fx);
         assert_eq!(total_spent(&fx.schema, l).await, Some(walked));
         let e = "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)";

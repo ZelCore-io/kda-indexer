@@ -106,6 +106,18 @@ answers, unless a failed root is non-null. Each error keeps its `path`; stock st
 `locations` from errors that carry `extensions` (see
 [comparison.md](comparison.md#intended-differences)).
 
+One exception keeps the rest of the page: an error this indexer raises itself, which stock
+never raises, nulls a non-null field in place (the field answers `null`, the error is kept) and
+does not bubble. These are the `extensions.code`s `COUNT_TIMEOUT` (a cut `totalCount`), `LIMIT`
+(the `transactionsByPactCode` search slot, page and item caps, DEX budgets), `TIMEOUT` (the
+request deadline, including the DEX one) and `NOT_AVAILABLE` (data still being built: a fill
+or readiness wait), plus the `pactQuery`/`gasLimitEstimate` caps, which carry stock's
+`INTERNAL_SERVER_ERROR` code and name the cap in `extensions.limit` (`pact_items`,
+`pact_rate`, `pact_busy`). A strict client sees `null` in a non-null slot for these; blanking
+the whole page would lose the fields that did answer. Every other error, async-graphql's own
+included, bubbles as above. The list lives in one place (`IN_PLACE_CODES` in
+`crates/kdx-graphql/src/error.rs`).
+
 ## Limits
 
 Depth and complexity are the same as the stock indexer's (hack-a-chain-software/indexer-kadena
@@ -564,9 +576,9 @@ the oracle puts them.
   is computed only when selected: from the stored per-key counts where they hold the list
   (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s).
   A walk the deadline cuts answers a `COUNT_TIMEOUT` error at
-  `totalCount` (the error has the field's path; `totalCount` is `Int!` and the connections
-  are non-null, so the error nulls the nearest nullable parent, `data` itself for a root
-  list, as stock's graphql-js answers); it never answers a
+  `totalCount` (the error has the field's path; `totalCount` is `Int!`, but this indexer's
+  own errors null the field in place and keep the page: `totalCount` answers `null` next to
+  the edges and the other root fields, see "A field that fails" above); it never answers a
   partial number and sets no response flag. A block's or a request key's list counts with
   its page, under the same rule (audit F-50). There is no `totalCountLowerBound` flag and no
   `count_budget_ms` setting any more (an old config file that sets it still loads; it is

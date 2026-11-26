@@ -174,6 +174,12 @@ fn field_err(msg: impl Into<String>) -> async_graphql::Error {
     async_graphql::Error::new(msg).extend_with(|_, e| e.set("code", INTERNAL_SERVER_ERROR))
 }
 
+/// A refusal of one of this indexer's Pact caps: stock's code, plus `extensions.limit = name`
+/// so it is nulled in place rather than bubbled ([`crate::error::nulls_in_place`]).
+fn cap_err(name: &'static str, msg: impl Into<String>) -> async_graphql::Error {
+    field_err(msg).extend_with(|_, e| e.set("limit", name))
+}
+
 /// Why a `/local` call gave no Pact answer.
 enum CallErr {
     Timeout,
@@ -257,10 +263,13 @@ impl PactPass {
         let limit = || {
             metric(field, "limit_items");
             kdx_metrics::get().graphql_rejected("pact_items");
-            field_err(format!(
-                "[ERROR][{}][LIMIT] At most {max} Pact queries and gas estimates per request",
-                field.tag()
-            ))
+            cap_err(
+                "pact_items",
+                format!(
+                    "[ERROR][{}][LIMIT] At most {max} Pact queries and gas estimates per request",
+                    field.tag()
+                ),
+            )
         };
         let used = budget.map_or(0, |b| b.used.load(Ordering::Acquire));
         if n > max || used.saturating_add(n) > max {
@@ -274,10 +283,13 @@ impl PactPass {
         if !allowed {
             metric(field, "limit_rate");
             kdx_metrics::get().graphql_rejected("pact_rate");
-            return Err(field_err(format!(
-                "[ERROR][{}][RATE_LIMIT] Too many Pact queries from this client, retry later",
-                field.tag()
-            )));
+            return Err(cap_err(
+                "pact_rate",
+                format!(
+                    "[ERROR][{}][RATE_LIMIT] Too many Pact queries from this client, retry later",
+                    field.tag()
+                ),
+            ));
         }
         // Charged now; a concurrent field of the same request may have taken the room.
         if let Some(b) = budget {
@@ -317,10 +329,13 @@ impl PactPass {
         let permit = self.requests.clone().try_acquire_owned().map_err(|_| {
             metric(field, "limit_busy");
             kdx_metrics::get().graphql_rejected("pact_busy");
-            field_err(format!(
-                "[ERROR][{}][BUSY] The Pact query service is busy, retry later",
-                field.tag()
-            ))
+            cap_err(
+                "pact_busy",
+                format!(
+                    "[ERROR][{}][BUSY] The Pact query service is busy, retry later",
+                    field.tag()
+                ),
+            )
         })?;
         match held.as_deref_mut() {
             Some(slot) => {
