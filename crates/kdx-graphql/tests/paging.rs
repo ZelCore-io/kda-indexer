@@ -1561,6 +1561,25 @@ async fn a_capped_transfer_probe_keeps_the_zero_rows_it_could_not_resolve() {
     assert_eq!(rows.len(), 4, "{v}");
 }
 
+/// N-12: `balance(...)` honours the request deadline in its row walk and its transfer
+/// probes: spent before the read, the answer is a deadline error, not rows computed past it.
+#[tokio::test]
+async fn balance_honours_the_request_deadline() {
+    let fx = fixture();
+    let q = format!(
+        "{{ balance(accountName: \"{CAROL}\") {{ edges {{ node {{ module chainId balance }} }} }} }}"
+    );
+    let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+        deadline: Instant::now(),
+    });
+    let r = fx.schema.execute(req).await;
+    assert!(
+        !r.errors.is_empty(),
+        "answered past the deadline: {:?}",
+        r.data
+    );
+}
+
 /// I-1 (PR #44 review): an account drained to 0 everywhere still resolves through
 /// `fungibleAccount` and `node(id:)` (`FungibleAccount` and `FungibleChainAccount` ids), with
 /// its rows at 0, so its `transfers` and `transactions` stay reachable. An account with no
