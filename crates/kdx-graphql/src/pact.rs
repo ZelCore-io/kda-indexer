@@ -23,7 +23,6 @@
 //! bucket, a global in-flight cap, the input size, the gas limit a command may ask for, the
 //! node answer's size. Every refusal is a stock-style message.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,6 +49,8 @@ pub const GAS_NODE: &str =
 /// Stock's `gasLimitEstimate` error for an input that is not JSON or fails its schema.
 pub const GAS_PARSE: &str =
     "[ERROR][GAS][PARSER] Unable to parse input as JSON. Please see the README for the accepted input format.";
+/// Our refusal of a command holding a duplicate JSON key (fix round 1, M1).
+pub const GAS_DUP_KEYS: &str = "[ERROR][GAS][INPUT] The command holds a duplicate JSON key";
 /// Stock's `gasLimitEstimate` error for an input of no known shape.
 pub const GAS_UNKNOWN: &str =
     "[ERROR][GRAPHQL][GAS][INPUT_CHECKER] Unknown input type. Please see the README for the accepted input format.";
@@ -59,8 +60,6 @@ const QUERY_GAS_LIMIT: u64 = 2500;
 /// Stock's gas-estimate defaults (`domain/gas/transaction.gas.ts`).
 const ESTIMATE_GAS_LIMIT: u64 = 10_000;
 const TTL: u64 = 28_800;
-/// Distinct per-IP buckets kept before idle ones are dropped.
-const RATE_KEYS: usize = 65_536;
 
 /// `[graphql.pact]`: the passthrough's limits.
 #[derive(Debug, Clone)]
@@ -70,7 +69,9 @@ pub struct PactSettings {
     pub max_items: usize,
     /// `/local` calls in flight across the process.
     pub max_in_flight: usize,
-    /// Per client IP (IPv6 by /64): `/local` calls per second (0 = no per-IP limit) and burst.
+    /// Per client (the API limiter's keys: an IPv4 address, v4-mapped IPv6 unmapped, or an
+    /// IPv6 /64, with a /24 or /48 overflow tier): `/local` calls per second (0 = no per-IP
+    /// limit) and burst.
     pub per_ip_rps: u32,
     pub per_ip_burst: u32,
     /// Per item, waiting for a slot included (stock: 10 s).
@@ -118,7 +119,8 @@ pub struct PactPass {
     /// Requests inside the passthrough (2 × `max_in_flight`): past it a request is refused at
     /// once, so waiting requests cannot hold the API's in-flight slots.
     requests: Arc<Semaphore>,
-    rate: Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    /// Per-client buckets (`None` when `per_ip_rps` is 0): the API's limiter (I3).
+    rate: Option<kdx_api::limits::RateLimiter>,
 }
 
 impl std::fmt::Debug for PactPass {
@@ -172,6 +174,22 @@ impl PactPass {
     /// `node` must be a client of its own: its concurrency and body cap are this
     /// passthrough's (`max_in_flight`, `max_response_bytes`).
     pub fn new(node: kdx_node::NodeClient, settings: PactSettings) -> PactPass {
+        PactPass::with_rate_cap(node, settings, None)
+    }
+
+    /// As [`PactPass::new`], with at most `cap` per-client buckets (tests; `None` is the
+    /// API limiter's default).
+    #[doc(hidden)]
+    pub fn with_rate_cap(
+        node: kdx_node::NodeClient,
+        settings: PactSettings,
+        cap: Option<usize>,
+    ) -> PactPass {
+        let (rps, burst) = (settings.per_ip_rps, settings.per_ip_burst);
+        let rate = (rps > 0).then(|| match cap {
+            Some(c) => kdx_api::limits::RateLimiter::with_cap(rps, burst, c),
+            None => kdx_api::limits::RateLimiter::new(rps, burst),
+        });
         PactPass {
             node,
             slots: Semaphore::new(settings.max_in_flight.max(1)),
@@ -179,7 +197,30 @@ impl PactPass {
                 settings.max_in_flight.max(1).saturating_mul(2),
             )),
             settings,
-            rate: Mutex::new(HashMap::new()),
+            rate,
+        }
+    }
+
+    /// Free node slots and free request places (tests: every permit comes back).
+    #[doc(hidden)]
+    pub fn idle(&self) -> (usize, usize) {
+        (
+            self.slots.available_permits(),
+            self.requests.available_permits(),
+        )
+    }
+
+    /// I1: a Pact field is about to call the node, so the request may now run to the
+    /// passthrough's timeout (plus the answer margin). Only here is the request's shared
+    /// deadline extended, never past the ceiling the guard set.
+    fn extend_deadline(&self, ctx: &Context<'_>) {
+        if let Some(r) = ctx.data_opt::<crate::RequestRun>() {
+            r.0.extend_to(
+                Instant::now()
+                    + self.settings.timeout
+                    + crate::http::PACT_MARGIN
+                    + crate::http::DEADLINE_MARGIN,
+            );
         }
     }
 
@@ -251,40 +292,13 @@ impl PactPass {
         }
     }
 
-    /// Take `n` tokens from `ip`'s bucket (IPv6 keyed by its /64).
+    /// Take `n` tokens from the client's bucket ([`kdx_api::limits::RateLimiter`]: /64 keys
+    /// with a /48 overflow tier, v4-mapped addresses unmapped, eviction never refills a
+    /// drained key).
     fn take(&self, ip: IpAddr, n: usize) -> bool {
-        let (rps, burst) = (
-            f64::from(self.settings.per_ip_rps),
-            f64::from(self.settings.per_ip_burst),
-        );
-        if self.settings.per_ip_rps == 0 {
-            return true;
-        }
-        let key = match ip {
-            IpAddr::V6(v6) => {
-                let s = v6.segments();
-                IpAddr::from([s[0], s[1], s[2], s[3], 0, 0, 0, 0])
-            }
-            v4 => v4,
-        };
-        let now = Instant::now();
-        let mut m = self.rate.lock().unwrap_or_else(|e| e.into_inner());
-        if m.len() >= RATE_KEYS && !m.contains_key(&key) {
-            m.retain(|_, (t, at)| *t + now.duration_since(*at).as_secs_f64() * rps < burst);
-            if m.len() >= RATE_KEYS {
-                m.clear();
-            }
-        }
-        let (tokens, at) = m.entry(key).or_insert((burst, now));
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * rps).min(burst);
-        *at = now;
-        let need = n as f64;
-        if *tokens >= need {
-            *tokens -= need;
-            true
-        } else {
-            false
-        }
+        self.rate
+            .as_ref()
+            .is_none_or(|r| r.allow_n(ip, u32::try_from(n).unwrap_or(u32::MAX)))
     }
 
     /// One `/local` call: a slot, then the node, all within `deadline`.
@@ -331,6 +345,7 @@ impl PactPass {
         }
         self.admit(ctx, items.len(), Field::Query)?;
         let _in = self.enter(ctx, Field::Query)?;
+        self.extend_deadline(ctx);
         Ok(futures::future::join_all(items.into_iter().map(|q| self.one_query(q))).await)
     }
 
@@ -415,6 +430,9 @@ impl PactPass {
             .map(|s| self.plan_gas(s))
             .collect::<Result<Vec<_>, _>>()
             .inspect_err(|_| metric(Field::Gas, "bad_input"))?;
+        if plans.iter().any(|p| matches!(p, GasPlan::Call { .. })) {
+            self.extend_deadline(ctx);
+        }
         futures::future::try_join_all(plans.into_iter().map(|p| self.run_gas(p))).await
     }
 
@@ -488,7 +506,12 @@ impl PactPass {
         sigs: Vec<String>,
         verify: bool,
     ) -> async_graphql::Result<GasPlan> {
+        // M1: a key given twice anywhere could read one way here (serde_json keeps the last)
+        // and another way at the node; such a command never reaches it.
         let parsed: Option<Value> = serde_json::from_str(cmd).ok();
+        if parsed.is_some() && serde_json::from_str::<NoDupKeys>(cmd).is_err() {
+            return Ok(GasPlan::Fail(GAS_DUP_KEYS.into()));
+        }
         let meta = parsed.as_ref().and_then(|v| v.get("meta"));
         let chain = meta
             .and_then(|m| m.get("chainId"))
@@ -820,6 +843,61 @@ pub fn js_number(f: f64) -> String {
         format!("-{body}")
     } else {
         body
+    }
+}
+
+/// Any JSON value, refused when an object anywhere in it repeats a key (decoded keys
+/// compared, so an escaped spelling is the same key). Depth is serde_json's limit.
+struct NoDupKeys;
+
+impl<'de> serde::Deserialize<'de> for NoDupKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(NoDupVisitor)
+    }
+}
+
+struct NoDupVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoDupVisitor {
+    type Value = NoDupKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JSON without duplicate keys")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_unit<E>(self) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_none<E>(self) -> Result<NoDupKeys, E> {
+        Ok(NoDupKeys)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<NoDupKeys, A::Error> {
+        while a.next_element::<NoDupKeys>()?.is_some() {}
+        Ok(NoDupKeys)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<NoDupKeys, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(k) = a.next_key::<String>()? {
+            if !seen.insert(k) {
+                return Err(serde::de::Error::custom("duplicate key"));
+            }
+            a.next_value::<NoDupKeys>()?;
+        }
+        Ok(NoDupKeys)
     }
 }
 

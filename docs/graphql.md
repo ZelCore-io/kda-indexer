@@ -31,8 +31,9 @@ Differences from Kadena graph:
 
 - `pactQuery` and `gasLimitEstimate` run client Pact through the node's `/local`, as the stock
   indexer does (owner decision 2026-11-26, which replaces the earlier "never runs Pact for
-  clients" rule). See [Pact passthrough](#pact-passthrough). With `[graphql.pact] enabled =
-  false` both answer `NOT_SUPPORTED`. `gasLimitEstimate(input: [])` runs no Pact and answers
+  clients" rule). See [Pact passthrough](#pact-passthrough). The passthrough is off by
+  default (`[graphql.pact] enabled = false`), and then both answer `NOT_SUPPORTED`. An
+  operator turns it on with `enabled = true`. `gasLimitEstimate(input: [])` runs no Pact and answers
   `[]`, as the stock indexer does.
 - `Transaction.result` is never a `TransactionMempoolInfo`: the indexer has no mempool, and a
   transaction that is not indexed is `null`.
@@ -781,13 +782,16 @@ Limits (`[graphql.pact]`; stock has none). Each refusal is a stock-style message
 | Setting | Default | When hit |
 |---|---|---|
 | `max_items` | 20 | items in one request, all fields, aliases and batch operations together: the field fails with `[ERROR][RAW_QUERY][LIMIT] At most 20 Pact queries and gas estimates per request` (`[GAS]` for `gasLimitEstimate`) |
-| `per_ip_rps`, `per_ip_burst` | 5, 20 | per client IP (IPv6 by /64), one token per item: `[ERROR][RAW_QUERY][RATE_LIMIT] Too many Pact queries from this client, retry later` |
+| `enabled` | false | off: both fields answer `NOT_SUPPORTED`. Operators turn it on |
+| `per_ip_rps`, `per_ip_burst` | 5, 20 | per client, keyed as the API's rate limit (an IPv4 address, a v4-mapped address unmapped, or an IPv6 /64; under key pressure a new key draws on its /24 or /48 overflow bucket, and eviction never refills a drained key), one token per item: `[ERROR][RAW_QUERY][RATE_LIMIT] Too many Pact queries from this client, retry later` |
 | `max_in_flight` | 8 | node calls at once; items wait for a slot inside their timeout. At most twice as many requests may be inside the passthrough; past that a request is refused at once with `[ERROR][RAW_QUERY][BUSY] The Pact query service is busy, retry later` |
-| `timeout_ms` | 10,000 | per item, slot wait included: stock's `timeout` item; a gas estimate fails with the node error. A request naming either field may run this long past `api.deadline_ms` |
+| `timeout_ms` | 10,000 | per item, slot wait included: stock's `timeout` item; a gas estimate fails with the node error. Only a request in which one of the fields actually runs may run this long (plus 1 s) past `api.deadline_ms`; the body read and every other request keep `api.deadline_ms` |
 | `max_input_bytes` | 65,536 | `code` plus `data` of one item: `[ERROR][RAW_QUERY][LIMIT] Pact code and data exceed N bytes` (the item, not the field); one gas input: `[ERROR][GAS][LIMIT] Input exceeds N bytes`. The request's `max_variables_bytes` and query caps apply first |
 | `max_gas_limit` | 150,000 | `meta.gasLimit` of a client command (`stringified-command`, `full-transaction`): `[ERROR][GAS][LIMIT] gasLimit above the server cap of N`, no node call. Our own commands ask for 2,500 or 10,000 |
+| (duplicate keys) | refused | a client command (`stringified-command`, `full-transaction`) that repeats a JSON key anywhere: `[ERROR][GAS][INPUT] The command holds a duplicate JSON key`, no node call (the node's decoder might read the other copy) |
 | `max_response_bytes` | 1 MiB | the node's answer: `[ERROR][RAW_QUERY][LIMIT] The node's answer exceeds N bytes`; a gas estimate fails with the node error |
-| `node_rps` | 0 (none) | node calls per second across the process |
+| `node_rps` | 16 | node calls per second across the process (0 = none); calls past it wait inside their timeout |
+| (chains) | the network's | a `chainId` must be a canonical number below the network's chain count, taken from the store's chain graph, else the network (20); otherwise no node call |
 
 The passthrough has its own node client, so it neither shares nor drains ingest's node budget.
 

@@ -132,7 +132,7 @@ pub fn api(
     // (GQ-6), which polls the store, so `serve` and replicas have them as `run` does.
     let gs = cfg.graphql.settings(&cfg.network);
     let feed = kdx_graphql::BlockFeed::spawn(api.state(), gs.feed_poll, gs.feed_ring_bytes);
-    let pact = pact_pass(cfg, &gs)?;
+    let pact = pact_pass(cfg, &gs, &api.state())?;
     if let Some(p) = &pact {
         // B1: a request naming the passthrough's fields may run its timeout past `deadline`.
         api.state()
@@ -149,10 +149,20 @@ pub fn api(
 fn pact_pass(
     cfg: &Config,
     gs: &kdx_graphql::GraphqlSettings,
+    st: &kdx_api::ApiState,
 ) -> anyhow::Result<Option<Arc<kdx_graphql::pact::PactPass>>> {
     let p = &cfg.graphql.pact;
     if !p.enabled {
         return Ok(None);
+    }
+    // M4: the network's chains from the store's chain graph when it has one (the node's own
+    // graph), else the configured network's count.
+    let mut settings = gs.pact.clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    if let Ok(view) = st.store.view(deadline) {
+        if let Some(n) = view.genesis.chains().map(|(c, _)| c).max() {
+            settings.chains = n.saturating_add(1);
+        }
     }
     let mut c = cfg.clone();
     c.ingest.max_rps = p.node_rps;
@@ -161,8 +171,7 @@ fn pact_pass(
     c.node.timeout_ms = p.timeout_ms;
     let node = super::node_client(&c).context("graphql.pact node client")?;
     Ok(Some(Arc::new(kdx_graphql::pact::PactPass::new(
-        node,
-        gs.pact.clone(),
+        node, settings,
     ))))
 }
 

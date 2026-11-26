@@ -681,3 +681,402 @@ async fn malformed_and_huge_input() {
     assert_eq!(err_msg(&r), GAS_PARSE);
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }
+
+// ---- Fix round 1 (PR #52 review): HTTP-level deadline, guard, budget, limiter, M1/M4/M7.
+
+fn schema_with(
+    base: url::Url,
+    s: PactSettings,
+    st: Option<Arc<kdx_api::ApiState>>,
+    rate_cap: Option<usize>,
+) -> (KdxSchema, Arc<PactPass>) {
+    let node = kdx_node::NodeClient::new(&kdx_node::NodeClientConfig {
+        base,
+        network: "mainnet01".into(),
+        timeout: Duration::from_secs(30),
+        max_rps: 0,
+        concurrency: s.max_in_flight,
+        p2p_url: None,
+        p2p_cert_sha256: None,
+        max_body_bytes: s.max_response_bytes,
+        max_sse_event_bytes: 1 << 16,
+    })
+    .unwrap();
+    let pass = Arc::new(PactPass::with_rate_cap(node, s.clone(), rate_cap));
+    let settings = GraphqlSettings {
+        pact: s,
+        ..GraphqlSettings::default()
+    };
+    (
+        build_schema_full(st, settings, None, None, Some(pass.clone())),
+        pass,
+    )
+}
+
+struct Http {
+    _dir: tempfile::TempDir,
+    st: Arc<kdx_api::ApiState>,
+}
+
+fn http_state(deadline: Duration) -> Http {
+    let d = tempfile::tempdir().unwrap();
+    let g = kdx_hot::Geometry {
+        max_gb: 1,
+        growth_mb: 16,
+    };
+    let hot = Arc::new(kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap());
+    let store = Arc::new(kdx_api::Store::open(hot, d.path()).unwrap());
+    let settings = kdx_api::ApiSettings {
+        network: "mainnet01".into(),
+        deadline,
+        max_in_flight: 16,
+        max_body_bytes: 8 << 20,
+        v1txs_max_body_bytes: 8 << 20,
+        v1txs_deadline: Duration::from_secs(30),
+        rate_per_ip: 1000,
+        rate_burst: 1000,
+        trusted_proxies: Vec::new(),
+        read_threads: 2,
+        ready_max_lag: 10,
+        max_event_lists: 64,
+    };
+    let st = kdx_api::Api::new(store, settings, kdx_api::TipWatch::default()).state();
+    Http { _dir: d, st }
+}
+
+/// The `/graphql` app, with the listener's guard when `guarded`.
+fn app(schema: KdxSchema, st: &Arc<kdx_api::ApiState>, guarded: bool) -> axum::Router {
+    let r = kdx_graphql::router(schema);
+    let r = if guarded {
+        r.layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            kdx_api::server::guard,
+        ))
+    } else {
+        r
+    };
+    r.with_state(st.clone())
+}
+
+async fn send(
+    app: axum::Router,
+    body: axum::body::Body,
+    run: Option<kdx_api::RunDeadline>,
+) -> (StatusCode, Value, Duration) {
+    use tower::ServiceExt;
+    let mut req = axum::http::Request::post("/graphql")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    if let Some(r) = run {
+        req.extensions_mut().insert(r);
+    }
+    let t = Instant::now();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let b = axum::body::to_bytes(resp.into_body(), 64 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&b).unwrap_or(Value::Null),
+        t.elapsed(),
+    )
+}
+
+/// I1: naming the fields without running them (a comment, a string, an unused fragment, an
+/// operation not selected, another batch member) leaves the request at its normal
+/// deadline; only a Pact field that runs extends it.
+#[tokio::test]
+async fn only_a_running_pact_field_extends_the_deadline() {
+    let (base, m) = mock(|_, _| ok("1")).await;
+    let h = http_state(Duration::from_secs(5));
+    let (schema, _) = schema_with(base, open(), Some(h.st.clone()), None);
+    let a = app(schema, &h.st, false);
+    let smuggled = [
+        (
+            "comment",
+            json!({"query": "# pactQuery gasLimitEstimate\n{ __typename }"}),
+        ),
+        (
+            "string",
+            json!({"query": "{ __type(name: \"pactQuery gasLimitEstimate\") { name } }"}),
+        ),
+        (
+            "unused fragment",
+            json!({"query": "{ __typename } fragment F on Query { pactQuery(pactQuery: [{chainId: \"0\", code: \"1\"}]) { status } }"}),
+        ),
+        (
+            "operation not selected",
+            json!({"query": "query A { __typename } query B { pactQuery(pactQuery: [{chainId: \"0\", code: \"1\"}]) { status } }", "operationName": "A"}),
+        ),
+        (
+            "batch member",
+            json!([{"query": "{ __typename }"}, {"query": "# pactQuery\n{ gasLimitEstimate: __typename }"}]),
+        ),
+    ];
+    for (case, body) in smuggled {
+        let at = Instant::now() + Duration::from_secs(5);
+        let run = kdx_api::RunDeadline::new(at, Duration::from_secs(11));
+        let before = run.get();
+        let (st, v, _) = send(a.clone(), body.to_string().into(), Some(run.clone())).await;
+        assert_eq!(run.get(), before, "{case}: {st} {v}");
+    }
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    // The same document selected and run: extended, within the ceiling.
+    let at = Instant::now() + Duration::from_secs(5);
+    let run = kdx_api::RunDeadline::new(at, Duration::from_secs(11));
+    let body = json!({"query": "query A { __typename } query B { pactQuery(pactQuery: [{chainId: \"0\", code: \"1\"}]) { status } }", "operationName": "B"});
+    let (_, v, _) = send(a.clone(), body.to_string().into(), Some(run.clone())).await;
+    assert_eq!(v["data"]["pactQuery"][0]["status"], "success", "{v}");
+    assert!(run.get() > at + Duration::from_secs(5), "extended");
+    assert!(run.get() <= at + Duration::from_secs(11), "ceiling");
+}
+
+/// I1/I2 through the guard: a Pact field that runs gets past the listener's deadline (its
+/// node answer arrives after it), and its own timeout answers as stock's `timeout` item,
+/// not a 504.
+#[tokio::test]
+async fn a_running_pact_field_outlives_the_listener_deadline() {
+    let (base, _m) = mock(|_, v| {
+        let delay = if code_of(v) == "slow" { 1500 } else { 5000 };
+        (200, ok("1").1, Duration::from_millis(delay))
+    })
+    .await;
+    let h = http_state(Duration::from_secs(1));
+    let s = PactSettings {
+        timeout: Duration::from_secs(3),
+        ..open()
+    };
+    h.st.set_graphql_extra_deadline(s.timeout + Duration::from_secs(1));
+    let (schema, _) = schema_with(base, s, Some(h.st.clone()), None);
+    let a = app(schema, &h.st, true);
+    let q = |code: &str| json!({"query": PQ, "variables": {"q": [{"chainId": "0", "code": code}]}});
+    let (st, v, el) = send(a.clone(), q("slow").to_string().into(), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["data"]["pactQuery"][0]["status"], "success", "{v}");
+    assert!(el >= Duration::from_millis(1400), "{el:?}");
+    let (st, v, el) = send(a, q("stuck").to_string().into(), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["data"]["pactQuery"][0]["status"], "timeout", "{v}");
+    assert!(el < Duration::from_millis(4500), "{el:?}");
+}
+
+/// I2: a body trickled in is cut at the listener's normal deadline even with the
+/// passthrough on (the guard's extra is only a ceiling).
+#[tokio::test]
+async fn a_slow_body_is_cut_at_the_normal_deadline() {
+    let (base, _m) = mock(|_, _| ok("1")).await;
+    let h = http_state(Duration::from_secs(1));
+    let s = PactSettings {
+        timeout: Duration::from_secs(5),
+        ..open()
+    };
+    h.st.set_graphql_extra_deadline(s.timeout + Duration::from_secs(1));
+    let (schema, _) = schema_with(base, s, Some(h.st.clone()), None);
+    let a = app(schema, &h.st, true);
+    let chunks = futures::stream::unfold(0u32, |i| async move {
+        if i >= 30 {
+            return None;
+        }
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let c = if i == 0 {
+            "{\"query\": \"{ pactQuery".to_string()
+        } else {
+            " ".into()
+        };
+        Some((Ok::<_, std::io::Error>(c), i + 1))
+    });
+    let (st, _, el) = send(a, axum::body::Body::from_stream(chunks), None).await;
+    assert_ne!(st, StatusCode::OK);
+    assert!(el < Duration::from_millis(1500), "{st} {el:?}");
+}
+
+/// I5: one item budget for every operation of a JSON batch over HTTP.
+#[tokio::test]
+async fn batch_operations_share_the_item_budget_over_http() {
+    let (base, m) = mock(|_, _| ok("1")).await;
+    let h = http_state(Duration::from_secs(5));
+    let s = PactSettings {
+        max_items: 3,
+        ..open()
+    };
+    let (schema, _) = schema_with(base, s, Some(h.st.clone()), None);
+    let a = app(schema, &h.st, false);
+    let two = json!([{"chainId": "0", "code": "1"}, {"chainId": "0", "code": "2"}]);
+    let body = json!([
+        {"query": PQ, "variables": {"q": two}},
+        {"query": PQ, "variables": {"q": two}},
+    ]);
+    let (_, v, _) = send(a, body.to_string().into(), None).await;
+    let r = v.as_array().unwrap();
+    let ok_n = r
+        .iter()
+        .filter(|x| x["data"]["pactQuery"].is_array())
+        .count();
+    assert_eq!(ok_n, 1, "{v}");
+    assert!(
+        r.iter().any(|x| err_msg(x).contains("[LIMIT] At most 3")),
+        "{v}"
+    );
+    assert_eq!(m.hits.load(Ordering::SeqCst), 2);
+}
+
+/// M7: a request dropped mid-call gives its node slot and its request place back.
+#[tokio::test]
+async fn a_cancelled_request_releases_its_slot_and_place() {
+    let (base, m) = mock(|_, _| (200, ok("1").1, Duration::from_secs(3))).await;
+    let s = PactSettings {
+        max_in_flight: 2,
+        ..open()
+    };
+    let (schema, pass) = schema_with(base, s, None, None);
+    let schema = Arc::new(schema);
+    assert_eq!(pass.idle(), (2, 4));
+    let sc = schema.clone();
+    let h = tokio::spawn(async move {
+        run(
+            &sc,
+            PQ,
+            json!({"q": [{"chainId": "0", "code": "1"}]}),
+            [1, 1, 1, 1],
+        )
+        .await
+    });
+    let t = Instant::now();
+    while m.hits.load(Ordering::SeqCst) == 0 && t.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pass.idle(), (1, 3), "held while running");
+    h.abort();
+    let _ = h.await;
+    assert_eq!(pass.idle(), (2, 4), "released on cancel");
+}
+
+fn signed_cmd(meta: &str) -> String {
+    format!(
+        r#"{{"networkId":"mainnet01","payload":{{"exec":{{"code":"(+ 1 2)","data":{{}}}}}},"signers":[],"meta":{meta},"nonce":"n"}}"#
+    )
+}
+
+/// M1: a command with a key given twice, at any depth or spelled with an escape, never
+/// reaches the node.
+#[tokio::test]
+async fn duplicate_keys_never_reach_the_node() {
+    let (base, m) = mock(|_, _| ok("1")).await;
+    let s = schema(base, open());
+    let meta_ok =
+        r#"{"chainId":"0","sender":"s","gasLimit":100,"gasPrice":1e-8,"ttl":600,"creationTime":1}"#;
+    let dupes = [
+        signed_cmd(r#"{"chainId":"0","gasLimit":1000000000,"gasLimit":100}"#),
+        signed_cmd(r#"{"chainId":"0","gasLimit":1000000000,"gasLimit":100}"#),
+        signed_cmd(&format!("{meta_ok},\"meta\":{meta_ok}").replace("}\",", "},")),
+        signed_cmd(meta_ok).replace(
+            "\"networkId\":\"mainnet01\"",
+            "\"networkId\":\"x\",\"networkId\":\"mainnet01\"",
+        ),
+        signed_cmd(meta_ok).replace("\"data\":{}", "\"data\":{\"a\":1,\"a\":2}"),
+    ];
+    for cmd in dupes {
+        let input = json!({ "cmd": cmd }).to_string();
+        let r = run(&s, GAS, json!({ "i": [input] }), [3, 3, 3, 3]).await;
+        assert_eq!(err_msg(&r), kdx_graphql::pact::GAS_DUP_KEYS, "{cmd}: {r}");
+    }
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    // The same command without the duplicate is sent.
+    let input = json!({ "cmd": signed_cmd(meta_ok) }).to_string();
+    let r = run(&s, GAS, json!({ "i": [input] }), [3, 3, 3, 3]).await;
+    assert_ne!(err_msg(&r), kdx_graphql::pact::GAS_DUP_KEYS, "{r}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+}
+
+/// M4: chain `"20"` is past mainnet's last chain; the count comes from the settings.
+#[tokio::test]
+async fn chain_20_is_refused_and_the_count_is_configured() {
+    let (base, m) = mock(|_, _| ok("1")).await;
+    let q = json!({ "q": [{"chainId": "20", "code": "1"}, {"chainId": "19", "code": "1"}] });
+    let s = schema(base.clone(), open());
+    let r = run(&s, PQ, q.clone(), [4, 4, 4, 4]).await;
+    assert_eq!(r["data"]["pactQuery"][0]["status"], "error", "{r}");
+    assert_eq!(r["data"]["pactQuery"][1]["status"], "success", "{r}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+    let s = schema(
+        base,
+        PactSettings {
+            chains: 21,
+            ..open()
+        },
+    );
+    let r = run(&s, PQ, q, [4, 4, 4, 4]).await;
+    assert_eq!(r["data"]["pactQuery"][0]["status"], "success", "{r}");
+}
+
+async fn run_ip(s: &KdxSchema, ip: IpAddr, n: usize) -> bool {
+    let items = vec![json!({"chainId": "0", "code": "1"}); n];
+    let req = async_graphql::Request::new(PQ)
+        .variables(async_graphql::Variables::from_json(json!({ "q": items })))
+        .data(ClientIp(ip))
+        .data(PactBudget::default());
+    let r = serde_json::to_value(s.execute(req).await).unwrap();
+    r["data"]["pactQuery"].is_array()
+}
+
+fn rated() -> PactSettings {
+    PactSettings {
+        max_items: 2,
+        per_ip_rps: 1,
+        per_ip_burst: 2,
+        ..PactSettings::default()
+    }
+}
+
+/// I3: on a dual-stack listener IPv4 clients arrive v4-mapped; each keeps its own bucket
+/// (the mapped and plain forms are one client).
+#[tokio::test]
+async fn v4_mapped_clients_are_not_merged() {
+    let (base, _m) = mock(|_, _| ok("1")).await;
+    let (s, _) = schema_with(base, rated(), None, None);
+    let mapped = |a: [u8; 4]| IpAddr::from(std::net::Ipv4Addr::from(a).to_ipv6_mapped());
+    assert!(run_ip(&s, mapped([1, 2, 3, 4]), 2).await);
+    assert!(!run_ip(&s, mapped([1, 2, 3, 4]), 1).await, "drained");
+    assert!(
+        !run_ip(&s, IpAddr::from([1, 2, 3, 4]), 1).await,
+        "same client"
+    );
+    for i in 0..20u8 {
+        assert!(run_ip(&s, mapped([5, 6, 7, i]), 2).await, "client {i}");
+    }
+}
+
+/// I3: a flood of new keys evicts drained buckets but never refills them: a returning
+/// drained /64 starts empty and draws on its /48's overflow bucket, which every /64 of
+/// that /48 shares; another /48 has its own.
+#[tokio::test]
+async fn a_key_flood_never_refills_and_the_48_tier_holds() {
+    let (base, _m) = mock(|_, _| ok("1")).await;
+    let (s, _) = schema_with(base, rated(), None, Some(16));
+    let in48 = |site: u16, net: u16| IpAddr::from([0x2001, 0xdb8, site, net, 0, 0, 0, 1]);
+    // 16 /64s of one /48 drain their buckets and fill the table.
+    for n in 0..16 {
+        assert!(run_ip(&s, in48(0, n), 2).await);
+    }
+    // A flood of new /64s from other /48s evicts them.
+    for site in 100..164 {
+        run_ip(&s, in48(site, 0), 1).await;
+    }
+    // Back, the drained /64s and new ones of their /48 share one overflow burst.
+    let mut admitted = 0;
+    for n in 0..40 {
+        if run_ip(&s, in48(0, n), 1).await {
+            admitted += 1;
+        }
+    }
+    assert!(admitted <= 3, "{admitted} items admitted to a drained /48");
+    // Another /48 is not held to that share once the flood's buckets have refilled (while
+    // the overflow table is under pressure a new prefix starts empty too: the API
+    // limiter's rule).
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(run_ip(&s, in48(7, 0), 2).await);
+}

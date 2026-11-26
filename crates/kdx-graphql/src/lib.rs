@@ -189,6 +189,11 @@ pub struct ReqCtx {
     pub deadline: Instant,
 }
 
+/// An HTTP request's shared deadline (B1 fix round 1, I1): the outer timers of the guard
+/// and the handler follow it; a Pact field that runs extends it ([`crate::pact`]).
+#[derive(Debug, Clone)]
+pub struct RequestRun(pub kdx_api::RunDeadline);
+
 /// The client address of an HTTP request or a websocket connection (`trusted_proxies`
 /// applied). Per-client gates (the search gate, S-5) refuse an operation without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

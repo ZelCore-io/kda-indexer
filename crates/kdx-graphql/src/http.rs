@@ -24,7 +24,7 @@ use crate::error::{limit, server, Code};
 use crate::{KdxSchema, ReqCtx};
 
 /// Past the passthrough's timeout, time to answer a `pactQuery` that timed out (B1).
-const PACT_MARGIN: Duration = Duration::from_secs(1);
+pub(crate) const PACT_MARGIN: Duration = Duration::from_secs(1);
 /// Time kept back from the request deadline to answer `TIMEOUT` as GraphQL before the
 /// guard's 504.
 pub(crate) const DEADLINE_MARGIN: Duration = Duration::from_millis(100);
@@ -129,12 +129,26 @@ async fn post_handler(
     req: HttpRequest,
 ) -> HttpResponse {
     let peer = peer_of(&req);
+    let run = run_deadline(&schema, &st, &req);
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
     let s = &crate::gql_settings(&schema);
-    let bytes: Bytes = match axum::body::to_bytes(body, s.max_body_bytes).await {
-        Ok(b) => b,
-        Err(_) => {
+    // I2: the body read is bounded by the request's normal deadline (nothing has extended
+    // it yet), so a slow sender cannot hold the in-flight slot past it.
+    let read = run.run(
+        DEADLINE_MARGIN,
+        axum::body::to_bytes(body, s.max_body_bytes),
+    );
+    let bytes: Bytes = match read.await {
+        None => {
+            kdx_metrics::get().graphql_request("query", "timeout");
+            return error_body(
+                StatusCode::REQUEST_TIMEOUT,
+                server(Code::Timeout, "request body not received in time"),
+            );
+        }
+        Some(Ok(b)) => b,
+        Some(Err(_)) => {
             kdx_metrics::get().graphql_request("query", "rejected");
             return error_body(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -177,7 +191,22 @@ async fn post_handler(
             Err(m) => return bad(m),
         },
     };
-    execute(schema, &st, peer, &headers, batch).await
+    execute(schema, &st, peer, &headers, batch, run).await
+}
+
+/// The request's shared deadline: the guard's, else (no guard, as in tests) one from now
+/// with the passthrough's extra as its ceiling.
+fn run_deadline(schema: &KdxSchema, st: &ApiState, req: &HttpRequest) -> kdx_api::RunDeadline {
+    req.extensions()
+        .get::<kdx_api::RunDeadline>()
+        .cloned()
+        .unwrap_or_else(|| {
+            let extra = schema
+                .data::<crate::Gql>()
+                .and_then(|g| g.pact.as_ref())
+                .map_or(Duration::ZERO, |p| p.settings().timeout + PACT_MARGIN);
+            kdx_api::RunDeadline::new(Instant::now() + st.settings.deadline, extra)
+        })
 }
 
 async fn get_handler(
@@ -189,6 +218,7 @@ async fn get_handler(
         return crate::ws::upgrade(schema, st, req).await;
     }
     let peer = peer_of(&req);
+    let run = run_deadline(&schema, &st, &req);
     let headers = req.headers().clone();
     let Ok(Query(q)) = Query::<GetParams>::try_from_uri(req.uri()) else {
         return bad("query parameters are not valid");
@@ -207,7 +237,7 @@ async fn get_handler(
     if let Some(n) = q.operation_name {
         r = r.operation_name(n);
     }
-    execute(schema, &st, peer, &headers, BatchRequest::Single(r)).await
+    execute(schema, &st, peer, &headers, BatchRequest::Single(r), run).await
 }
 
 async fn execute(
@@ -216,6 +246,7 @@ async fn execute(
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
     batch: BatchRequest,
+    run: kdx_api::RunDeadline,
 ) -> HttpResponse {
     let kind = match &batch {
         BatchRequest::Single(_) => "query",
@@ -249,30 +280,25 @@ async fn execute(
             return error_body(StatusCode::OK, e);
         }
     }
-    let budget = st.settings.deadline.saturating_sub(DEADLINE_MARGIN);
-    let deadline = Instant::now() + budget;
-    // B1: a request naming `pactQuery` / `gasLimitEstimate` may wait for the node up to the
-    // passthrough's own timeout (stock's 10 s), so its outer deadline is that plus a margin.
-    // Store reads keep `deadline` (ReqCtx): naming the fields buys them no extra time.
-    let names_pact = |q: &str| q.contains("pactQuery") || q.contains("gasLimitEstimate");
-    let mentions = match &batch {
-        BatchRequest::Single(r) => names_pact(&r.query),
-        BatchRequest::Batch(b) => b.iter().any(|r| names_pact(&r.query)),
-    };
-    let outer = match schema.data::<crate::Gql>().and_then(|g| g.pact.as_ref()) {
-        Some(p) if mentions => budget.max(p.settings().timeout + PACT_MARGIN),
-        _ => budget,
-    };
+    // Store reads stop at the request's normal deadline (from arrival, I2). The outer timer
+    // follows the shared deadline, which only a Pact field that actually runs extends
+    // (I1): naming the fields in a comment, a string, an unused fragment, an operation not
+    // selected or another batch member buys nothing.
+    let deadline = run
+        .get()
+        .checked_sub(DEADLINE_MARGIN)
+        .unwrap_or_else(Instant::now);
     // One item budget for the whole request (every alias, every operation of a batch).
     let mut batch = batch
         .data(ReqCtx { deadline })
+        .data(crate::RequestRun(run.clone()))
         .data(crate::pact::PactBudget::default());
     if let Some(p) = peer {
         batch = batch.data(crate::ClientIp(st.client_ip_of(p, headers)));
     }
-    let resp = match tokio::time::timeout(outer, schema.execute_batch(batch)).await {
-        Ok(r) => r,
-        Err(_) => {
+    let resp = match run.run(DEADLINE_MARGIN, schema.execute_batch(batch)).await {
+        Some(r) => r,
+        None => {
             kdx_metrics::get().graphql_request(kind, "timeout");
             return error_body(
                 StatusCode::OK,
