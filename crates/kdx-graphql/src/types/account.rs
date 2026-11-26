@@ -706,35 +706,53 @@ pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
 /// can walk the whole list; this bounds it.
 pub const BALANCE_TOUCH_KEYS: usize = 10_000;
 
+/// Transfer keys one `balance(...)` request reads in all its zero-row probes, as a multiple
+/// of the per-module cap (`balance_touch_keys`): an account with thousands of zero rows in
+/// distinct modules does not read thousands of full per-module budgets on a normal read slot
+/// (N-12). A module probed after the total is spent is capped (its unresolved rows are kept).
+pub const BALANCE_TOUCH_MODULES: usize = 4;
+
 /// Chains among `want` on which the `xfer` posting list of `(a, m)` has a key, newest first,
-/// reading at most `cap` keys. Stops early once every wanted chain is found. The flag is true
-/// when the cap ended the walk with some wanted chain still unfound.
+/// reading at most `cap` keys, and at most `*budget` (decreased by the keys read). Stops early
+/// once every wanted chain is found. The flag is true when a cap ended the walk with some
+/// wanted chain still unfound. `check` is the request's deadline, checked every 64 keys; a
+/// passed deadline (the walk's own or the request's) is an error, never a cap (N-12).
 fn xfer_touched(
     view: &View,
-    a: u32,
-    m: u32,
+    (a, m): (u32, u32),
     want: &BTreeSet<u8>,
     cap: usize,
+    budget: &mut usize,
+    check: &dyn Fn() -> ApiResult<()>,
 ) -> ApiResult<(BTreeSet<u8>, bool)> {
     let mut found = BTreeSet::new();
+    check()?;
     let mut it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
+    let cap = cap.min(*budget);
     let mut read = 0usize;
-    while found.len() < want.len() {
+    let out = loop {
+        if found.len() >= want.len() {
+            break (found, false);
+        }
         if read >= cap {
-            // Capped only if keys remain unread.
-            let more = it.next().is_some();
-            return Ok((found, more));
+            // Capped only if keys remain unread; an error (the deadline) is returned.
+            let more = it.next().transpose()?.is_some();
+            break (found, more);
         }
         let Some(k) = it.next() else {
-            break;
+            break (found, false);
         };
         read += 1;
+        if read.is_multiple_of(64) {
+            check()?;
+        }
         let c = k?.chain();
         if want.contains(&c) {
             found.insert(c);
         }
-    }
-    Ok((found, false))
+    };
+    *budget -= read;
+    Ok(out)
 }
 
 /// `balance(accountName, module, chainIds)`: an account's fungible rows above 0, plus its rows
@@ -805,6 +823,14 @@ pub async fn query_balance(
         .transpose()?;
     let acct = account.clone();
     let touch_keys = g.settings.balance_touch_keys;
+    // The request's deadline as well as the read slot's (N-12).
+    let dl = crate::deadline(ctx);
+    let check = move || -> ApiResult<()> {
+        if std::time::Instant::now() >= dl {
+            return Err(kdx_api::ApiError::Deadline);
+        }
+        Ok(())
+    };
     let mut rows: Vec<(String, u8, String)> = g
         .state()?
         .read(move |view| {
@@ -828,6 +854,7 @@ pub async fn query_balance(
             let mut zero: BTreeMap<u32, (String, BTreeMap<u8, String>)> = BTreeMap::new();
             for (k, v) in found {
                 view.check_deadline()?;
+                check()?;
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                     continue;
                 };
@@ -854,9 +881,11 @@ pub async fn query_balance(
             // `transfers(accountName, fungibleName, chainId)` reads). Rows above 0 are always
             // listed. Our transfer postings come only from node events, which start at the
             // events fork, as stock's TRANSFER rows do, so no height bound is needed.
+            let mut budget = touch_keys.saturating_mul(BALANCE_TOUCH_MODULES);
             for (m, (name, rows)) in zero {
                 let want: BTreeSet<u8> = rows.keys().copied().collect();
-                let (touched, capped) = xfer_touched(view, a, m, &want, touch_keys)?;
+                let (touched, capped) =
+                    xfer_touched(view, (a, m), &want, touch_keys, &mut budget, &check)?;
                 for (c, text) in rows {
                     if touched.contains(&c) {
                         out.push((name.clone(), c, text));

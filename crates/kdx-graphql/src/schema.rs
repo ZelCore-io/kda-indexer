@@ -456,17 +456,27 @@ impl Query {
         if module_name.len() > kdx_hot::prices::MAX_LIKE_PATTERN {
             return Ok(None);
         }
+        // The request's deadline, not only the slot's (N-06): a read that waited for its
+        // heavy slot must not scan past the time the client was promised.
+        let dl = crate::deadline(ctx);
+        let spent = move |view: &kdx_api::View| -> kdx_api::ApiResult<()> {
+            if std::time::Instant::now() >= dl {
+                return Err(kdx_api::ApiError::Deadline);
+            }
+            view.check_deadline()
+        };
         let row = crate::gql(ctx)
             .state()?
             .read_heavy(move |view| {
+                spent(view)?;
                 let found = kdx_hot::prices::lookup_checked(&view.txn, &module_name, &mut || {
-                    view.check_deadline()?;
+                    spent(view)?;
                     Ok(())
                 });
                 match found {
                     Ok(row) => Ok(row),
                     // The deadline passed inside the scan: answer it as every read does.
-                    Err(e) => view.check_deadline().and(Err(e.into())),
+                    Err(e) => spent(view).and(Err(e.into())),
                 }
             })
             .await

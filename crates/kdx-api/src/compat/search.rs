@@ -340,11 +340,37 @@ pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiR
         }
         _ => (false, false),
     };
+    // Out of time already: the scan could not read a height either (N-02).
+    if partial && no_hits && Instant::now() >= until {
+        rejected("timeout");
+        return Ok(empty(true));
+    }
     let path = if partial && no_hits {
         IndexPath::None
     } else {
         path
     };
+    scan_or_hits(view, raw, pg, path, partial, max_h, limits)
+}
+
+/// The page of `path`. A partial index whose hits list no row in the window (their bodies
+/// can sit wholly below `minheight`: `Window::admits` keeps every doc under an open upper
+/// bound) falls back to the scan, which finds the bodies a partial index misses (N-07).
+fn scan_or_hits(
+    view: &View,
+    raw: &str,
+    pg: &Paging,
+    path: IndexPath,
+    partial: bool,
+    max_h: Option<u32>,
+    limits: ScanLimits,
+) -> ApiResult<Page> {
+    let empty = |truncated| Page {
+        rows: Vec::new(),
+        next: None,
+        truncated,
+    };
+    let until = limits.until;
     match path {
         IndexPath::Hits {
             hits,
@@ -380,6 +406,12 @@ pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiR
                 rejected("timeout");
             }
             page.truncated |= capped || cut || partial;
+            if partial && page.rows.is_empty() && page.next.is_none() {
+                if Instant::now() >= until {
+                    return Ok(empty(true));
+                }
+                return scan_or_hits(view, raw, pg, IndexPath::None, false, max_h, limits);
+            }
             Ok(page)
         }
         // Nothing found in time: no token (it would repeat the same query).
@@ -685,5 +717,129 @@ mod tests {
         // The other list routes keep hiding them.
         assert!(hidden(&view, TxKey::new(8, 12, 1)));
         assert!(hidden(&view, TxKey::new(5, 3, 1)));
+    }
+
+    /// A hot store with `blocks`, the code index built over them in Full mode, then
+    /// `later` applied (not in the index) and the index marked stale: a partial index.
+    fn partial_index(
+        blocks: &[IndexedBlock],
+        later: &[IndexedBlock],
+    ) -> (tempfile::TempDir, Arc<Store>) {
+        let d = tempfile::tempdir().unwrap();
+        let g = Geometry {
+            max_gb: 1,
+            growth_mb: 16,
+        };
+        let hot = Arc::new(HotStore::open(&d.path().join("hot"), g).unwrap());
+        let apply = |bs: &[IndexedBlock]| {
+            let mut w = hot.rw().unwrap();
+            w.set_meta(kdx_hot::env::meta::NETWORK, b"mainnet01")
+                .unwrap();
+            let mut dict = HotDict::load(&w).unwrap();
+            for b in bs {
+                kdx_hot::tail::apply(&mut w, b, &mut dict).unwrap();
+            }
+            w.commit().unwrap();
+        };
+        apply(blocks);
+        let o = kdx_search::BuildOpts {
+            data_dir: d.path().to_path_buf(),
+            mode: kdx_search::ModeSel::Full,
+            threads: 1,
+            heap_mb: 64,
+            trial_docs: 0,
+            stop: Default::default(),
+        };
+        kdx_search::rebuild(&o, &hot).unwrap();
+        apply(later);
+        assert!(kdx_search::manifest::mark_stale(d.path(), 1).unwrap());
+        let store = Arc::new(Store::open(hot, d.path()).unwrap());
+        (d, store)
+    }
+
+    fn paging(min_height: Option<u32>, next: Option<crate::cursor::Cursor>) -> Paging {
+        Paging {
+            limit: 10,
+            offset: 0,
+            next,
+            min_height,
+            max_height: None,
+            empty: false,
+        }
+    }
+
+    /// N-07: a partial index whose hits all lie below `minheight` does not answer an empty
+    /// page: the scan finds the recent body the index does not hold.
+    #[test]
+    fn partial_index_hits_below_minheight_fall_back_to_the_scan() {
+        let (d, store) = partial_index(
+            &[block(0, 3, "(coin.details \"alpha-old\")")],
+            &[block(1, 9, "(coin.details \"alpha-new\")")],
+        );
+        let view = store
+            .view(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let ctx = SearchCtx::new(
+            super::super::SearchSettings::default(),
+            Some(kdx_search::search_dir(d.path())),
+        );
+        let heights = |pg: &Paging| -> Vec<u64> {
+            search_page(&view, &ctx, "alpha", pg)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r["height"].as_u64().unwrap())
+                .collect()
+        };
+        // Hits in the window: served, marked truncated (the scan is not run).
+        assert_eq!(heights(&paging(None, None)), vec![3]);
+        assert_eq!(heights(&paging(Some(5), None)), vec![9]);
+    }
+
+    /// N-02: a scan out of time before its first height returns no cursor (one naming the
+    /// page's own start would repeat forever), from a fresh query and from a row cursor.
+    #[test]
+    fn scan_cut_before_any_height_returns_no_cursor() {
+        let (d, store) = partial_index(
+            &[block(0, 3, "(coin.details \"alpha-old\")")],
+            &[block(1, 9, "(coin.details \"alpha-new\")")],
+        );
+        let view = store
+            .view(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let past = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        let row = crate::cursor::Cursor::new(&view, TxKey::new(9, 1, 1), 0).unwrap();
+        for next in [None, Some(row)] {
+            let pg = paging(None, next);
+            let mut src = Summaries {
+                like: Some(Like::new("alpha")),
+                hashes: None,
+            };
+            let page = super::super::collect_page(
+                &view,
+                super::super::Candidates::Scan {
+                    next: Some(9),
+                    floor: 0,
+                },
+                &mut src,
+                &pg,
+                Some(ScanLimits {
+                    max_heights: 100,
+                    until: past,
+                }),
+            )
+            .unwrap();
+            assert!(page.truncated && page.rows.is_empty());
+            assert!(page.next.is_none(), "cursor {next:?} repeated");
+        }
+        // Through search_page with no search time left: a partial index with no hit.
+        let settings = super::super::SearchSettings {
+            timeout_ms: 0,
+            ..super::super::SearchSettings::default()
+        };
+        let ctx = SearchCtx::new(settings, Some(kdx_search::search_dir(d.path())));
+        let page = search_page(&view, &ctx, "zzz-nothing", &paging(None, None)).unwrap();
+        assert!(page.next.is_none() && page.rows.is_empty());
     }
 }

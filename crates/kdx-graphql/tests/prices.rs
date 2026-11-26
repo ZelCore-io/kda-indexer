@@ -102,7 +102,24 @@ async fn corpus_requests_match_the_recorded_stock_prices() {
         max_event_lists: 64,
     };
     let st = Api::new(store, settings, TipWatch::default()).state();
-    let app = router(build_schema(st.clone(), GraphqlSettings::default(), None)).with_state(st);
+    let schema = build_schema(st.clone(), GraphqlSettings::default(), None);
+    let app = router(schema.clone()).with_state(st);
+
+    // N-06: the request deadline governs the scan. Spent before the read: an error, not an
+    // answer computed past it.
+    let spent = async_graphql::Request::new(DOC)
+        .variables(async_graphql::Variables::from_json(
+            json!({"moduleName": "kaddex_kdx"}),
+        ))
+        .data(kdx_graphql::ReqCtx {
+            deadline: std::time::Instant::now(),
+        });
+    let r = schema.execute(spent).await;
+    assert!(
+        !r.errors.is_empty(),
+        "answered past the deadline: {:?}",
+        r.data
+    );
 
     // free.wiza: the tx is an arbitrage (kaddex.exchange swap-exact-in, then
     // n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange swap-exact-in); its result is

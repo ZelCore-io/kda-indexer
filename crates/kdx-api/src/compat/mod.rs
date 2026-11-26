@@ -507,6 +507,17 @@ pub fn collect_page(
                 let Some(h) = *next else { break };
                 if let Some(l) = scan {
                     if scanned >= l.max_heights || Instant::now() >= l.until {
+                        if scanned == 0 {
+                            // Out of time before the first height: a cursor here would name
+                            // the page's own start (or drop a row cursor's place inside its
+                            // height), so paging would repeat it forever (N-02). No token,
+                            // like an index query that timed out.
+                            return Ok(Page {
+                                rows: out,
+                                next: None,
+                                truncated: true,
+                            });
+                        }
                         // Cut: resume below the last whole height.
                         let done = h + 1;
                         let owed = u16::try_from(skip).unwrap_or(u16::MAX);
