@@ -1142,8 +1142,10 @@ fn pact_tokens(code: &str) -> Vec<PactTok> {
 /// count is bounded by what the sender pays for (secpass A I-2):
 /// - data-backed calls, at most [`MAX_COIN_CREATE_PER_TX`] in all: the account is a
 ///   `read-msg` / `read-string` of `exec.data`, or a literal whose guard is
-///   `(read-keyset k)` naming an `exec.data` object under a key no earlier call used (the
-///   bulk creators' form);
+///   `(read-keyset k)` naming an `exec.data` keyset under a key no earlier call used, whose
+///   `keys` name the account: the bare key, or `k:` + a key (the bulk creators' form). Any
+///   other entry (`{}`, a keyset of other keys, one value copied under many keys) costs the
+///   sender a few bytes, not a name's worth, and backs nothing (PR #59 review P-1);
 /// - literal-only calls, at most [`MAX_COIN_CREATE_LITERALS_PER_TX`] of them.
 ///
 /// Distinct, [`account_like`], first-seen order.
@@ -1167,7 +1169,8 @@ pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
         // (account, whether an `exec.data` entry backs the call)
         let account = match t.get(i + 2) {
             Some(PactTok::Str(Some(s))) => {
-                // The guard `(read-keyset k)`, `k` a data object no earlier call used.
+                // The guard `(read-keyset k)`, `k` a data keyset naming the account that no
+                // earlier call used.
                 let backed = match (
                     t.get(i + 3),
                     t.get(i + 4),
@@ -1180,7 +1183,9 @@ pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
                         Some(k),
                         Some(PactTok::Close),
                     ) if f == "read-keyset"
-                        && data.and_then(|d| d.get(k)).is_some_and(Value::is_object)
+                        && data
+                            .and_then(|d| d.get(k))
+                            .is_some_and(|ks| keyset_names(ks, s))
                         && !used_keys.contains(k) =>
                     {
                         Some(k)
@@ -1219,6 +1224,18 @@ pub fn coin_create_accounts(code: &str, data: Option<&Value>) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether `ks` is a keyset object whose `keys` name `account`: `account` is one of the
+/// keys, or `k:` + one of them.
+fn keyset_names(ks: &Value, account: &str) -> bool {
+    let bare = account.strip_prefix("k:").unwrap_or(account);
+    ks.get("keys")
+        .and_then(Value::as_array)
+        .is_some_and(|keys| {
+            keys.iter()
+                .any(|k| k.as_str().is_some_and(|k| k == account || k == bare))
+        })
 }
 
 /// The data key a `read-msg` argument names (a literal or a `'symbol`).

@@ -228,7 +228,12 @@ marker is set when the store is created, each backfill range adds its counts in 
 commit with the `row_counts_txnum` stamp, and the tail adds each block. A reindex from scratch
 needs no `reconcile-counts`. A backfill killed between a range's MDBX commit and its manifest
 commit subtracts the range's stored counts and chain totals on resume (`Meta
-row_counts_range`, `chain_counters_range`), so both markers stay set.
+row_counts_range`, `chain_counters_range`), so both markers stay set. Both blobs are
+deleted once the range is in the manifest. The row-count blob takes 26 bytes per distinct
+(kind, entity, chain) key of the range and is capped at 2,000,000 keys (52 MB): a range
+above the cap stores none and logs `row counts: range blob over the cap not stored`, and a
+resume of that range clears the row-count marker as a store without the blob would (run
+`reconcile-counts`; the chain counters are not affected).
 
 Build it once on a store that predates this, and again after any command that clears the
 marker (`rebuild-range`, `segments add-index`, `hot drop-family`; each logs

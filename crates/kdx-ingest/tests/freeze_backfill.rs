@@ -721,6 +721,13 @@ fn every_derived_table_is_exact(c: &kdx_ingest::Ctx) {
     assert!(kdx_hot::rowcount::ready(&ro).unwrap(), "row counts ready");
     assert!(kdx_hot::holders::ready(&ro).unwrap(), "holders ready");
     assert!(!kdx_hot::rowcount::read_all(&ro).unwrap().is_empty());
+    // PR #59 review m-a: every range is in the manifest, so no resume blob is left in Meta.
+    assert!(kdx_hot::Txn::meta(&ro, kdx_hot::rowcount::RANGE)
+        .unwrap()
+        .is_none());
+    assert!(kdx_hot::Txn::meta(&ro, kdx_hot::chaincount::RANGE)
+        .unwrap()
+        .is_none());
     drop(ro);
     let rep = kdx_ingest::row_counts::reconcile(&c.segdir, &c.hot, 2, true, &|| false).unwrap();
     assert_eq!(rep.differing, Some(0), "row counts: {rep:?}");
@@ -750,6 +757,50 @@ async fn a_kill_between_the_hot_and_manifest_commits_keeps_every_table_exact() {
     assert!(m.entries.len() >= 2, "{m:?}");
     // Find a last range that added holders, so m-2 is exercised.
     let last = m.entries.pop().unwrap();
+    // PR #59 review m-a: the manifest commit drops the range's resume blobs; a kill between
+    // the two commits leaves them. Put back what the last range's commit wrote: the full
+    // store's counts minus those of a store backfilled to just before that range.
+    {
+        let pdb = tempfile::tempdir().unwrap();
+        let p = Arc::new(ctx_with_node(pdb.path(), 2, 2, 2, &base));
+        kdx_ingest::backfill::run(p.clone(), 0, last.start - 1, kdx_ingest::HeaderMode::Cut)
+            .await
+            .unwrap();
+        let pm = kdx_segment::manifest::Manifest::load(&p.segdir)
+            .unwrap()
+            .unwrap();
+        let ranges = |m: &kdx_segment::manifest::Manifest| -> Vec<(u32, u32)> {
+            m.entries.iter().map(|e| (e.start, e.end)).collect()
+        };
+        assert_eq!(ranges(&pm), ranges(&m));
+        let (full, pre) = (c.hot.ro().unwrap(), p.hot.ro().unwrap());
+        let pre_rows: BTreeMap<_, _> = kdx_hot::rowcount::read_all(&pre).unwrap().iter().collect();
+        let mut rows = kdx_hot::rowcount::Tally::default();
+        for (k, (u, cb)) in kdx_hot::rowcount::read_all(&full).unwrap().iter() {
+            let (pu, pc) = pre_rows.get(&k).copied().unwrap_or((0, 0));
+            if (u, cb) != (pu, pc) {
+                rows.insert(k, (u - pu, cb - pc));
+            }
+        }
+        let pre_chains = kdx_hot::chaincount::read_all(&pre).unwrap();
+        let mut chains = kdx_hot::chaincount::Tally::default();
+        for (ch, v) in kdx_hot::chaincount::read_all(&full).unwrap() {
+            let v = v.unwrap();
+            let pv = pre_chains.get(&ch).copied().flatten().unwrap_or_default();
+            chains.chains.insert(
+                ch,
+                kdx_hot::chaincount::Counts {
+                    user_txs: v.user_txs - pv.user_txs,
+                    gas: v.gas.checked_sub(pv.gas).unwrap(),
+                },
+            );
+        }
+        drop((full, pre));
+        let mut t = c.hot.rw().unwrap();
+        kdx_hot::chaincount::set_range(&mut t, last.start, last.end, &chains).unwrap();
+        kdx_hot::rowcount::set_range(&mut t, last.start, last.end, &rows).unwrap();
+        t.commit().unwrap();
+    }
     m.frontier = last.start;
     m.next_txnum = last.first_txnum;
     m.commit(&c.segdir).unwrap();

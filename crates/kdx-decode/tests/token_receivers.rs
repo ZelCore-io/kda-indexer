@@ -1216,13 +1216,16 @@ fn data_backed_creates_keep_the_1000_cap() {
         coin_create_accounts(&code, Some(&data)).len(),
         MAX_COIN_CREATE_PER_TX
     );
-    // Literal accounts guarded by distinct data keysets (the captured bot batches' form).
+    // Literal accounts guarded by distinct data keysets that name them (the captured bot
+    // batches' form): `k:` + the key, or the bare key.
     let mut data = serde_json::Map::new();
     let mut code = String::new();
     for i in 0..n {
-        data.insert(format!("ks{i}"), json!({"keys": [R1], "pred": "keys-all"}));
+        let key = format!("{i:064x}");
+        data.insert(format!("ks{i}"), json!({"keys": [key], "pred": "keys-all"}));
+        let acct = if i % 2 == 0 { format!("k:{key}") } else { key };
         code.push_str(&format!(
-            "(coin.create-account \"k:lit-{i:05}\" (read-keyset \"ks{i}\"))"
+            "(coin.create-account \"{acct}\" (read-keyset \"ks{i}\"))"
         ));
     }
     let data = Value::Object(data);
@@ -1230,9 +1233,16 @@ fn data_backed_creates_keep_the_1000_cap() {
         coin_create_accounts(&code, Some(&data)).len(),
         MAX_COIN_CREATE_PER_TX
     );
-    // One shared keyset: one call is data-backed, the rest are literal-only.
+    // One keyset reused by every call: only the call that uses it first is data-backed.
     let code: String = (0..n)
-        .map(|i| format!("(coin.create-account \"k:one-{i:05}\" (read-keyset \"ks0\"))"))
+        .map(|i| {
+            let acct = if i == 0 {
+                format!("k:{:064x}", 0)
+            } else {
+                format!("k:one-{i:05}")
+            };
+            format!("(coin.create-account \"{acct}\" (read-keyset \"ks0\"))")
+        })
         .collect();
     assert_eq!(
         coin_create_accounts(&code, Some(&data)).len(),
@@ -1246,4 +1256,86 @@ fn data_backed_creates_keep_the_1000_cap() {
         coin_create_accounts(&code, Some(&data)).len(),
         MAX_COIN_CREATE_LITERALS_PER_TX
     );
+}
+
+/// PR #59 review P-1: an `exec.data` entry backs a literal call only when it is a keyset
+/// whose `keys` name the account (the bare key, or `k:` + a key). An empty object, or one
+/// keyset value copied under every key, costs a few bytes per name and backs nothing: such
+/// calls, even in code that never runs, stay under the 64 literal cap.
+#[test]
+fn a_read_keyset_entry_backs_only_the_account_it_names() {
+    let n = MAX_COIN_CREATE_PER_TX;
+    let calls = |name: &dyn Fn(usize) -> String| -> String {
+        let body: String = (0..n)
+            .map(|i| {
+                format!(
+                    "(coin.create-account \"{}\" (read-keyset \"k{i}\"))",
+                    name(i)
+                )
+            })
+            .collect();
+        format!("(if false (do {body}) 1)")
+    };
+    // 1,000 dead-code literals, each with its own `{}` entry.
+    let empty: serde_json::Map<String, Value> =
+        (0..n).map(|i| (format!("k{i}"), json!({}))).collect();
+    let empty = Value::Object(empty);
+    let code = calls(&|i| format!("k:{i:064x}"));
+    assert!(coin_create_accounts(&code, Some(&empty)).len() <= MAX_COIN_CREATE_LITERALS_PER_TX);
+    // One shared keyset value under every key: it names R1 only.
+    let shared: serde_json::Map<String, Value> = (0..n)
+        .map(|i| (format!("k{i}"), json!({"keys": [R1], "pred": "keys-all"})))
+        .collect();
+    let shared = Value::Object(shared);
+    let got = coin_create_accounts(&code, Some(&shared));
+    assert!(
+        got.len() <= MAX_COIN_CREATE_LITERALS_PER_TX,
+        "{}",
+        got.len()
+    );
+    // ... even when the first call names R1 itself (one backed name, then the cap).
+    let code = calls(&|i| {
+        if i == 0 {
+            format!("k:{R1}")
+        } else {
+            format!("k:{i:064x}")
+        }
+    });
+    let got = coin_create_accounts(&code, Some(&shared));
+    assert!(
+        got.len() <= 1 + MAX_COIN_CREATE_LITERALS_PER_TX,
+        "{}",
+        got.len()
+    );
+    // Entries that are not keyset-shaped: `keys` absent, not an array, or not strings; and
+    // an account that is neither the key nor `k:` + the key.
+    for bad in [
+        json!({"pred": "keys-all"}),
+        json!({"keys": R1}),
+        json!({"keys": [1, 2]}),
+        json!({"keys": [format!("k:{R1}")]}),
+        json!([R1]),
+        json!(R1),
+    ] {
+        let d: serde_json::Map<String, Value> =
+            (0..n).map(|i| (format!("k{i}"), bad.clone())).collect();
+        let d = Value::Object(d);
+        let code = calls(&|i| format!("k:{i:064x}"));
+        let got = coin_create_accounts(&code, Some(&d));
+        assert!(
+            got.len() <= MAX_COIN_CREATE_LITERALS_PER_TX,
+            "{bad}: {}",
+            got.len()
+        );
+    }
+    // `w:` and other prefixed names are not `k:` + a key.
+    let w: serde_json::Map<String, Value> = (0..n)
+        .map(|i| (format!("k{i}"), json!({"keys": [format!("{i:064x}")]})))
+        .collect();
+    let w = Value::Object(w);
+    let code = calls(&|i| format!("w:{i:064x}"));
+    assert!(coin_create_accounts(&code, Some(&w)).len() <= MAX_COIN_CREATE_LITERALS_PER_TX);
+    // The honest form keeps every name.
+    let code = calls(&|i| format!("k:{i:064x}"));
+    assert_eq!(coin_create_accounts(&code, Some(&w)).len(), n);
 }

@@ -678,6 +678,12 @@ pub fn undo_range(txn: &mut RwTxn<'_>, start: u32, end: u32) -> Result<bool> {
     Ok(true)
 }
 
+/// Delete [`RANGE`]: once the range is in the manifest it is never undone (PR #59 review m-a).
+pub fn drop_range(txn: &mut RwTxn<'_>) -> Result<()> {
+    txn.del(Table::Meta, RANGE.as_bytes())?;
+    Ok(())
+}
+
 /// Replace the whole table with `t` (`reconcile-counts`; the caller sets the marker).
 pub fn replace(txn: &mut RwTxn<'_>, t: &Tally) -> Result<()> {
     txn.clear(Table::ChainCounters)?;

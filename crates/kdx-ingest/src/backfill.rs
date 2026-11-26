@@ -893,6 +893,13 @@ fn build_and_commit(
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
+    // PR #59 review m-a: the range is in the manifest, so its resume blobs (the row-count one
+    // can be MBs) are dead weight. A kill before this commit leaves them: the next range's
+    // commit replaces them, and a resume only uses a blob whose range matches exactly.
+    let mut txn = ctx.hot.rw()?;
+    kdx_hot::chaincount::drop_range(&mut txn)?;
+    kdx_hot::rowcount::drop_range(&mut txn)?;
+    txn.commit()?;
     // After the commit, so a range that is built again does not list its blocks twice.
     merkle.commit(&ctx.opts.data_dir, u.start);
     let commit_secs = t.elapsed().as_secs_f64();
