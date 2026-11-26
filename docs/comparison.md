@@ -255,6 +255,11 @@ The G4 replay of real traffic (below) met most of these classes again; its
   gas, so it drifts up. The comparison accepts a relative difference of at most 1e-6 per
   chain (stock's chain 0 total is about 126,268 KDA: 0.13 KDA). `transactionCount` is
   compared exactly, less the blocks in flight between the two reads.
+- Field errors keep their `path` (and `locations`). Stock's `securitySanitizationPlugin`
+  strips both from every error that carries `extensions`; the spec requires `path` on a field
+  error, and a client ignores an extra key, so ours is kept (secpass B M-3).
+- `NOT_AVAILABLE` texts name the operator command that builds the missing data
+  (`kda-indexer reconcile-counts`, `reconcile-holders`); stock has no such state.
 - Event text search covers a bounded recent window; chainweb-data scans further back
   (`event-search-window`). Only whole rows stock lists and kda-indexer does not are explained;
   a row only kda-indexer lists, or a field that differs on a row both sides list, is reported.

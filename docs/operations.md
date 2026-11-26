@@ -62,6 +62,11 @@ journalctl -u kda-indexer-mainnet01 -f
   while any chain is halted, or while any chain lags more than `api.ready_max_lag` blocks.
   Lag is judged against the last node tips for up to 10 minutes after the node stops
   answering, so a node restart does not take the indexer out of the pool.
+  On a new store the chain counters (`transactionCount`, `totalGasUsedInKda`) and the holders
+  list are marked ready from the start and are served partial, with no flag, while the
+  backfill from block 0 runs; only `/readyz` tells. So for a from-scratch reindex either let
+  the public load balancer check `/readyz`, or keep the GraphQL port private until backfill
+  ends.
 - **Watchdog.** `WatchdogSec=120`. A dedicated thread pings systemd only while ingest and the
   API runtime are making progress: backfill and the range writer beat per block and per
   postings file, the tail writer on every commit and every 5 s when idle, the freezer per
@@ -1055,7 +1060,8 @@ sweep, a chain retry or its unlistable period comes due (a token whose
 the store has no row for ([graphql.md](graphql.md#accounts)). A typical lookup misses on 18
 or 19 of the 20 chains, so the node's absent answers decide the load:
 
-- Absent answers are cached as one 20-bit chain mask per (account, module) for
+- Absent answers are cached as one 32-bit chain mask per (account, module) (chains 32 and
+  above are not cached absent) for
   `ttl_absent_secs` (default 21,600 = 6 h, at most 86,400). At the default `node_rps` 20 and
   19 reads per new account, the reader can keep about 22,700 accounts' negatives fresh (600 s
   kept about 630), and `cache_entries` (100,000) holds about that many accounts, not the
@@ -1068,6 +1074,36 @@ or 19 of the 20 chains, so the node's absent answers decide the load:
   error marks nothing, so that chain is read again on the next lookup.
 - `node_burst` is 20..=64: at least one account's chains, at most about three accounts'
   worth of reads at once on top of the reconciler's `balances.local_rps`.
+- Per client: 2 reads/s, burst 20 (`per_ip_rps`, `per_ip_burst`), a tenth of `node_rps`, so
+  one client at its maximum rate leaves the rest of the node budget to other clients'
+  lookups. The same limit bounds the cache churn one client causes (each cache insert is one
+  of its reads): `cache_entries / 2 / per_ip_rps` must be at least `ttl_absent_secs` (at the
+  defaults 25,000 s against 21,600 s), so one client cannot turn a cache generation over and
+  flush everyone else's absent answers; `validate` refuses a config that breaks it. Many
+  clients together (an IPv6 /48 has its own overflow tier) are bounded only by `node_rps`.
+- An absent answer that arrives while a found row is cached for the chain is ignored (coin
+  rows are never deleted, so it is stale); a found answer clears its chain's bit in each
+  cache generation separately.
+
+### Combined node load (miss read, Pact passthrough, reconciler)
+
+Each budget is separate, so the node sees their sum. At the defaults with
+`[graphql.pact] enabled = true`:
+
+| Source | Rate | Burst / in flight | Over the limit |
+|---|---|---|---|
+| Miss read (`[graphql.account_miss]`) | `node_rps` 20/s | burst 40, 16 in flight | refused at once (store-only, flagged) |
+| Pact passthrough (`[graphql.pact]`) | `node_rps` 16/s (at most 64) | 8 in flight, 16 requests inside | waits within the item's 10 s timeout; past 16 requests `BUSY` |
+| Reconciler (`balances.local_rps`) | its own setting | its own | waits |
+
+Worst case: about 36 `/local` calls/s plus the reconciler's rate, with bursts of 40 miss reads
+and 8 Pact calls in flight at once. Pact calls can be slow (each up to `timeout_ms`), so size
+the node for 8 concurrent slow `/local` calls on top of the miss reads. Fairness: one Pact
+client may burst 20 items (`per_ip_burst`) against 16/s and 8 slots, which queues other
+clients' items for 1 to 2 s (within their timeout); a few clients sending 1-item requests
+against a node slower than about 1 s can fill the 16 request places, and the rest get `BUSY`.
+Lower `[graphql.pact] per_ip_rps` (for example to 2) if that matters more than one client's
+throughput.
 
 ### NFTs
 

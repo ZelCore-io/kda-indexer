@@ -69,8 +69,9 @@ type. The `limit` rows break down as follows:
   page. It passes with `first` 50.
 
 Three kadscan documents pass check-ops but read a field that answers `NOT_SUPPORTED` or
-`NOT_AVAILABLE` at run time: the per-chain gas counter and `balance` without an account
-(`pactQuery` is served since the node passthrough). The explorer gets an error for that field, and the rest of the
+`NOT_AVAILABLE` at run time: the per-chain gas counter while it is not built (`balance`
+without an account is served since the holders index, `pactQuery` since the node
+passthrough). The explorer gets an error for that field, and the rest of the
 operation still answers.
 
 The per-operation table, with a note on every row, is in
