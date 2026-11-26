@@ -655,11 +655,18 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
   (the API limiter's keys), checked first, so a refused client spends no request budget; 40
   reads per request across all fields, aliases and batch operations; across the process, 16
   in flight and a node rate of its own on a `/local` client of its own: `node_rps` 20/s
-  (burst 40), at most 25/s, on top of the reconciler's `balances.local_rps`; 3 s per read
+  (burst 40, at most 64), at most 25/s, on top of the reconciler's `balances.local_rps`; 3 s per read
   within the request deadline; a cache of at most 100,000 answers (`cache_entries`, at most
-  1,000,000; two generations, the older dropped whole), found ones for 30 s, absent ones for
-  600 s and node errors for 30 s (`ttl_error_secs`; served as unanswered, flagged), keyed by
-  the exact (account, module, chain). The global limits fail fast: a read with no node token
+  1,000,000; two generations, the older dropped whole): found rows for 30 s and node errors
+  for 30 s (`ttl_error_secs`; served as unanswered, flagged), each keyed by the exact
+  (account, module, chain); absent answers for 6 h (`ttl_absent_secs`, at most 24 h) as one
+  chain mask per (account, module), so an account costs one entry. Only the node's absent
+  answer sets a chain's bit (a timeout or refusal marks nothing; that chain is read again
+  next time); a bit added to a live mask keeps the mask's expiry, so no bit outlives its TTL.
+  Trade-off: a row created without an event on a chain already cached absent stays hidden
+  here for up to that TTL; a row with an event is indexed and served from the store
+  regardless (see [operations.md](operations.md#node-read-on-a-lookup-miss-graphqlaccount_miss)).
+  The global limits fail fast: a read with no node token
   is refused at once and one waits at most `slot_wait_ms` (150 ms) for an in-flight slot, so a
   saturated reader costs a lookup at most that wait; the refused chains answer store-only
   with the flag. Concurrent reads of one (account, module, chain) share one node call. A

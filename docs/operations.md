@@ -1049,6 +1049,26 @@ failed chains with their retry times; a restart resumes) and `Meta balances_keyl
 sweep, a chain retry or its unlistable period comes due (a token whose
 `balances_keylist/<ModuleId>` entry is gone counts as never listed, but no tool deletes one).
 
+### Node read on a lookup miss (`[graphql.account_miss]`)
+
+`fungibleAccount` and its kin read `(<module>.details)` from the node for each asked chain
+the store has no row for ([graphql.md](graphql.md#accounts)). A typical lookup misses on 18
+or 19 of the 20 chains, so the node's absent answers decide the load:
+
+- Absent answers are cached as one 20-bit chain mask per (account, module) for
+  `ttl_absent_secs` (default 21,600 = 6 h, at most 86,400). At the default `node_rps` 20 and
+  19 reads per new account, the reader can keep about 22,700 accounts' negatives fresh (600 s
+  kept about 630), and `cache_entries` (100,000) holds about that many accounts, not the
+  ~5,000 a per-chain entry allowed. Found rows (30 s) and node errors (30 s) stay per chain.
+- The trade-off: a row created without an event (inside another module's code) on a chain
+  already cached absent stays hidden from these lookups for up to `ttl_absent_secs` after the
+  lookup that cached it. A row with an event is indexed, and the store serves it regardless
+  of the cache. Lower `ttl_absent_secs` if that window matters more than node load.
+- Only the node's absent answer sets a bit. A timeout, a refusal by our limits or a node
+  error marks nothing, so that chain is read again on the next lookup.
+- `node_burst` is 20..=64: at least one account's chains, at most about three accounts'
+  worth of reads at once on top of the reconciler's `balances.local_rps`.
+
 ### NFTs
 
 The same stage keeps `NftBalances` (spec §3.9). Once per store (`Meta nft_filled`), before the

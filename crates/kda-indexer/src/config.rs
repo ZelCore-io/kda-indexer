@@ -441,12 +441,17 @@ pub struct AccountMissConfig {
     pub slot_wait_ms: u64,
     /// Node calls per second across the process and their burst. A budget of its own, on top
     /// of the reconciler's `balances.local_rps`, so at most 25/s (default 20): a read with no
-    /// token is refused at once, never queued.
+    /// token is refused at once, never queued. `node_burst` is 20..=64: at least one
+    /// account's chains, and at most about three accounts' worth of reads in one instant on
+    /// top of the reconciler.
     pub node_rps: u32,
     pub node_burst: u32,
     /// Per read, slot wait included.
     pub timeout_ms: u64,
     /// How long a found row, an absent answer and a node error (0: not cached) are reused.
+    /// Absent answers are one chain mask per (account, module), kept 6 h by default (at most
+    /// 24 h): a row created without an event on a chain cached absent stays hidden up to that
+    /// long; rows with an event are indexed and served from the store regardless.
     pub ttl_found_secs: u64,
     pub ttl_absent_secs: u64,
     pub ttl_error_secs: u64,
@@ -467,7 +472,7 @@ impl Default for AccountMissConfig {
             node_burst: 40,
             timeout_ms: 3_000,
             ttl_found_secs: 30,
-            ttl_absent_secs: 600,
+            ttl_absent_secs: 21_600,
             ttl_error_secs: 30,
             cache_entries: 100_000,
         }
@@ -481,14 +486,14 @@ impl AccountMissConfig {
                 && (1..=256).contains(&self.max_in_flight)
                 && self.slot_wait_ms <= 1_000
                 && (1..=25).contains(&self.node_rps)
-                && (20..=400).contains(&self.node_burst)
+                && (20..=64).contains(&self.node_burst)
                 && (500..=30_000).contains(&self.timeout_ms)
                 && self.ttl_found_secs <= 3_600
                 && (1..=86_400).contains(&self.ttl_absent_secs)
                 && self.ttl_error_secs <= 600
                 && (1..=1_000_000).contains(&self.cache_entries),
             "graphql.account_miss: max_reads_per_request 1..=400, max_in_flight 1..=256, \
-             slot_wait_ms <= 1000, node_rps 1..=25, node_burst 20..=400, \
+             slot_wait_ms <= 1000, node_rps 1..=25, node_burst 20..=64, \
              timeout_ms 500..=30000, ttl_found_secs <= 3600, ttl_absent_secs 1..=86400, \
              ttl_error_secs <= 600, cache_entries 1..=1000000"
         );
@@ -1092,11 +1097,29 @@ mod balances_tests {
                 slot_wait_ms: 1_001,
                 ..AccountMissConfig::default()
             },
+            AccountMissConfig {
+                node_burst: 65,
+                ..AccountMissConfig::default()
+            },
+            AccountMissConfig {
+                node_burst: 19,
+                ..AccountMissConfig::default()
+            },
+            AccountMissConfig {
+                ttl_absent_secs: 86_401,
+                ..AccountMissConfig::default()
+            },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
+        let edge = AccountMissConfig {
+            node_burst: 64,
+            ..AccountMissConfig::default()
+        };
+        assert!(edge.validate().is_ok());
         let s = m.settings(20);
         assert_eq!((s.node_rps, s.node_burst), (20, 40));
+        assert_eq!(s.ttl_absent, std::time::Duration::from_secs(6 * 3600));
         assert_eq!(s.slot_wait, std::time::Duration::from_millis(150));
     }
 

@@ -19,9 +19,9 @@
 //! serves; the API's per-client token bucket ([`kdx_api::limits::RateLimiter`]), checked first;
 //! a per-request read budget across all fields and aliases ([`MissBudget`]); a node rate of its
 //! own (default 20/s, at most 25/s, on top of the reconciler's `balances.local_rps`); a global
-//! in-flight cap; a per-read timeout within the request deadline; a bounded TTL cache of
-//! found and absent answers (negatives included) and, briefly, of node errors, keyed by the
-//! exact `(account, module, chain)`. The code sent is fixed (`(<module>.details
+//! in-flight cap; a per-read timeout within the request deadline; a bounded TTL cache (see
+//! [Cache]) of found rows and, briefly, node errors per `(account, module, chain)`, and of
+//! the node's absent answers as one chain mask per `(account, module)`. The code sent is fixed (`(<module>.details
 //! (read-msg "a"))`, account in `data`), the node URL is the configured one: no client text
 //! reaches a URL or the code.
 //!
@@ -106,8 +106,11 @@ pub struct MissSettings {
     pub timeout: Duration,
     /// Longest wait for an in-flight slot; past it the read is refused.
     pub slot_wait: Duration,
-    /// How long a found row, an absent answer and a node error are reused (zero: a node
-    /// error is not cached).
+    /// How long a found row, an absent answer and a node error are reused (zero: not
+    /// cached). Absent answers live long (default 6 h): a typical lookup misses on 19 of 20
+    /// chains, and only a long negative TTL keeps the node budget for new accounts. The cost:
+    /// a row created without an event on a chain cached absent stays hidden up to this long
+    /// (a row with an event is indexed and served from the store regardless).
     pub ttl_found: Duration,
     pub ttl_absent: Duration,
     pub ttl_error: Duration,
@@ -130,7 +133,7 @@ impl Default for MissSettings {
             timeout: Duration::from_secs(3),
             slot_wait: Duration::from_millis(150),
             ttl_found: Duration::from_secs(30),
-            ttl_absent: Duration::from_secs(600),
+            ttl_absent: Duration::from_secs(6 * 3600),
             ttl_error: Duration::from_secs(30),
             cache_entries: 100_000,
             max_in_flight: 16,
@@ -155,36 +158,118 @@ impl MissBudget {
 
 type Key = (String, String, u8);
 
-/// A cached answer: the node's row, or a node error (served as unanswered).
+/// A cache key: `(account, module, Some(chain))` for one chain's found row or node error,
+/// `(account, module, None)` for the account's absent mask.
+type CacheKey = (String, String, Option<u8>);
+
+/// A cached answer: the node's found row, a node error (served as unanswered), or the
+/// chains the node answered absent (bit `c` for chain `c`).
 #[derive(Debug, Clone)]
 enum Cached {
     Row(NodeRow),
     Failed,
+    Absent(u32),
+}
+
+/// The mask bit of `chain`; 0 (never cached absent) for a chain past the mask's 32 bits.
+fn bit(chain: u8) -> u32 {
+    1u32.checked_shl(u32::from(chain)).unwrap_or(0)
 }
 
 /// The answer cache: two generations of at most half the cap each. An insert goes to the
 /// young one; when it is full it becomes the old one and the previous old one is retired
 /// whole (handed back to be dropped outside the lock). O(1) per insert, no scan; an expired
 /// entry is never served and leaves with its generation.
+///
+/// Absent answers of one `(account, module)` share one entry, a chain mask, so an account
+/// costs one entry however many chains it misses on (found rows and node errors stay per
+/// chain, short-lived). Merging: a bit is set only by the node's absent answer for that
+/// chain (never by a timeout, a refusal, a node error or anything a client sends). A bit
+/// set into a live entry keeps the entry's expiry, the earliest of its bits', so no bit is
+/// served past its own TTL (a newer bit may expire early, costing one read); into an
+/// expired or missing entry it starts a new one. A found answer clears its chain's bit.
 #[derive(Debug, Default)]
 struct Cache {
-    young: HashMap<Key, (Instant, Cached)>,
-    old: HashMap<Key, (Instant, Cached)>,
+    young: Generation,
+    old: Generation,
 }
 
-type Generation = HashMap<Key, (Instant, Cached)>;
+type Generation = HashMap<CacheKey, (Instant, Cached)>;
 
 impl Cache {
-    fn get(&self, k: &Key, now: Instant) -> Option<Cached> {
+    fn entry(&self, k: &CacheKey, now: Instant) -> Option<&(Instant, Cached)> {
         self.young
             .get(k)
             .or_else(|| self.old.get(k))
             .filter(|(exp, _)| *exp > now)
+    }
+
+    /// The answer for one chain: absent if its mask bit is set, else its own entry.
+    fn get(&self, k: &Key, now: Instant) -> Option<Cached> {
+        let mask = (k.0.clone(), k.1.clone(), None);
+        if let Some((_, Cached::Absent(m))) = self.entry(&mask, now) {
+            if m & bit(k.2) != 0 {
+                return Some(Cached::Row(NodeRow::Absent));
+            }
+        }
+        self.entry(&(k.0.clone(), k.1.clone(), Some(k.2)), now)
             .map(|(_, v)| v.clone())
     }
 
+    /// The account's live absent mask.
+    fn absent_mask(&self, account: &str, module: &str, now: Instant) -> u32 {
+        match self.entry(&(account.to_owned(), module.to_owned(), None), now) {
+            Some((_, Cached::Absent(m))) => *m,
+            _ => 0,
+        }
+    }
+
+    fn remove(&mut self, k: &CacheKey) {
+        self.young.remove(k);
+        self.old.remove(k);
+    }
+
+    /// The node answered `k`'s chain absent: set its bit (see the merge rule above) and
+    /// drop the chain's own entry.
     #[must_use]
-    fn put(&mut self, k: Key, exp: Instant, v: Cached, cap: usize) -> Option<Generation> {
+    fn mark_absent(
+        &mut self,
+        k: &Key,
+        exp: Instant,
+        now: Instant,
+        cap: usize,
+    ) -> Option<Generation> {
+        let b = bit(k.2);
+        if b == 0 {
+            return None;
+        }
+        self.remove(&(k.0.clone(), k.1.clone(), Some(k.2)));
+        let mk = (k.0.clone(), k.1.clone(), None);
+        let (exp, m) = match self.entry(&mk, now) {
+            Some((e, Cached::Absent(m))) => ((*e).min(exp), m | b),
+            _ => (exp, b),
+        };
+        self.put(mk, exp, Cached::Absent(m), cap)
+    }
+
+    /// The node found `k`'s chain: clear its absent bit, the entry's expiry unchanged.
+    fn clear_absent(&mut self, k: &Key) {
+        let mk = (k.0.clone(), k.1.clone(), None);
+        let b = bit(k.2);
+        let mut empty = false;
+        for g in [&mut self.young, &mut self.old] {
+            if let Some((_, Cached::Absent(m))) = g.get_mut(&mk) {
+                *m &= !b;
+                empty |= *m == 0;
+            }
+        }
+        if empty {
+            self.remove(&mk);
+        }
+    }
+
+    #[must_use]
+    fn put(&mut self, k: CacheKey, exp: Instant, v: Cached, cap: usize) -> Option<Generation> {
         let half = (cap / 2).max(1);
         let mut retired = None;
         if self.young.len() >= half && !self.young.contains_key(&k) {
@@ -264,14 +349,36 @@ impl Core {
     fn remember(&self, k: Key, v: Cached) {
         let ttl = match &v {
             Cached::Row(NodeRow::Found { .. }) => self.settings.ttl_found,
-            Cached::Row(NodeRow::Absent) => self.settings.ttl_absent,
+            Cached::Row(NodeRow::Absent) | Cached::Absent(_) => self.settings.ttl_absent,
             Cached::Failed => self.settings.ttl_error,
         };
-        if ttl.is_zero() {
-            return;
-        }
         let cap = self.settings.cache_entries.max(1);
-        let retired = self.cache().put(k, Instant::now() + ttl, v, cap);
+        let now = Instant::now();
+        let exp = now + ttl;
+        let retired = {
+            let mut cache = self.cache();
+            match v {
+                Cached::Row(NodeRow::Absent) | Cached::Absent(_) => {
+                    if ttl.is_zero() {
+                        None
+                    } else {
+                        cache.mark_absent(&k, exp, now, cap)
+                    }
+                }
+                v => {
+                    // A found row supersedes an absent bit even when found rows are not
+                    // cached.
+                    if matches!(v, Cached::Row(NodeRow::Found { .. })) {
+                        cache.clear_absent(&k);
+                    }
+                    if ttl.is_zero() {
+                        None
+                    } else {
+                        cache.put((k.0, k.1, Some(k.2)), exp, v, cap)
+                    }
+                }
+            }
+        };
         // Dropped here, after the lock is released.
         drop(retired);
     }
@@ -453,8 +560,9 @@ impl MissReader {
         let mut todo = Vec::new();
         {
             let cache = self.core.cache();
+            let absent = cache.absent_mask(account, module, now);
             for &c in chains {
-                if c >= self.core.settings.chains || todo.contains(&c) {
+                if c >= self.core.settings.chains || todo.contains(&c) || absent & bit(c) != 0 {
                     continue;
                 }
                 let k = (account.to_owned(), module.to_owned(), c);
@@ -462,7 +570,7 @@ impl MissReader {
                     Some(Cached::Row(NodeRow::Found { balance, guard, .. })) => {
                         out.found.push((c, balance, guard));
                     }
-                    Some(Cached::Row(NodeRow::Absent)) => {}
+                    Some(Cached::Row(NodeRow::Absent) | Cached::Absent(_)) => {}
                     Some(Cached::Failed) => out.incomplete = true,
                     None => todo.push(c),
                 }
@@ -560,6 +668,9 @@ impl MissReader {
         let cached = self.core.cache().get(&key, now);
         match cached {
             Some(Cached::Row(row)) => return Ok(futures::future::ready(Ok(row)).boxed().shared()),
+            Some(Cached::Absent(_)) => {
+                return Ok(futures::future::ready(Ok(NodeRow::Absent)).boxed().shared())
+            }
             Some(Cached::Failed) => return Err(ReadErr::Node),
             None => {}
         }
@@ -592,5 +703,58 @@ impl MissReader {
             );
         }
         Ok(call)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(c: u8) -> Key {
+        ("k:a".into(), "coin".into(), c)
+    }
+
+    fn absent(cache: &Cache, c: u8, now: Instant) -> bool {
+        matches!(cache.get(&key(c), now), Some(Cached::Row(NodeRow::Absent)))
+    }
+
+    /// The absent mask: one entry per account, bits merged, no bit served past its own
+    /// TTL, a newer bit never extends an older one, an expired entry starts over.
+    #[test]
+    fn absent_bits_merge_and_expire_by_the_earliest() {
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(100);
+        let mut c = Cache::default();
+        let _ = c.mark_absent(&key(1), t0 + ttl, t0, 1000);
+        let t1 = t0 + Duration::from_secs(60);
+        let _ = c.mark_absent(&key(2), t1 + ttl, t1, 1000);
+        assert_eq!(c.len(), 1, "one entry per (account, module)");
+        assert!(absent(&c, 1, t1) && absent(&c, 2, t1) && !absent(&c, 3, t1));
+        // Chain 1's TTL ends at t0 + 100: neither bit is served past it.
+        let t2 = t0 + Duration::from_secs(101);
+        assert!(!absent(&c, 1, t2) && !absent(&c, 2, t2));
+        // Set into an expired entry: a fresh entry, old bits gone.
+        let _ = c.mark_absent(&key(3), t2 + ttl, t2, 1000);
+        assert!(absent(&c, 3, t2) && !absent(&c, 1, t2) && !absent(&c, 2, t2));
+        assert!(absent(&c, 3, t2 + Duration::from_secs(99)));
+        assert!(!absent(&c, 3, t2 + ttl));
+    }
+
+    #[test]
+    fn a_found_answer_clears_its_bit_and_chains_past_the_mask_are_not_cached() {
+        let t0 = Instant::now();
+        let exp = t0 + Duration::from_secs(100);
+        let mut c = Cache::default();
+        let _ = c.mark_absent(&key(4), exp, t0, 1000);
+        let _ = c.mark_absent(&key(5), exp, t0, 1000);
+        c.clear_absent(&key(4));
+        assert!(!absent(&c, 4, t0) && absent(&c, 5, t0));
+        c.clear_absent(&key(5));
+        assert_eq!(c.len(), 0, "an empty mask is dropped");
+        assert!(c.mark_absent(&key(40), exp, t0, 1000).is_none());
+        assert_eq!(c.len(), 0);
+        assert_eq!(bit(31), 1 << 31);
+        assert_eq!(bit(32), 0);
+        assert_eq!(bit(255), 0);
     }
 }
