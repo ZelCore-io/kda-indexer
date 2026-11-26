@@ -25,7 +25,7 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_graphql::{Context, ErrorExtensions};
@@ -102,13 +102,25 @@ impl Default for PactSettings {
     }
 }
 
+/// `code` + `data` bytes of one `pactQuery` item.
+fn query_size(q: &PactQuery) -> usize {
+    q.code.len()
+        + q.data
+            .iter()
+            .flatten()
+            .map(|d| d.key.len() + d.value.len())
+            .sum::<usize>()
+}
+
 /// One request's share of the passthrough, for all its fields and aliases (and the
 /// operations of a batch): the items asked for so far, and its one place among the
-/// requests inside ([`PactPass::enter`]), released when the request ends.
+/// requests inside ([`PactPass::enter`]), released when the request ends; and its one time
+/// cap, set when its first Pact field starts (secpass B M-8).
 #[derive(Debug, Clone, Default)]
 pub struct PactBudget {
     used: Arc<AtomicUsize>,
     place: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    until: Arc<OnceLock<Instant>>,
 }
 
 /// The passthrough: the node client (fixed URL and network), the slots, the per-IP buckets.
@@ -235,23 +247,31 @@ impl PactPass {
         (n.to_string() == s && n < self.settings.chains).then_some(n)
     }
 
-    /// The per-request item budget, then the per-IP bucket.
+    /// The per-request item budget (checked, not yet charged), then the per-IP bucket, then
+    /// the budget charged: a field the bucket refuses spends none of the request's items
+    /// (secpass B M-10). With the per-IP limit on, a request with no peer address (never one
+    /// the HTTP server takes) is refused rather than sharing one bucket (M-9).
     fn admit(&self, ctx: &Context<'_>, n: usize, field: Field) -> async_graphql::Result<()> {
         let max = self.settings.max_items;
-        let used = match ctx.data_opt::<PactBudget>() {
-            Some(b) => b.used.fetch_add(n, Ordering::AcqRel).saturating_add(n),
-            None => n,
-        };
-        if n > max || used > max {
+        let budget = ctx.data_opt::<PactBudget>();
+        let limit = || {
             metric(field, "limit_items");
             kdx_metrics::get().graphql_rejected("pact_items");
-            return Err(field_err(format!(
+            field_err(format!(
                 "[ERROR][{}][LIMIT] At most {max} Pact queries and gas estimates per request",
                 field.tag()
-            )));
+            ))
+        };
+        let used = budget.map_or(0, |b| b.used.load(Ordering::Acquire));
+        if n > max || used.saturating_add(n) > max {
+            return Err(limit());
         }
-        let ip = crate::client_ip(ctx).unwrap_or(IpAddr::from([0, 0, 0, 0]));
-        if !self.take(ip, n) {
+        let allowed = match (&self.rate, crate::client_ip(ctx)) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(_), Some(ip)) => self.take(ip, n),
+        };
+        if !allowed {
             metric(field, "limit_rate");
             kdx_metrics::get().graphql_rejected("pact_rate");
             return Err(field_err(format!(
@@ -259,7 +279,26 @@ impl PactPass {
                 field.tag()
             )));
         }
+        // Charged now; a concurrent field of the same request may have taken the room.
+        if let Some(b) = budget {
+            if b.used.fetch_add(n, Ordering::AcqRel).saturating_add(n) > max {
+                return Err(limit());
+            }
+        }
         Ok(())
+    }
+
+    /// The request's Pact time cap: `timeout` after its first Pact field started; every item
+    /// of every field of the request (aliases, batch operations) ends by it.
+    fn until(&self, ctx: &Context<'_>) -> Instant {
+        let fresh = || Instant::now() + self.settings.timeout;
+        ctx.data_opt::<PactBudget>()
+            .map_or_else(fresh, |b| *b.until.get_or_init(fresh))
+    }
+
+    /// Whether an item passes the local checks (size, chain), so it would call the node.
+    fn query_runs(&self, q: &PactQuery) -> bool {
+        query_size(q) <= self.settings.max_input_bytes && self.chain(&q.chain_id).is_some()
     }
 
     /// A request's place in the passthrough (one per request, however many fields and
@@ -345,12 +384,16 @@ impl PactPass {
         }
         self.admit(ctx, items.len(), Field::Query)?;
         let _in = self.enter(ctx, Field::Query)?;
-        self.extend_deadline(ctx);
-        Ok(futures::future::join_all(items.into_iter().map(|q| self.one_query(q))).await)
+        // Only when an item will call the node (secpass B M-6), as for gas estimates.
+        if items.iter().any(|q| self.query_runs(q)) {
+            self.extend_deadline(ctx);
+        }
+        let until = self.until(ctx);
+        Ok(futures::future::join_all(items.into_iter().map(|q| self.one_query(q, until))).await)
     }
 
-    async fn one_query(&self, q: PactQuery) -> PactQueryResponse {
-        let (status, result, error) = self.query_answer(&q).await;
+    async fn one_query(&self, q: PactQuery, until: Instant) -> PactQueryResponse {
+        let (status, result, error) = self.query_answer(&q, until).await;
         metric(Field::Query, status_label(status, error.as_deref()));
         PactQueryResponse {
             chain_id: q.chain_id,
@@ -361,15 +404,13 @@ impl PactPass {
         }
     }
 
-    async fn query_answer(&self, q: &PactQuery) -> (&'static str, Option<String>, Option<String>) {
+    async fn query_answer(
+        &self,
+        q: &PactQuery,
+        until: Instant,
+    ) -> (&'static str, Option<String>, Option<String>) {
         let err = |e: String| ("error", None, Some(e));
-        let size = q.code.len()
-            + q.data
-                .iter()
-                .flatten()
-                .map(|d| d.key.len() + d.value.len())
-                .sum::<usize>();
-        if size > self.settings.max_input_bytes {
+        if query_size(q) > self.settings.max_input_bytes {
             return err(format!(
                 "[ERROR][RAW_QUERY][LIMIT] Pact code and data exceed {} bytes",
                 self.settings.max_input_bytes
@@ -391,7 +432,7 @@ impl PactPass {
             secs,
             ms,
         );
-        let deadline = Instant::now() + self.settings.timeout;
+        let deadline = (Instant::now() + self.settings.timeout).min(until);
         match self
             .call(
                 chain,
@@ -433,7 +474,8 @@ impl PactPass {
         if plans.iter().any(|p| matches!(p, GasPlan::Call { .. })) {
             self.extend_deadline(ctx);
         }
-        futures::future::try_join_all(plans.into_iter().map(|p| self.run_gas(p))).await
+        let until = self.until(ctx);
+        futures::future::try_join_all(plans.into_iter().map(|p| self.run_gas(p, until))).await
     }
 
     fn plan_gas(&self, s: &str) -> async_graphql::Result<GasPlan> {
@@ -555,7 +597,11 @@ impl PactPass {
         })
     }
 
-    async fn run_gas(&self, plan: GasPlan) -> async_graphql::Result<GasLimitEstimation> {
+    async fn run_gas(
+        &self,
+        plan: GasPlan,
+        until: Instant,
+    ) -> async_graphql::Result<GasLimitEstimation> {
         let (input_type, chain, transaction, preflight, sigs) = match plan {
             GasPlan::Fail(msg) => {
                 metric(Field::Gas, "error");
@@ -569,7 +615,7 @@ impl PactPass {
                 sigs,
             } => (input_type, chain, transaction, preflight, sigs),
         };
-        let deadline = Instant::now() + self.settings.timeout;
+        let deadline = (Instant::now() + self.settings.timeout).min(until);
         let v = match self
             .call(
                 chain,
