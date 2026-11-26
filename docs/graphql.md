@@ -553,7 +553,9 @@ the oracle puts them.
   is computed only when selected: from the stored per-key counts where they hold the list
   (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s).
   A walk the deadline cuts answers a `COUNT_TIMEOUT` error at
-  `totalCount` (the field is `null`, the rest of the response stays); it never answers a
+  `totalCount` (the error has the field's path; the field is left out of the connection
+  object, which is `null` when `totalCount` was its only field; the rest of the response
+  stays); it never answers a
   partial number and sets no response flag. A block's or a request key's list counts with
   its page, under the same rule (audit F-50). There is no `totalCountLowerBound` flag and no
   `count_budget_ms` setting any more (an old config file that sets it still loads; it is

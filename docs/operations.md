@@ -233,25 +233,38 @@ kda-indexer -c <config> reconcile-counts      # [--threads N] [--data-dir D]
 systemctl start kda-indexer-<network>
 ```
 
-- It reads every frozen record on `--threads` workers (default `[balances]
-  history_walk_threads`, else the cores less 2), then the hot records, rebuilds the whole
-  table and sets the marker last. It takes the data-dir lock, so the service must be
-  stopped. It is idempotent: run it again at any time; a run stopped halfway leaves the
-  marker cleared and the service walks.
+- It clears the marker first, reads every frozen record on `--threads` workers (default
+  `[balances] history_walk_threads`, else the cores less 2), then the hot records, rebuilds
+  the whole table and sets the marker last. It takes the data-dir lock, so the service must
+  be stopped. It is idempotent: run it again at any time. A run stopped or killed at any
+  point leaves the marker cleared, and the service walks until the next full run.
 - It prints a JSON report (`frozen_txs`, `hot_txs`, `keys`, `rate` in records a second,
   `ready`). A record whose output does not render leaves the marker unset and exits with an
   error (the walk cannot list that tx either).
 - `reconcile-counts --check` counts the same way without the lock or any write and reports
   `differing`, the rows of the stored table that differ from a fresh count (0 on a healthy
-  store). It runs beside the service, at the cost of the CPU it uses.
+  store). It can run beside the service. It holds no hot read transaction over the frozen
+  walk; one later snapshot reads the heights frozen meanwhile, the hot records and the stored
+  table, so both sides of the compare come from the same state. It compares one kind at a
+  time against the table read in chunks, so it needs no more memory than a full run. Mind
+  the memory below next to the service's own.
 - Time: measured at about 80,000 records a second per thread and 256,000 on 6 threads
   (mainnet-like synthetic records, release build, warm cache). Mainnet holds about 371
   million records, so plan on 25 minutes at that rate, up to about 50 minutes on slower
   cores or a cold disk.
-- Memory: one merged map of every (kind, key, chain); about 50 bytes a key.
-- A build before PR #48 applies blocks without counting them but leaves the marker set: after
-  running one on this data dir (a rollback), run `reconcile-counts` again before serving with
-  this build.
+- Memory: one map per kind of every (key, chain), 44-55 bytes a key measured (2-3 million
+  synthetic keys, release build), up to about 75 depending on how full the hash tables
+  are. Writing (or comparing) turns one kind at a time into a sorted list, so the peak is
+  the maps plus the largest kind's list: 54-64 bytes a key measured, up to about 90. At 30-60
+  million keys plan on 2-5.5 GB.
+- Hot store: the table holds one row per (kind, key, chain), about 40-60 bytes each in the
+  B-tree, so the hot store grows from about 0.85 GB to about 3-4 GB on mainnet. The default
+  `storage.mdbx_max_gb = 64` covers it; check that a config that lowers it leaves room.
+- The counts are tied to the tail: every block the tail applies or unwinds records the
+  chain's new tip in `Meta row_counts_at@<chain>`, and the run writes it for every chain. A
+  build before PR #48 moves the tips without it. The counts are then not used (lists walk),
+  and `run` clears the marker at startup with a warning that names the chain and heights.
+  Run `reconcile-counts` again after such a rollback.
 
 ## Rolling back to a build before FIX-2
 
