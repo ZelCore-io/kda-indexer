@@ -2753,3 +2753,391 @@ async fn last_pages_of_other_sources_keep_the_key_cap() {
         assert_eq!(code.as_deref(), Some("\"LIMIT\""), "{q}: {e:?}");
     }
 }
+
+/// PR #48 part 2: stored per-key row counts (`kdx_hot::rowcount`) built by
+/// `reconcile-counts` (`kdx_ingest::row_counts`) and kept by the tail answer `totalCount` of
+/// the plain posting-keyed lists, equal to the full walk; filters they do not hold walk.
+mod stored_count {
+    use super::*;
+    use kdx_hot::rowcount::{self, Tally};
+    use kdx_ingest::row_counts;
+
+    /// Lists the stored counts answer (no filter, `chainId`, `isCoinbase`), over several kinds,
+    /// both chains, frozen and hot rows, coinbase rows and a module with only 4-param
+    /// `TRANSFER` events (no transfer row).
+    const STORED: &[&str] = &[
+        "transfers(accountName: \"k:alice\", ARGS)",
+        "transfers(accountName: \"k:alice\", chainId: \"1\", ARGS)",
+        "transfers(accountName: \"k:carol\", ARGS)",
+        "transfers(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+        "transfers(accountName: \"k:carol\", fungibleName: \"kaddex.kdx\", ARGS)",
+        "transfers(fungibleName: \"coin\", ARGS)",
+        "transfers(fungibleName: \"kaddex.kdx\", chainId: \"0\", ARGS)",
+        "transfers(fungibleName: \"marmalade-v2.ledger\", ARGS)",
+        "transactions(accountName: \"k:alice\", ARGS)",
+        "transactions(accountName: \"k:alice\", chainId: \"0\", ARGS)",
+        "transactions(accountName: \"k:alice\", isCoinbase: true, ARGS)",
+        "transactions(fungibleName: \"coin\", ARGS)",
+        "transactions(fungibleName: \"coin\", isCoinbase: true, ARGS)",
+        "transactionsByPublicKey(publicKey: \"alice-key\", ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)",
+        "events(qualifiedEventName: \"coin.NOTE\", chainId: \"1\", ARGS)",
+        "events(qualifiedEventName: \"coin.COINBASE\", ARGS)",
+    ];
+
+    /// Lists that keep the walk: heights, depth, `fungibleName` on an account's txs, event
+    /// parameter / order filters, NFT transfers.
+    const WALKED: &[&str] = &[
+        "transactions(accountName: \"k:alice\", minHeight: 5, ARGS)",
+        "transactions(accountName: \"k:alice\", minimumDepth: 1, ARGS)",
+        "transactions(accountName: \"k:alice\", fungibleName: \"coin\", ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", minHeight: 5, ARGS)",
+        "events(qualifiedEventName: \"coin.TRANSFER\", orderIndex: 0, ARGS)",
+        "transfers(accountName: \"k:alice\", isNFT: true, ARGS)",
+    ];
+
+    fn field(l: &str) -> &str {
+        &l[..l.find('(').unwrap()]
+    }
+
+    async fn total(s: &KdxSchema, l: &str) -> i64 {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let v = run(s, &q).await;
+        v[field(l)]["totalCount"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{q}: {v}"))
+    }
+
+    async fn walk(s: &KdxSchema, l: &str) -> i64 {
+        let q = format!(
+            "{{ {} {{ edges {{ cursor }} }} }}",
+            l.replace("ARGS", "first: 1000")
+        );
+        let v = run(s, &q).await;
+        v[field(l)]["edges"].as_array().unwrap().len() as i64
+    }
+
+    /// `totalCount` of `l` with the request deadline already spent: `Some` only when no walk
+    /// ran (the stored count answered).
+    async fn total_spent(s: &KdxSchema, l: &str) -> Option<i64> {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: Instant::now(),
+        });
+        let r = s.execute(req).await;
+        let d = serde_json::to_value(&r.data).unwrap();
+        d.get(field(l))
+            .and_then(|c| c.get("totalCount"))
+            .and_then(Value::as_i64)
+    }
+
+    fn reconcile(fx: &Fx) -> row_counts::Report {
+        let r =
+            row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, false, &|| false).unwrap();
+        assert!(r.ready && r.unrendered == 0, "{r:?}");
+        r
+    }
+
+    fn stored(fx: &Fx) -> Tally {
+        rowcount::read_all(&fx.store.hot.ro().unwrap()).unwrap()
+    }
+
+    fn recount(fx: &Fx) -> Tally {
+        row_counts::tally(&fx.store.segdir, &fx.store.hot, 3, &|| false)
+            .unwrap()
+            .0
+    }
+
+    fn ready(fx: &Fx) -> bool {
+        rowcount::ready(&fx.store.hot.ro().unwrap()).unwrap()
+    }
+
+    /// Every stored-count list equals its walk; every walk-only list still walks.
+    async fn check_lists(fx: &Fx) {
+        for l in STORED.iter().chain(WALKED) {
+            assert_eq!(total(&fx.schema, l).await, walk(&fx.schema, l).await, "{l}");
+        }
+    }
+
+    /// The backfill builds exactly the counts ingest maintains: every fixture block applied by
+    /// the tail alone (in the fixture's interning order, so ids match) gives the table the
+    /// backfill builds from the fixture's frozen ranges and hot blocks.
+    #[test]
+    fn backfill_equals_ingest() {
+        let fx = fixture();
+        let built = recount(&fx);
+        assert!(built.0.len() > 20, "a real fixture: {}", built.0.len());
+        let kinds: HashSet<u8> = built.0.keys().map(|k| k.0 as u8).collect();
+        assert_eq!(kinds.len(), 7, "every kind is exercised: {kinds:?}");
+        let chains: HashSet<u8> = built.0.keys().map(|k| k.2).collect();
+        assert_eq!(chains, HashSet::from([0, 1]));
+
+        let d = tempfile::tempdir().unwrap();
+        let hot = kdx_hot::HotStore::open(d.path(), kdx_hot::Geometry::default()).unwrap();
+        let mut t = hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let order = BLOCKS
+            .iter()
+            .filter(|b| b.1 < FIRST_RANGE_END)
+            .chain(
+                BLOCKS
+                    .iter()
+                    .filter(|b| (FIRST_RANGE_END..FRONTIER).contains(&b.1)),
+            )
+            .chain(BLOCKS.iter().filter(|b| b.1 >= FRONTIER));
+        for &(c, h, shapes) in order {
+            let (b, _) = decoded(c, h, shapes);
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        }
+        let ingest = rowcount::read_all(&t).unwrap();
+        // Ingest keeps the table but never marks it ready: only the backfill does.
+        assert!(!rowcount::ready(&t).unwrap());
+        t.commit().unwrap();
+        assert_eq!(ingest, built);
+    }
+
+    /// Stored counts equal the full walk on every plain list, and the backfill is idempotent.
+    #[tokio::test]
+    async fn stored_counts_equal_the_walk() {
+        let fx = fixture();
+        let walked: Vec<i64> = {
+            let mut v = Vec::new();
+            for l in STORED {
+                v.push(walk(&fx.schema, l).await);
+            }
+            v
+        };
+        assert!(!ready(&fx));
+        let r = reconcile(&fx);
+        assert!(r.frozen_txs > 0 && r.hot_txs > 0, "{r:?}");
+        for (l, w) in STORED.iter().zip(&walked) {
+            assert_eq!(total(&fx.schema, l).await, *w, "{l}");
+            assert_eq!(total_spent(&fx.schema, l).await, Some(*w), "{l}: stored");
+        }
+        assert!(walked.contains(&0) && walked.iter().any(|&w| w > 10));
+        let once = stored(&fx);
+        reconcile(&fx);
+        assert_eq!(stored(&fx), once, "idempotent");
+        check_lists(&fx).await;
+    }
+
+    /// Counts stay right through a reorg: unwind two hot blocks of chain 0, apply a different
+    /// fork, with the marker set (stored counts answer) and unset (the walk answers; the
+    /// table still follows, and a backfill marks it ready again).
+    #[tokio::test]
+    async fn counts_follow_a_reorg_with_and_without_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let reorg = |chain: u8, to: u32, fork: &[(u32, &[Shape])]| {
+            let mut t = fx.store.hot.rw().unwrap();
+            let mut dict = HotDict::load(&t).unwrap();
+            assert!(kdx_hot::tail::unwind_to(&mut t, chain, to).unwrap() > 0);
+            for &(h, shapes) in fork {
+                let (mut b, _) = decoded(chain, h, shapes);
+                // Another fork: another block hash.
+                b.header.hash = kdx_types::Hash32(hash_of(0xC0, chain, h));
+                let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+                kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+            }
+            dict.persist(&mut t).unwrap();
+            t.commit().unwrap();
+        };
+        let before = stored(&fx);
+        reorg(0, FRONTIER, &[(11, &[Shape::One, Shape::Nft, Shape::Many])]);
+        assert!(ready(&fx), "a reorg keeps the marker");
+        assert_ne!(stored(&fx), before, "the reorg changed counts");
+        assert_eq!(stored(&fx), recount(&fx), "marker set: table = recount");
+        check_lists(&fx).await;
+        for l in STORED {
+            assert!(total_spent(&fx.schema, l).await.is_some(), "{l}: stored");
+        }
+
+        // Marker unset: the walk answers; the tail still keeps the table exact.
+        let mut t = fx.store.hot.rw().unwrap();
+        assert!(rowcount::clear_ready(&mut t).unwrap());
+        t.commit().unwrap();
+        reorg(1, 11, &[(12, &[Shape::Note]), (13, &[Shape::Many])]);
+        assert!(!ready(&fx));
+        assert_eq!(stored(&fx), recount(&fx), "marker unset: table = recount");
+        check_lists(&fx).await;
+        reconcile(&fx);
+        check_lists(&fx).await;
+    }
+
+    /// A count answered from storage on a list far longer than the walk can finish in the
+    /// deadline: the request deadline is already spent, the walk cannot read one key, the
+    /// stored count still answers, and equals the walk under a normal deadline.
+    #[tokio::test]
+    async fn a_stored_count_answers_where_the_walk_cannot() {
+        let fx = fixture_big(GraphqlSettings::default(), 3_000);
+        let l = "transfers(accountName: \"k:alice\", ARGS)";
+        let walked = total(&fx.schema, l).await;
+        assert!(walked > 3_000);
+        assert_eq!(
+            total_spent(&fx.schema, l).await,
+            None,
+            "no marker: the walk is cut"
+        );
+        reconcile(&fx);
+        assert_eq!(total_spent(&fx.schema, l).await, Some(walked));
+        let e = "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)";
+        assert_eq!(
+            total_spent(&fx.schema, e).await,
+            Some(walk_all(&fx.schema, e).await)
+        );
+        // Walk-only lists (each over thousands of keys here) still walk: a spent deadline
+        // gives no number.
+        for l in WALKED {
+            assert_eq!(total_spent(&fx.schema, l).await, None, "{l}");
+        }
+    }
+
+    /// Rows of the full walk of `l`, pages of 1,000.
+    async fn walk_all(s: &KdxSchema, l: &str) -> i64 {
+        let (mut n, mut after) = (0i64, None::<String>);
+        loop {
+            let args = match &after {
+                None => "first: 1000".to_string(),
+                Some(c) => format!("first: 1000, after: \"{c}\""),
+            };
+            let q = format!(
+                "{{ {} {{ pageInfo {{ hasNextPage endCursor }} edges {{ cursor }} }} }}",
+                l.replace("ARGS", &args)
+            );
+            let v = run(s, &q).await;
+            let c = &v[field(l)];
+            n += c["edges"].as_array().unwrap().len() as i64;
+            if c["pageInfo"]["hasNextPage"] != true {
+                return n;
+            }
+            after = c["pageInfo"]["endCursor"].as_str().map(str::to_owned);
+        }
+    }
+
+    /// A mainnet-like block for the backfill timing: a coinbase paying one of 50 miners
+    /// (`coin.TRANSFER ["", miner, reward]`) and `users` coin transfers, each from a sender out
+    /// of 2M accounts (its own signer key) to another, with the gas payment to the miner: two
+    /// `coin.TRANSFER` events per user tx, as most mainnet txs.
+    fn mainnet_like(c: u8, h: u32, users: usize) -> DecodedBlock {
+        let acct = |x: u64| {
+            format!(
+                "k:{:016x}",
+                x.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 2_000_000
+            )
+        };
+        let miner = format!("k:miner{}", (u64::from(h) * 7 + u64::from(c)) % 50);
+        let mut txs = Vec::new();
+        for i in 0..users {
+            let seed = (u64::from(h) << 20) ^ (u64::from(c) << 12) ^ i as u64;
+            let (from, to) = (acct(seed), acct(seed ^ 0xABCD_EF01));
+            let ct = 1_700_000_000u64 + u64::from(h);
+            let cmd = json!({
+                "payload": {"exec": {"data": null, "code": format!("(coin.transfer \"{from}\" \"{to}\" 1.0)")}},
+                "meta": {"sender": from, "chainId": c.to_string(), "creationTime": ct,
+                         "gasLimit": 1000, "gasPrice": 1e-8, "ttl": 600},
+                "signers": [{"pubKey": format!("{:064x}", seed % 2_000_000)}],
+                "nonce": format!("n-{c}-{h}-{i}"),
+                "networkId": "mainnet01",
+            })
+            .to_string();
+            let rk = blake2b_256(cmd.as_bytes()).to_b64url();
+            let tx = serde_json::to_vec(&json!({"hash": rk, "sigs": [{"sig": "ab"}], "cmd": cmd}))
+                .unwrap();
+            let evs = [
+                ev(None, "coin", "TRANSFER", json!([from, miner, 0.0000115])),
+                ev(None, "coin", "TRANSFER", json!([from, to, 1.0])),
+            ];
+            let out = serde_json::to_vec(&json!({"gas": 1150,
+                "result": {"status": "success", "data": "Write succeeded"}, "reqKey": rk,
+                "logs": b64url_encode(&hash_of(0x10, c, h)), "events": evs,
+                "metaData": null, "continuation": null, "txId": 1234567}))
+            .unwrap();
+            txs.push(json!([b64url_encode(&tx), b64url_encode(&out)]));
+        }
+        let cb = serde_json::to_vec(
+            &json!({"gas": 0, "result": {"status": "success", "data": "Write succeeded"},
+            "reqKey": b64url_encode(&hash_of(0xCB, c, h)), "logs": null,
+            "events": [ev(None, "coin", "TRANSFER", json!(["", miner, 2.304523]))],
+            "metaData": null, "continuation": null, "txId": 1234566}),
+        )
+        .unwrap();
+        let md = format!(r#"{{"account":"{miner}","predicate":"keys-all","public-keys":["m"]}}"#);
+        let payload_hash = b64url_encode(&hash_of(0xA4, c, h));
+        let header = json!({
+            "nonce": "1", "creationTime": 1_700_000_000_000_000u64 + u64::from(h) * 30_000_000,
+            "parent": b64url_encode(&hash_of(0xB0, c, h.saturating_sub(1))),
+            "adjacents": {"5": b64url_encode(&hash_of(0xAD, c, h))},
+            "target": b64url_encode(&[0xff; 32]), "payloadHash": payload_hash, "chainId": c,
+            "weight": b64url_encode(&[1; 32]), "height": h, "chainwebVersion": "mainnet01",
+            "epochStart": 1, "featureFlags": 0, "hash": block_hash(c, h)
+        });
+        let payload = json!({
+            "transactions": txs, "minerData": b64url_encode(md.as_bytes()),
+            "transactionsHash": b64url_encode(&hash_of(0xA7, c, h)),
+            "outputsHash": b64url_encode(&hash_of(0xA8, c, h)),
+            "payloadHash": payload_hash, "coinbase": b64url_encode(&cb),
+        });
+        decode_block(&header, &payload).expect("block decodes")
+    }
+
+    /// Backfill rate, run by hand (`--release -- --ignored --nocapture`): a store of
+    /// `KDX_COUNT_BENCH_BLOCKS` frozen mainnet-like blocks (default 100,000) on 20 chains,
+    /// alternating 1 and 2 user txs (about 40% coinbase records, as mainnet), counted on 1, 2
+    /// and 6 threads (KDA-03's default `history_walk_threads`).
+    #[test]
+    #[ignore = "timing run"]
+    fn timing_of_the_backfill() {
+        let n: u32 = std::env::var("KDX_COUNT_BENCH_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let d = tempfile::tempdir().unwrap();
+        let g = kdx_hot::Geometry {
+            max_gb: 4,
+            growth_mb: 64,
+        };
+        let hot = kdx_hot::HotStore::open(&d.path().join("hot"), g).unwrap();
+        let mut t = hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let segdir = d.path().join("segments");
+        let end = n.div_ceil(20);
+        let mut w = RangeWriter::create(
+            &segdir,
+            &d.path().join("etl-0"),
+            "mainnet01",
+            RangeKind::Step,
+            0,
+            end,
+            0,
+            WriteOpts::new(1, 0),
+        )
+        .unwrap();
+        for h in 0..end {
+            for c in 0..20u8 {
+                let b = mainnet_like(c, h, 1 + (h as usize + c as usize) % 2);
+                w.push(&index_block(&b, &VerifyReport::default(), &mut dict).unwrap())
+                    .unwrap();
+            }
+        }
+        let entry = w.finish().unwrap();
+        let mut m = Manifest::new("mainnet01");
+        let next = entry.end_txnum();
+        m.push(entry).unwrap();
+        m.commit(&segdir).unwrap();
+        t.set_frozen_frontier(end).unwrap();
+        t.set_next_txnum(next).unwrap();
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        for threads in [1usize, 2, 6] {
+            let (_, r) = row_counts::tally(&segdir, &hot, threads, &|| false).unwrap();
+            println!(
+                "threads {threads}: {} records in {:.2} s = {:.0} records/s ({} keys)",
+                r.frozen_txs + r.hot_txs,
+                r.count_secs,
+                r.rate,
+                r.keys
+            );
+        }
+    }
+}

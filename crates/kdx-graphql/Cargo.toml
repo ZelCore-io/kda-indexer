@@ -24,6 +24,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+kdx-ingest.workspace = true
 kdx-segment.workspace = true
 libc.workspace = true
 proptest.workspace = true

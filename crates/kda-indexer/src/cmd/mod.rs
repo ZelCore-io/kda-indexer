@@ -10,6 +10,7 @@ use kdx_node::{NodeClient, NodeClientConfig};
 use crate::config::Config;
 
 pub mod backfill;
+pub mod counts;
 pub mod dump;
 pub mod frames;
 pub mod graphql;

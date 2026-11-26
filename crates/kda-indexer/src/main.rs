@@ -202,6 +202,18 @@ enum Command {
         #[arg(long)]
         copy: bool,
     },
+    /// Build the stored per-key row counts behind GraphQL `totalCount` from every record and
+    /// mark them ready (idempotent; takes the data dir lock, so the service is stopped).
+    /// `--check` only counts and compares with the stored table (read-only).
+    ReconcileCounts {
+        /// Worker threads (default `[balances] history_walk_threads`, else the cores less 2).
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Balances (B-2…B-5): rerun the seed, mark every row dirty, or print the reconcile
     /// status. `run` seeds and reconciles by itself; `--seed` and `--all` take the data dir
     /// lock (service stopped), `--status` only reads.
@@ -685,6 +697,16 @@ async fn main() -> anyhow::Result<()> {
             out,
             copy,
         }),
+        Command::ReconcileCounts {
+            threads,
+            check,
+            data_dir,
+        } => kda_indexer::cmd::counts::run(
+            &cfg,
+            data_dir.as_deref().unwrap_or(&cfg.data_dir),
+            threads,
+            check,
+        ),
         Command::ReconcileBalances {
             data_dir,
             seed,

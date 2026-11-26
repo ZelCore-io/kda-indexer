@@ -1160,6 +1160,9 @@ fn run_page_desc(
 /// (the request deadline) ends with [`ApiError::Deadline`], never with a partial count.
 pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<u64> {
     let (src, rows) = plan(view, spec)?;
+    if let Some(n) = stored_count(view, spec, &src, &rows)? {
+        return Ok(n);
+    }
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
     let decode = rows.needs_record();
@@ -1204,6 +1207,94 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<u64> {
     }
     n += flush(&mut batch, &mut blocks)?;
     Ok(n)
+}
+
+/// The count of `spec` from the stored per-key row counts (PR #48 part 2), or `None` when
+/// they cannot answer it: the counts are not ready, or the list has a filter they do not
+/// hold. They hold rows per (list kind, key, chain) split into user and coinbase rows, so
+/// they answer the plain lists below with no filter, a `chainId`, or `isCoinbase`. Heights,
+/// `minimumDepth`, a sender filter on a view that is not sender-ready, `fungibleName` on an
+/// account's transactions, NFT transfers and event `parametersFilter` / `orderIndex` /
+/// `moduleName` keep the walk.
+fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResult<Option<u64>> {
+    use kdx_decode::rowcount::CountKind as K;
+    let f = &spec.filter;
+    if f.min_h.is_some() || f.max_h.is_some() || f.depth.is_some() {
+        return Ok(None);
+    }
+    let &Src::Post(fam, e) = src else {
+        return Ok(None);
+    };
+    let d = view.dict();
+    let evt = |q: &str| d.find(DictKind::EventName, q).map(u64::from);
+    let acct = |a: &str| d.find(DictKind::Account, a);
+    let plain_txs = |r: &Rows| {
+        matches!(
+            r,
+            Rows::Txs {
+                sender: None,
+                nft: false,
+                module: None,
+                ..
+            }
+        )
+    };
+    let kind = match (fam, rows) {
+        (Family::Sndr, r) if plain_txs(r) => K::Sndr,
+        (Family::Pk, r) if plain_txs(r) => K::Pk,
+        (Family::Evt, r) if plain_txs(r) && e < 1 << 32 => K::EvtTxs,
+        (
+            Family::Acct,
+            Rows::Transfers {
+                module: None,
+                account: Some(a),
+                nft: false,
+            },
+        ) if acct(a).map(u64::from) == Some(e) => K::AcctXfer,
+        (
+            Family::Xfer,
+            Rows::Transfers {
+                module: Some(m),
+                account: Some(a),
+                nft: false,
+            },
+        ) if acct(a)
+            .zip(d.find(DictKind::Module, m))
+            .map(|(a, m)| xfer_entity(a, m))
+            == Some(e) =>
+        {
+            K::Xfer
+        }
+        (
+            Family::Evt,
+            Rows::Transfers {
+                module: Some(m),
+                account: None,
+                nft: false,
+            },
+        ) if evt(&format!("{m}.TRANSFER")) == Some(e) => K::TokenXfer,
+        (
+            Family::Evt,
+            Rows::Events {
+                qual: Some(q),
+                module: None,
+                order_index: None,
+                params: None,
+            },
+        ) if evt(q) == Some(e) => K::EvtRows,
+        _ => return Ok(None),
+    };
+    let Some((user, cb)) = view.row_count(kind, e, f.chain)? else {
+        return Ok(None);
+    };
+    // Coinbase rows are listed unless the keys drop them (`user_only`) or a tx list keeps
+    // only user txs (`isCoinbase` absent).
+    let with_cb = !f.user_only
+        && match rows {
+            Rows::Txs { coinbase, .. } => *coinbase,
+            _ => true,
+        };
+    Ok(Some(user + if with_cb { cb } else { 0 }))
 }
 
 /// Keys a decoding count walk reads ahead at once ([`count`]).

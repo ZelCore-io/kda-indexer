@@ -19,6 +19,7 @@ pub mod price_fill;
 pub mod rebuild;
 pub mod reconcile;
 pub mod reorg;
+pub mod row_counts;
 pub mod search_stage;
 pub mod seed;
 pub mod seed_receivers;
