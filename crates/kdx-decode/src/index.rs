@@ -243,7 +243,8 @@ fn account_posting(a: &str, dict: &mut impl DictMut, p: &mut Vec<(Family, u64)>)
 }
 
 /// Names the tail's D3 marks need that no posting interns: a cross-chain defpact's module and
-/// account, and the modules a tx may put forward as tokens (at most
+/// account, the accounts a tx creates with `coin.create-account` (rule 2c, exact), and the
+/// modules a tx may put forward as tokens (at most
 /// [`crate::receivers::MAX_DISCOVERED_PER_TX`]). Interned here, at decode time, so backfill and
 /// tail build the same dictionary; event params and emitters are interned already.
 fn intern_d3(d3: &crate::receivers::D3Candidates, dict: &mut impl DictMut) {
@@ -253,6 +254,13 @@ fn intern_d3(d3: &crate::receivers::D3Candidates, dict: &mut impl DictMut) {
             dict.intern(DictKind::Module, m);
         }
         if let Some(a) = a.as_deref().filter(|a| account_like(a)) {
+            dict.intern(DictKind::Account, a);
+        }
+    }
+    // Rule 2c exact (gap Q): the accounts `coin.create-account` creates, read exactly from
+    // the code (at most `MAX_COIN_CREATE_PER_TX`), so the tail marks their coin rows live.
+    if let Some(x) = &d3.exec {
+        for a in &x.coin_created {
             dict.intern(DictKind::Account, a);
         }
     }
