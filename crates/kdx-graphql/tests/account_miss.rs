@@ -35,6 +35,8 @@ enum Mode {
     Hang,
     /// As `Chain`, after 100 ms.
     Slow,
+    /// As `Chain`, but this chain hangs.
+    HangOn(u8),
 }
 
 struct Mock {
@@ -66,7 +68,11 @@ fn mock(mode: Mode) -> (Arc<Mock>, DetailsFn) {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     Err(ReadErr::Node)
                 }
-                Mode::Chain | Mode::Slow => {
+                Mode::HangOn(c) if c == chain => {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Err(ReadErr::Node)
+                }
+                Mode::Chain | Mode::Slow | Mode::HangOn(_) => {
                     if matches!(mode, Mode::Slow) {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
@@ -545,4 +551,86 @@ async fn a_refused_client_spends_no_request_budget() {
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["extensions"]["nodeReadIncomplete"], true);
     assert_eq!(budget.used(), 0);
+}
+
+/// Chain mask: ALICE has a stored row on chain 0, so a fresh lookup reads the other 19
+/// chains (7 found, 18 absent); a repeat within the TTLs reads none. Her absent answers are
+/// one cache entry, besides the found row's.
+#[tokio::test]
+async fn a_fresh_lookup_reads_19_chains_and_a_repeat_none() {
+    let fx = fixture(Mode::Chain, settings());
+    let v = exec(&fx, &acct(ALICE), [10, 0, 5, 1]).await;
+    assert_eq!(
+        chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
+        ["0", "7"],
+        "{v}"
+    );
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 19);
+    assert_eq!(fx.reader.cached(), 2, "one absent mask + one found row");
+    let v = exec(&fx, &acct(ALICE), [10, 0, 5, 1]).await;
+    assert_eq!(
+        chain_ids(&v["data"]["fungibleAccount"]["chainAccounts"]),
+        ["0", "7"]
+    );
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], Value::Null, "{v}");
+    assert_eq!(
+        fx.mock.calls.load(Ordering::SeqCst),
+        19,
+        "repeat reads nothing"
+    );
+}
+
+/// A chain that timed out is not marked absent: the next lookup reads it (and only it).
+#[tokio::test]
+async fn a_timed_out_chain_is_not_marked_absent_and_is_read_again() {
+    let s = MissSettings {
+        timeout: Duration::from_millis(200),
+        ..settings()
+    };
+    let fx = fixture(Mode::HangOn(5), s);
+    let v = exec(&fx, &acct(ALICE), [10, 0, 5, 2]).await;
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], true, "{v}");
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 19);
+    *fx.mock.mode.lock().unwrap() = Mode::Chain;
+    let v = exec(&fx, &acct(ALICE), [10, 0, 5, 2]).await;
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], Value::Null, "{v}");
+    assert_eq!(
+        fx.mock.calls.load(Ordering::SeqCst),
+        20,
+        "chain 5 read again"
+    );
+    exec(&fx, &acct(ALICE), [10, 0, 5, 2]).await;
+    assert_eq!(
+        fx.mock.calls.load(Ordering::SeqCst),
+        20,
+        "now cached absent"
+    );
+}
+
+/// Memory per account is O(1): accounts absent on every chain cost one entry each, not 20.
+#[tokio::test]
+async fn absent_accounts_cost_one_cache_entry_each() {
+    let fx = fixture(Mode::Chain, settings());
+    for i in 0..5u8 {
+        let v = exec(&fx, &acct(&format!("k:nobody-{i}")), [10, 0, 5, 3]).await;
+        assert_eq!(v["data"]["fungibleAccount"], Value::Null, "{v}");
+    }
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 100);
+    assert_eq!(fx.reader.cached(), 5);
+}
+
+/// Absent bits expire with their TTL: after it the lookup reads every chain again.
+#[tokio::test]
+async fn absent_answers_expire_after_their_ttl() {
+    let s = MissSettings {
+        ttl_absent: Duration::from_millis(300),
+        ..settings()
+    };
+    let fx = fixture(Mode::Chain, s);
+    exec(&fx, &acct("k:nobody-ttl"), [10, 0, 5, 4]).await;
+    exec(&fx, &acct("k:nobody-ttl"), [10, 0, 5, 4]).await;
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 20);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    exec(&fx, &acct("k:nobody-ttl"), [10, 0, 5, 4]).await;
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 40);
 }
