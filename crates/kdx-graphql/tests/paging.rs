@@ -286,6 +286,33 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         t.put(Table::Balances, &bal_key(a, coin, c), &row.encode())
             .unwrap();
     }
+    // Carol's rows for `balance(...)`'s TRANSFER rule: Carol has coin and kaddex.kdx
+    // transfers on chain 0 and coin transfers on chain 1, none on chains 2 to 4. Rows at 0
+    // without a transfer on their chain were written by something else (create-account,
+    // rotate): stock's `balance(...)` leaves them out.
+    let carol = dict.intern(DictKind::Account, CAROL);
+    let kdx = dict.intern(DictKind::Module, "kaddex.kdx");
+    dict.persist(&mut t).unwrap();
+    for (m, c, bal) in [
+        (coin, 0u8, "0.0"),
+        (coin, 1, "2.0"),
+        (coin, 2, "0.0"),
+        (coin, 3, "1.0"),
+        (coin, 4, "0.0"),
+        (kdx, 0, "0.0"),
+        (kdx, 2, "0.0"),
+    ] {
+        let row = BalanceRow {
+            absent: false,
+            balance: bal.into(),
+            guard: [0; 16],
+            as_of: 12,
+            reconciled_at: 12,
+            unverified: false,
+        };
+        t.put(Table::Balances, &bal_key(carol, m, c), &row.encode())
+            .unwrap();
+    }
     // Rows the node reported absent (no row on chain): alice's coin on chain 3, `GONE`'s only.
     let gone = dict.intern(DictKind::Account, GONE);
     dict.persist(&mut t).unwrap();
@@ -1394,8 +1421,11 @@ async fn rows_on_chain_are_listed_at_any_balance() {
             )
         })
         .collect();
-    assert_eq!(rows, ["coin:\"0\"", "coin:\"1\"", "coin:\"2\""], "{v}");
-    // Every row at 0 (funded and drained, or created and never funded): all listed at 0.
+    // `balance(...)` lists alice's chain-2 row at 0 only if a TRANSFER touched it there;
+    // none did (stock's rule), while `fungibleAccount` above lists it.
+    assert_eq!(rows, ["coin:\"0\"", "coin:\"1\""], "{v}");
+    // `fungibleAccount` lists every row at 0 (funded and drained, or created and never
+    // funded).
     let v = run(
         &fx.schema,
         &format!("{{ fungibleAccount(accountName: \"{DRAINED}\") {{ accountName totalBalance chainAccounts {{ chainId }} }} }}"),
@@ -1418,9 +1448,10 @@ async fn rows_on_chain_are_listed_at_any_balance() {
         &format!("{{ balance(accountName: \"{DRAINED}\") {{ edges {{ cursor }} }} }}"),
     )
     .await;
+    // No TRANSFER touched `DRAINED`'s rows: `balance(...)` lists none of them.
     assert_eq!(
         v["balance"]["edges"].as_array().map(Vec::len),
-        Some(2),
+        Some(0),
         "{v}"
     );
     // An account whose only row is absent does not exist on chain: `null`.
@@ -1430,6 +1461,150 @@ async fn rows_on_chain_are_listed_at_any_balance() {
     )
     .await;
     assert_eq!(v["fungibleAccount"], Value::Null, "{v}");
+}
+
+/// `balance(accountName:)` rows of `account` as `module:chain=balance`, in served order.
+async fn balance_rows(schema: &KdxSchema, account: &str, args: &str) -> (Vec<String>, Value) {
+    let v = run(
+        schema,
+        &format!(
+            "{{ balance(accountName: \"{account}\"{args}) {{ edges {{ cursor node {{ module chainId balance }} }} pageInfo {{ hasNextPage hasPreviousPage }} }} }}"
+        ),
+    )
+    .await;
+    let rows = v["balance"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let n = &e["node"];
+            format!(
+                "{}:{}={}",
+                n["module"].as_str().unwrap(),
+                n["chainId"].as_str().unwrap(),
+                n["balance"].as_str().unwrap()
+            )
+        })
+        .collect();
+    (rows, v)
+}
+
+/// PR #47 I-1: stock's `balance(...)` lists every row above 0 and a row at 0 only when a
+/// TRANSFER event touched it, i.e. the account's transfer list in that module has an entry on
+/// that chain. A zero row written by create-account or rotate (no transfer there) is left out;
+/// `fungibleAccount` still lists it. Pages walk the same filtered rows.
+#[tokio::test]
+async fn balance_lists_zero_rows_only_where_a_transfer_touched_them() {
+    let fx = fixture();
+    let (rows, v) = balance_rows(&fx.schema, CAROL, "").await;
+    assert_eq!(
+        rows,
+        [
+            // at 0, with coin transfers on chain 0: listed
+            "coin:0=0",
+            // above 0, with transfers
+            "coin:1=2",
+            // above 0, no transfer on chain 3: listed (only zero rows are checked)
+            "coin:3=1",
+            // at 0, with kaddex.kdx transfers on chain 0: listed (the module's own list)
+            "kaddex.kdx:0=0",
+            // coin:2, coin:4 and kaddex.kdx:2 are at 0 with no transfer there: left out
+        ],
+        "{v}"
+    );
+    // `fungibleAccount` (coin) keeps every on-chain row, at any balance.
+    let v = run(
+        &fx.schema,
+        &format!(
+            "{{ fungibleAccount(accountName: \"{CAROL}\") {{ chainAccounts {{ chainId }} }} }}"
+        ),
+    )
+    .await;
+    let chains: Vec<&str> = v["fungibleAccount"]["chainAccounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["chainId"].as_str().unwrap())
+        .collect();
+    assert_eq!(chains, ["0", "1", "2", "3", "4"], "{v}");
+    // A chain filter applies the same rule.
+    let (rows, v) = balance_rows(&fx.schema, CAROL, ", chainIds: [\"2\", \"3\"]").await;
+    assert_eq!(rows, ["coin:3=1"], "{v}");
+    let (rows, v) = balance_rows(&fx.schema, CAROL, ", module: \"kaddex.kdx\"").await;
+    assert_eq!(rows, ["kaddex.kdx:0=0"], "{v}");
+    // Paging forward one row at a time and backward one row at a time walks exactly the
+    // listed rows; a left-out row never takes a page slot or flips `hasNextPage`.
+    let all = [
+        "coin:0=0".to_owned(),
+        "coin:1=2".to_owned(),
+        "coin:3=1".to_owned(),
+        "kaddex.kdx:0=0".to_owned(),
+    ];
+    for (dir, cur_arg, more) in [
+        ("first", "after", "hasNextPage"),
+        ("last", "before", "hasPreviousPage"),
+    ] {
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let args = match &cursor {
+                None => format!(", {dir}: 1"),
+                Some(c) => format!(", {dir}: 1, {cur_arg}: \"{c}\""),
+            };
+            let (rows, v) = balance_rows(&fx.schema, CAROL, &args).await;
+            assert_eq!(rows.len(), 1, "{dir}: {v}");
+            seen.push(rows[0].clone());
+            cursor = v["balance"]["edges"][0]["cursor"]
+                .as_str()
+                .map(str::to_owned);
+            if !v["balance"]["pageInfo"][more].as_bool().unwrap() {
+                break;
+            }
+            assert!(seen.len() < 10, "{dir}: no end");
+        }
+        if dir == "last" {
+            seen.reverse();
+        }
+        assert_eq!(seen, all, "{dir}");
+    }
+}
+
+/// The transfer probe of a zero row is bounded: `balance_touch_keys` transfer keys of one
+/// (account, module), newest first. When the cap ends the probe before every zero row's chain
+/// was found, the rows still unresolved are kept (listed, the safe side: the row exists on
+/// chain) and counted in `kdx_graphql_balance_touch_capped`.
+#[tokio::test]
+async fn a_capped_transfer_probe_keeps_the_zero_rows_it_could_not_resolve() {
+    let fx = fixture_with(GraphqlSettings {
+        balance_touch_keys: 1,
+        ..GraphqlSettings::default()
+    });
+    let before = kdx_metrics::get().graphql_balance_touch_capped.get();
+    let (rows, v) = balance_rows(&fx.schema, CAROL, "").await;
+    // Carol's newest coin and kaddex.kdx transfer keys are both on chain 1 (height 12): one
+    // key resolves none of the five zero rows, so all five are kept and counted.
+    assert_eq!(
+        rows,
+        [
+            "coin:0=0",
+            "coin:1=2",
+            "coin:2=0",
+            "coin:3=1",
+            "coin:4=0",
+            "kaddex.kdx:0=0",
+            "kaddex.kdx:2=0",
+        ],
+        "{v}"
+    );
+    let after = kdx_metrics::get().graphql_balance_touch_capped.get();
+    assert!(after >= before + 5, "{before} -> {after}");
+    // A cap large enough to read every key gives the exact answer.
+    let fx = fixture_with(GraphqlSettings {
+        balance_touch_keys: 1000,
+        ..GraphqlSettings::default()
+    });
+    let (rows, v) = balance_rows(&fx.schema, CAROL, "").await;
+    assert_eq!(rows.len(), 4, "{v}");
 }
 
 /// I-1 (PR #44 review): an account drained to 0 everywhere still resolves through
@@ -2154,7 +2329,7 @@ mod audit_pr3 {
             )
         };
         let all = run(&fx.schema, &q("")).await;
-        assert_eq!(edges(&all, "balance").len(), 3, "{all}");
+        assert_eq!(edges(&all, "balance").len(), 2, "{all}");
         // The stored texts `1.0` and `0.0` are served in stock's layout (`balance_text`).
         let texts = run(
             &fx.schema,
@@ -2167,7 +2342,7 @@ mod audit_pr3 {
             .iter()
             .map(|e| &e["node"]["balance"])
             .collect();
-        assert_eq!(got, [&json!("1"), &json!("1"), &json!("0")], "{texts}");
+        assert_eq!(got, [&json!("1"), &json!("1")], "{texts}");
         assert_eq!(run(&fx.schema, &q(", chainIds: []")).await, all);
         let many = format!(", chainIds: [{}]", vec!["\"0\""; 101].join(", "));
         let r = fx.schema.execute(q(&many)).await;

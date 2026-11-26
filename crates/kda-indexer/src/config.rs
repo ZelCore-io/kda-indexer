@@ -533,6 +533,7 @@ impl GraphqlConfig {
             apq: self.apq,
             count_budget: Duration::from_millis(self.count_budget_ms),
             back_keys: kdx_graphql::txlist::BACK_KEYS,
+            balance_touch_keys: kdx_graphql::types::account::BALANCE_TOUCH_KEYS,
         }
     }
 }

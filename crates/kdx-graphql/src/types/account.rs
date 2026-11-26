@@ -11,7 +11,11 @@
 //!   At most [`MAX_KEY_ACCOUNTS`] matching accounts; a cut answer is flagged (L-2).
 
 use async_graphql::{Context, Object, Result, ID};
-use kdx_api::{ApiResult, View};
+use std::collections::{BTreeMap, BTreeSet};
+
+use kdx_api::{ApiResult, PostingQuery, View};
+use kdx_decode::index::xfer_entity;
+use kdx_decode::Family;
 use kdx_hot::balances::{self, key_hash, parse_bal_key, ref_hash, BalanceRow, GuardKeys};
 use kdx_hot::{Table, Txn};
 use kdx_types::{Dict, DictKind};
@@ -702,6 +706,42 @@ pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
 /// `chainIds`. Without `accountName` (a module's holders) it is `NOT_SUPPORTED`: the store
 /// keeps no holders-by-module index, and a scan of every balance row is not bounded (R7I-5).
 #[allow(clippy::too_many_arguments)]
+/// Transfer keys read per (account, module) by `balance(...)`'s zero-row probe
+/// ([`xfer_touched`]). Keys are height-major, so a probe for a chain the account rarely uses
+/// can walk the whole list; this bounds it.
+pub const BALANCE_TOUCH_KEYS: usize = 10_000;
+
+/// Chains among `want` on which the `xfer` posting list of `(a, m)` has a key, newest first,
+/// reading at most `cap` keys. Stops early once every wanted chain is found. The flag is true
+/// when the cap ended the walk with some wanted chain still unfound.
+fn xfer_touched(
+    view: &View,
+    a: u32,
+    m: u32,
+    want: &BTreeSet<u8>,
+    cap: usize,
+) -> ApiResult<(BTreeSet<u8>, bool)> {
+    let mut found = BTreeSet::new();
+    let mut it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
+    let mut read = 0usize;
+    while found.len() < want.len() {
+        if read >= cap {
+            // Capped only if keys remain unread.
+            let more = it.next().is_some();
+            return Ok((found, more));
+        }
+        let Some(k) = it.next() else {
+            break;
+        };
+        read += 1;
+        let c = k?.chain();
+        if want.contains(&c) {
+            found.insert(c);
+        }
+    }
+    Ok((found, false))
+}
+
 pub async fn query_balance(
     ctx: &Context<'_>,
     account_name: Option<String>,
@@ -763,6 +803,7 @@ pub async fn query_balance(
         .map(decode_balance_cursor)
         .transpose()?;
     let acct = account.clone();
+    let touch_keys = g.settings.balance_touch_keys;
     let mut rows: Vec<(String, u8, String)> = g
         .state()?
         .read(move |view| {
@@ -782,6 +823,8 @@ pub async fn query_balance(
                 )));
             }
             let mut out = Vec::new();
+            // Rows at 0 wait for the transfer probe of their module (stock's rule, below).
+            let mut zero: BTreeMap<u32, (String, BTreeMap<u8, String>)> = BTreeMap::new();
             for (k, v) in found {
                 view.check_deadline()?;
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
@@ -796,7 +839,33 @@ pub async fn query_balance(
                 if module.as_ref().is_some_and(|x| *x != name) || hidden(view, m)? {
                     continue;
                 }
-                out.push((name, c, balance_text(&r.balance)));
+                if r.positive() {
+                    out.push((name, c, balance_text(&r.balance)));
+                } else {
+                    zero.entry(m)
+                        .or_insert_with(|| (name, BTreeMap::new()))
+                        .1
+                        .insert(c, balance_text(&r.balance));
+                }
+            }
+            // Stock lists a row at 0 only when a TRANSFER event touched it: the account's
+            // transfer list in that module has a key on the row's chain (the list
+            // `transfers(accountName, fungibleName, chainId)` reads). Rows above 0 are always
+            // listed. Our transfer postings come only from node events, which start at the
+            // events fork, as stock's TRANSFER rows do, so no height bound is needed.
+            for (m, (name, rows)) in zero {
+                let want: BTreeSet<u8> = rows.keys().copied().collect();
+                let (touched, capped) = xfer_touched(view, a, m, &want, touch_keys)?;
+                for (c, text) in rows {
+                    if touched.contains(&c) {
+                        out.push((name.clone(), c, text));
+                    } else if capped {
+                        // Not resolved within the cap: kept, the safe side (the row exists on
+                        // chain), and counted.
+                        kdx_metrics::get().graphql_balance_touch_capped.inc();
+                        out.push((name.clone(), c, text));
+                    }
+                }
             }
             Ok(out)
         })
