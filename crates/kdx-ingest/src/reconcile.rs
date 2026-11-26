@@ -1424,6 +1424,12 @@ async fn run_with(
             keylist_stop,
         ));
     }
+    // N-11: expired not-fungible verdicts are lifted before the history walk starts, which
+    // reads only modules not marked not fungible (the loop's first pass came after the spawn).
+    let n = recheck_not_fungible(&ctx.hot, now_unix(), o.caps.recheck_secs)?;
+    if n > 0 {
+        tracing::info!(modules = n, "balances: not-fungible modules re-checked");
+    }
     // Re-review N2: the D3 history walk in its own task; awaited on every return so no walk
     // write outlives the run.
     let history_stop = stop.child_token();

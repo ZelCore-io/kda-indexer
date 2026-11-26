@@ -44,6 +44,11 @@ fn rewalk_marks_queues_and_refuses_unknown_and_a_held_lock() {
         let alice = dict.intern(DictKind::Account, "alice");
         let bob = dict.intern(DictKind::Account, "bob");
         dict.persist(&mut txn).unwrap();
+        no_walk_on_tracking(&mut txn);
+        // Tracked tokens (`free.other` too: only its postings are not listed).
+        for m in [coin, wiza, other] {
+            balances::note_token(&mut txn, m, 5).unwrap();
+        }
         for k in [
             posting(bob, coin, 3),
             posting(alice, wiza, 1),
@@ -116,4 +121,70 @@ fn rewalk_marks_queues_and_refuses_unknown_and_a_held_lock() {
         .find(DictKind::Module, "coin")
         .unwrap();
     assert!(balances::rewalk_pending(&txn).unwrap().contains(&coin));
+}
+
+/// N-11: the history walk only walks tracked tokens that are not marked not fungible, so the
+/// command refuses an untracked module (nothing written) and makes a not-fungible one active
+/// again (saying so) instead of reporting a walk that would end at once with nothing read.
+#[test]
+fn rewalk_refuses_untracked_and_reactivates_not_fungible() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(kdx_ingest::ctx::segments_dir(dir.path())).unwrap();
+    let hot_dir = kda_indexer::cmd::hot::hot_dir(dir.path());
+    let (nf, alice) = {
+        let hs = HotStore::open(&hot_dir, kda_indexer::cmd::hot::geometry(&cfg())).unwrap();
+        let mut txn = hs.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let coin = dict.intern(DictKind::Module, "coin");
+        dict.intern(DictKind::Module, "free.untracked");
+        let nf = dict.intern(DictKind::Module, "free.nf");
+        let alice = dict.intern(DictKind::Account, "alice");
+        dict.persist(&mut txn).unwrap();
+        no_walk_on_tracking(&mut txn);
+        for m in [coin, nf] {
+            balances::note_token(&mut txn, m, 5).unwrap();
+        }
+        balances::update_token(&mut txn, nf, |t| t.kind = balances::KIND_NOT_FUNGIBLE).unwrap();
+        txn.put(Table::TailPostings, &posting(alice, nf, 1), &[])
+            .unwrap();
+        txn.commit().unwrap();
+        (nf, alice)
+    };
+    let err = rewalk(&cfg(), dir.path(), &names(&["free.nf", "free.untracked"])).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a tracked token"),
+        "{err:#}"
+    );
+    {
+        let hs = HotStore::open_ro(&hot_dir).unwrap();
+        let txn = hs.ro().unwrap();
+        assert_eq!(balances::dirty_count(&txn).unwrap(), 0);
+        assert!(balances::rewalk_pending(&txn).unwrap().is_empty());
+        let t = balances::token_row(&txn, nf).unwrap().unwrap();
+        assert_eq!(t.kind, balances::KIND_NOT_FUNGIBLE, "nothing written");
+    }
+    let out = rewalk(&cfg(), dir.path(), &names(&["free.nf"])).unwrap();
+    assert_eq!(out["reactivated"], json_names(&["free.nf"]), "{out}");
+    assert_eq!(out["rewalk_queued"], 1, "{out}");
+    let hs = HotStore::open_ro(&hot_dir).unwrap();
+    let txn = hs.ro().unwrap();
+    let t = balances::token_row(&txn, nf).unwrap().unwrap();
+    assert_eq!(t.kind, balances::KIND_FUNGIBLE);
+    assert!(txn
+        .get(Table::BalanceSeed, &bal_key(alice, nf, 1))
+        .unwrap()
+        .is_some());
+}
+
+fn json_names(v: &[&str]) -> serde_json::Value {
+    serde_json::json!(v)
+}
+
+/// A D3 pass done at height 0: tracking a token in the setup queues no history walk.
+fn no_walk_on_tracking(txn: &mut kdx_hot::RwTxn<'_>) {
+    txn.set_meta(
+        balances::meta::BALANCES_SEED_TOKEN_RECEIVERS,
+        &0u32.to_be_bytes(),
+    )
+    .unwrap();
 }
