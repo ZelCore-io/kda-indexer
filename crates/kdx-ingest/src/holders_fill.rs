@@ -50,7 +50,7 @@ pub struct Report {
 }
 
 fn add_record(t: &mut Tally, r: &TxRecord, dict: &MemDict) -> bool {
-    match kdx_decode::rowcount::xfer_sides(r, dict) {
+    match kdx_decode::rowcount::holder_sides(r, dict) {
         Ok(sides) => {
             for (a, m) in sides {
                 t.add(a, m, r.key);
@@ -286,6 +286,7 @@ pub fn reconcile(
         let mut txn = hot.rw()?;
         holders::set_ready(&mut txn, next_txnum)?;
         holders::stamp_all(&mut txn)?;
+        holders::stamp_txnum(&mut txn)?;
         txn.commit()?;
         rep.ready = true;
     }

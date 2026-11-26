@@ -112,11 +112,11 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             if marking {
                 balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
             }
-            // A module's holders: every TRANSFER side, from its first transfer (no undo op;
-            // the posting's undo removes it, `holders.rs`).
-            if let Some((a, m)) = holders::xfer_sides(f as u8, e) {
-                holders::touch(txn, a, m, r.key)?;
-            }
+        }
+        // A module's holders, from the first event naming each row (no undo op: the tx's
+        // undo removes the rows it is the first of, `holders.rs`).
+        for &(a, m) in &x.holders {
+            holders::touch(txn, a, m, r.key)?;
         }
         // Ruling R-P5P9-192: credits no TRANSFER names, marked like postings (no hourly lag).
         if marking && !x.d3.is_empty() {
@@ -318,6 +318,8 @@ fn undo_op(
         UndoOp::Tx(k) => {
             // Plan Task 11: rows this tx's NFT events touched are re-read from the node.
             nft::mark_tx_dirty(txn, *k)?;
+            // The holder rows this tx was the first of (`holders.rs`).
+            holders::untouch_tx(txn, *k)?;
             // PR #48: subtract the row counts `apply` added, recomputed from the record (its
             // postings were undone just before; the record is still here).
             match txn.get(Table::TailTxs, &k.to_be_bytes())? {
@@ -349,9 +351,6 @@ fn undo_op(
             key,
         } => {
             txn.del(Table::TailPostings, &posting_key(*family, *entity, *key))?;
-            if let Some((a, m)) = holders::xfer_sides(*family, *entity) {
-                holders::untouch(txn, a, m, *key)?;
-            }
             // B-3: no balance undo ops; the row is marked dirty and re-read.
             if balances::marking() {
                 balances::mark_posting(txn, *family, *entity, *key, coin, false)?;
@@ -470,6 +469,7 @@ mod pact_family_tests {
                 pact_id: Some(pact),
                 code_hash: None,
                 d3: Default::default(),
+                holders: Vec::new(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -530,6 +530,7 @@ mod balance_mark_tests {
                 pact_id: None,
                 code_hash: None,
                 d3: Default::default(),
+                holders: Vec::new(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,
@@ -616,6 +617,7 @@ mod balance_mark_tests {
                     pact_id: None,
                     code_hash: None,
                     d3: Default::default(),
+                    holders: Vec::new(),
                 }],
                 cmd_reencoded: 0,
                 unindexed_accounts: 0,
@@ -674,6 +676,7 @@ mod balance_mark_tests {
                 pact_id: None,
                 code_hash: None,
                 d3: Default::default(),
+                holders: Vec::new(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,

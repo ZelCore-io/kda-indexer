@@ -335,8 +335,18 @@ systemctl start kda-indexer-<network>
   entry per holder row (about 1.2M on mainnet, roughly 100 MB).
 - `reconcile-holders --check` compares the walk with the stored table without the lock or
   any write and reports `differing` (0 on a healthy store: backfill and tail equal the walk).
-- `rebuild-range`, `run --start-height` and a rollback to a build without the table (the
-  startup guard sees the stamps lag the tips) clear the marker.
+- `rebuild-range`, `run --start-height` and a rollback to a build without the table clear
+  the marker: the startup guard sees the per-chain stamps lag the tips (blocks that build
+  applied or unwound), or `Meta holders_txnum` differ from `next_txnum` (ranges that build
+  backfilled or froze, which move no tip). Each backfill range, each freeze and
+  `reconcile-holders` write `holders_txnum` in the txn that moves `next_txnum`.
+- A new store serves the list while backfill from block 0 is still running: it is partial
+  until backfill finishes, and a row moves down as backfill finds an earlier first transfer
+  for it. Same as the per-chain counters.
+- A store whose table was built before PR #54's fix round (suffix `*TRANSFER` names, no
+  marmalade rows, accounts at most 256 bytes) needs one `reconcile-holders` to match the new
+  rule; on such a store, names longer than 256 bytes that were never interned stay out until
+  a reindex.
 
 ## Rolling back to a build before FIX-2
 

@@ -80,23 +80,26 @@ impl CountKind {
     }
 }
 
-/// The `(AccountId, ModuleId)` of every `xfer` posting `r` has (the TRANSFER sides
-/// `index::extract` posts), from the record: what the holders rebuild walk reads. Names the
-/// dictionary lacks have no posting and are left out.
-pub fn xfer_sides(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<(u32, u32)>, RenderError> {
+/// The `(AccountId, ModuleId)` holder sides of `r` (`build::holder_sides`, as
+/// `index::extract` derives `TxIndex::holders`), from the record: what the holders rebuild
+/// walk reads. Names the dictionary lacks are left out.
+pub fn holder_sides(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<(u32, u32)>, RenderError> {
     let out = render_output(r, dict)?;
     let mut sides: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut accts = Vec::new();
     if let Some(raw) = out.get("events").and_then(Value::as_array) {
         for e in raw {
             let Some(ev) = parse_event(e) else { continue };
-            let Some((from, to)) = transfer_accounts(&ev) else {
+            accts.clear();
+            crate::build::holder_sides(&ev, &mut accts);
+            if accts.is_empty() {
                 continue;
-            };
+            }
             let Some(m) = dict.find(DictKind::Module, &ev.module) else {
                 continue;
             };
-            for a in [from, to] {
-                if let Some(id) = account_ok(a)
+            for a in &accts {
+                if let Some(id) = crate::build::holder_account_ok(a)
                     .then(|| dict.find(DictKind::Account, a))
                     .flatten()
                 {

@@ -162,6 +162,66 @@ pub fn acct_transfer_accounts<'a>(ev: &EventParts<'a>) -> Option<(&'a str, &'a s
     transfer_accounts(ev)
 }
 
+/// Longest account a module holders row keeps (`balance(module:)` without `accountName`):
+/// stock keeps any non-empty string; we bound it at 1024 bytes (review M-4 of PR #54), above
+/// `MAX_ACCOUNT_LEN`. Such names are interned too (decode time, so backfill and tail agree).
+pub const MAX_HOLDER_ACCOUNT_LEN: usize = 1024;
+
+/// The marmalade ledgers stock adds `MINT` and `TRANSFER` holder rows for (`payload.ts`).
+pub const MARMALADE_LEDGERS: [&str; 2] = ["marmalade-v2.ledger", "marmalade.ledger"];
+
+/// Whether `s` may be a holders row's account: non-empty, at most `MAX_HOLDER_ACCOUNT_LEN`.
+pub fn holder_account_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_HOLDER_ACCOUNT_LEN
+}
+
+/// The accounts an event adds to its module's holders list, as stock's `payload.ts` builds
+/// its `Balances` rows (at most three per event, so the work per event is fixed):
+/// - a coin-shaped transfer (`getCoinTransfers`): name exactly `TRANSFER`, three params,
+///   string from and to, an amount (`acct_transfer_accounts`): both sides;
+/// - an NFT `RECONCILE` (`getNftTransfers`) of a module in the `marmalade-v2` or `marmalade`
+///   namespace: four params, a string token id, an amount, then two objects with an
+///   `account` member: both accounts;
+/// - on `marmalade-v2.ledger` / `marmalade.ledger`: `MINT` names `params[1]`, `TRANSFER`
+///   names its receiver `params[2]`, when the token id `params[0]` is a non-empty string.
+///
+/// Empty sides are left out (stock: `!== ''` and `account && tokenId`). Stock would also
+/// stringify a non-string account; those are left out here. `holder_account_ok` filters
+/// the result.
+pub fn holder_sides<'a>(ev: &EventParts<'a>, out: &mut Vec<&'a str>) {
+    if let Some((from, to)) = acct_transfer_accounts(ev) {
+        out.extend([from, to]);
+    }
+    let Some(p) = ev.params.as_array() else {
+        return;
+    };
+    let ns = ev.module.split_once('.').map(|(ns, _)| ns);
+    if ev.name == "RECONCILE"
+        && p.len() == 4
+        && matches!(ns, Some("marmalade-v2" | "marmalade"))
+        && p[0].is_string()
+        && transfer_amount_ok(&p[1])
+    {
+        let acct = |v: &'a Value| v.as_object().and_then(|o| o.get("account"));
+        if let (Some(a), Some(b)) = (acct(&p[2]), acct(&p[3])) {
+            out.extend([a, b].into_iter().filter_map(Value::as_str));
+        }
+    }
+    if MARMALADE_LEDGERS.contains(&ev.module.as_str())
+        && p.first()
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty())
+    {
+        let side = match ev.name {
+            "MINT" => p.get(1),
+            "TRANSFER" => p.get(2),
+            _ => None,
+        };
+        out.extend(side.and_then(Value::as_str));
+    }
+    out.retain(|a| !a.is_empty());
+}
+
 /// All events canonical, or None (then the events go to `extra`).
 fn parse_events(o: &Map<String, Value>) -> Option<Vec<EventParts<'_>>> {
     o.get("events")?
@@ -655,6 +715,71 @@ mod transfer_rule_tests {
         let mut acc = Vec::new();
         event_accounts(&t, &mut acc);
         assert_eq!(acc[..2], ["alice", "bob"]);
+    }
+
+    /// PR #54 review I-2, M-3, M-4: the holders rule is stock's `payload.ts`: exact
+    /// `TRANSFER` only (an `XTRANSFER` gives no side), the marmalade ledgers' `MINT` account
+    /// and `TRANSFER` receiver, both `RECONCILE` accounts in the marmalade namespaces, no empty
+    /// side, and accounts bounded at 1024 bytes.
+    #[test]
+    fn holder_sides_follow_stock_balances_rows() {
+        use super::{holder_account_ok, holder_sides, MAX_HOLDER_ACCOUNT_LEN};
+        let ev = |ns: &str, module: &str, name: &str, params: serde_json::Value| {
+            json!({"params": params, "name": name,
+                   "module": {"namespace": ns, "name": module}, "moduleHash": "h"})
+        };
+        let sides = |e: &serde_json::Value| {
+            let p = parse_event(e).unwrap();
+            let mut out = Vec::new();
+            holder_sides(&p, &mut out);
+            out.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let amt = json!({"decimal": "1.5"});
+        assert_eq!(
+            sides(&ev("free", "tok", "TRANSFER", json!(["a", "b", amt]))),
+            ["a", "b"]
+        );
+        assert!(sides(&ev("free", "tok", "XTRANSFER", json!(["a", "b", amt]))).is_empty());
+        assert!(sides(&ev("free", "tok", "X_TRANSFER", json!(["a", "b", 1]))).is_empty());
+        // Coinbase-shaped: the empty sender is left out.
+        let cb = json!({"params": ["", "m", 2], "name": "TRANSFER",
+                        "module": {"namespace": null, "name": "coin"}, "moduleHash": "h"});
+        assert_eq!(sides(&cb), ["m"]);
+        // Marmalade ledgers.
+        let (v2, v1) = ("marmalade-v2", "marmalade");
+        assert_eq!(
+            sides(&ev(v2, "ledger", "MINT", json!(["t:1", "alice", 1]))),
+            ["alice"]
+        );
+        assert_eq!(
+            sides(&ev(v1, "ledger", "TRANSFER", json!(["t:1", "a", "b", 1]))),
+            ["b"]
+        );
+        assert!(sides(&ev(v2, "ledger", "MINT", json!(["", "alice", 1]))).is_empty());
+        assert!(sides(&ev(v2, "ledger", "BURN", json!(["t:1", "alice", 1]))).is_empty());
+        assert!(sides(&ev(v2, "other", "MINT", json!(["t:1", "alice", 1]))).is_empty());
+        let rec = |a: &str, b: &str| {
+            json!(["t:1", 1, {"account": a, "current": 1, "previous": 0},
+                   {"account": b, "current": 1, "previous": 0}])
+        };
+        assert_eq!(
+            sides(&ev(v2, "ledger", "RECONCILE", rec("", "bob"))),
+            ["bob"]
+        );
+        assert_eq!(
+            sides(&ev(v1, "policy-manager", "RECONCILE", rec("a", "b"))),
+            ["a", "b"]
+        );
+        assert!(sides(&ev("free", "ledger", "RECONCILE", rec("a", "b"))).is_empty());
+        let bad = json!(["t:1", 1, {"acct": "a"}, {"account": "b"}]);
+        assert!(sides(&ev(v2, "ledger", "RECONCILE", bad)).is_empty());
+        // At most three sides per event (a 3-param TRANSFER on a ledger with a string third).
+        let t3 = sides(&ev(v2, "ledger", "TRANSFER", json!(["t:1", "a", "5"])));
+        assert_eq!(t3, ["t:1", "a", "5"]);
+        // Accounts up to 1024 bytes.
+        assert!(holder_account_ok(&"a".repeat(MAX_HOLDER_ACCOUNT_LEN)));
+        assert!(!holder_account_ok(&"a".repeat(MAX_HOLDER_ACCOUNT_LEN + 1)));
+        assert!(!holder_account_ok(""));
     }
 
     /// F-01: a cross-chain event's chain id is a string in `p[3]`; those arms must still run,

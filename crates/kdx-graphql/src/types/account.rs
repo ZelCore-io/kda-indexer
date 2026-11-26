@@ -1062,24 +1062,52 @@ pub async fn query_holders(
                 }
                 Ok(())
             };
-            let page = holders::page(&view.txn, m, &chains, order, cur, n + 1, &mut check)
-                .map_err(|e| match e.downcast::<kdx_api::ApiError>() {
-                    Ok(a) => a,
-                    Err(e) => kdx_api::ApiError::from(e),
-                })?;
-            let mut out = Vec::with_capacity(page.len());
-            for h in page {
-                view.check_deadline()?;
-                let Some(acct) = d.name(DictKind::Account, h.account) else {
-                    continue;
-                };
-                let bal = view
-                    .txn
-                    .get(Table::Balances, &balances::bal_key(h.account, m, h.chain))?
-                    .and_then(|v| BalanceRow::decode(&v))
-                    .filter(|r| !r.absent)
-                    .map_or_else(|| "0".to_owned(), |r| balance_text(&r.balance));
-                out.push((h.first.0, h.account, acct.to_owned(), h.chain, bal));
+            // Review M-1 of PR #54: a row whose AccountId has no dictionary name (only on a
+            // damaged dictionary) is skipped and counted, and the page keeps filling past it,
+            // so it is never cut short and `hasNextPage` stays right. Each round reads at most
+            // `chains × (n + 1)` keys; the deadline bounds the rounds.
+            let ledger = kdx_decode::build::MARMALADE_LEDGERS.contains(&name.as_str());
+            let mut out = Vec::with_capacity(n + 1);
+            let mut at = cur;
+            let mut skipped = 0u64;
+            loop {
+                let want = n + 1 - out.len();
+                let page = holders::page(&view.txn, m, &chains, order, at, want, &mut check)
+                    .map_err(|e| match e.downcast::<kdx_api::ApiError>() {
+                        Ok(a) => a,
+                        Err(e) => kdx_api::ApiError::from(e),
+                    })?;
+                let last = page.len() < want;
+                at = page.last().map(holders::Holder::order).or(at);
+                for h in page {
+                    view.check_deadline()?;
+                    let Some(acct) = d.name(DictKind::Account, h.account) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    // A marmalade ledger has no account-wide balance: stock's `details` read
+                    // fails there and it answers 0 (review M-3 of PR #54).
+                    let bal = if ledger {
+                        "0".to_owned()
+                    } else {
+                        view.txn
+                            .get(Table::Balances, &balances::bal_key(h.account, m, h.chain))?
+                            .and_then(|v| BalanceRow::decode(&v))
+                            .filter(|r| !r.absent)
+                            .map_or_else(|| "0".to_owned(), |r| balance_text(&r.balance))
+                    };
+                    out.push((h.first.0, h.account, acct.to_owned(), h.chain, bal));
+                }
+                if last || out.len() > n {
+                    break;
+                }
+            }
+            if skipped > 0 {
+                tracing::warn!(
+                    module = %name,
+                    skipped,
+                    "holders: rows whose AccountId has no dictionary name were skipped"
+                );
             }
             Ok(Some(out))
         })

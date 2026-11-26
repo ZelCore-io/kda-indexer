@@ -232,7 +232,7 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         for &(c, h, shapes) in BLOCKS.iter().filter(|b| (start..end).contains(&b.1)) {
             let ib = index(c, h, shapes, &mut dict);
             for x in &ib.idx {
-                holders.add_postings(&x.postings, x.key);
+                holders.add_sides(&x.holders, x.key);
             }
             w.push(&ib).unwrap();
         }
@@ -244,6 +244,7 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
     t.set_frozen_frontier(FRONTIER).unwrap();
     kdx_hot::holders::add_tally(&mut t, &holders).unwrap();
     t.set_next_txnum(first_txnum).unwrap();
+    kdx_hot::holders::stamp_txnum(&mut t).unwrap();
     for &(c, h, shapes) in BLOCKS.iter().filter(|b| b.1 >= FRONTIER) {
         let ib = index(c, h, shapes, &mut dict);
         kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
@@ -3605,6 +3606,20 @@ async fn holders_list_every_transfer_side_newest_first() {
         ],
         "{v}"
     );
+    // Review M-3 of PR #54: a marmalade ledger lists each NFT `TRANSFER` receiver (stock's
+    // `Balances` rows; the 4-param event is no fungible transfer, so not its sender), at "0"
+    // (stock's `details` read fails for a ledger); chain 1's first at height 9, chain 0's at 6.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"marmalade-v2.ledger\"").await;
+    assert_eq!(rows.len(), 6, "{v}");
+    assert!(rows[..3].iter().all(|r| r.1 == "1") && rows[3..].iter().all(|r| r.1 == "0"));
+    for (c, part) in [("1", &rows[..3]), ("0", &rows[3..])] {
+        let got: Vec<_> = part.iter().map(|r| (r.0.as_str(), r.2.as_str())).collect();
+        assert_eq!(
+            sorted(&got),
+            [(ALICE, "0"), (BOB, "0"), (CAROL, "0")],
+            "chain {c}: {v}"
+        );
+    }
     // `chainIds`.
     let (rows, v) = holder_rows(&fx.schema, "module: \"coin\", chainIds: [\"0\"]").await;
     assert_eq!(rows.len(), 3, "{v}");
@@ -3756,4 +3771,39 @@ async fn the_holders_rebuild_walk_equals_ingest() {
     assert!(kdx_hot::holders::ready(&ro).unwrap());
     let (rows, _) = holder_rows(&fx.schema, "module: \"coin\"").await;
     assert_eq!(rows.len(), 6);
+}
+
+/// Review M-1 of PR #54: holder rows whose AccountId has no dictionary name (a damaged
+/// dictionary) are skipped, and the page keeps filling past them: never cut short, and
+/// `hasNextPage` stays right.
+#[tokio::test]
+async fn holders_skip_rows_without_a_name_and_keep_filling() {
+    let fx = fixture();
+    let (want, _) = holder_rows(&fx.schema, "module: \"coin\"").await;
+    {
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let coin = dict.intern(DictKind::Module, "coin");
+        // Five nameless rows, newer than every real one on chain 1.
+        for i in 0..5u32 {
+            let key = TxKey::new(1_000 + i, 1, 1);
+            kdx_hot::holders::touch(&mut t, u32::MAX - i, coin, key).unwrap();
+        }
+        t.commit().unwrap();
+    }
+    let (rows, _) = holder_rows(&fx.schema, "module: \"coin\"").await;
+    assert_eq!(rows, want);
+    // A page of 2 at the top: the nameless rows are passed over, the page is full and more
+    // rows follow.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"coin\", first: 2").await;
+    assert_eq!(rows, want[..2], "{v}");
+    assert_eq!(v["balance"]["pageInfo"]["hasNextPage"], true, "{v}");
+    // The last real row: a page of 6 is the whole list and nothing follows.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"coin\", first: 6").await;
+    assert_eq!(rows, want, "{v}");
+    assert_eq!(v["balance"]["pageInfo"]["hasNextPage"], false, "{v}");
+    // Backward from the oldest end, through them too.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"coin\", last: 6").await;
+    assert_eq!(rows, want, "{v}");
+    assert_eq!(v["balance"]["pageInfo"]["hasPreviousPage"], false, "{v}");
 }

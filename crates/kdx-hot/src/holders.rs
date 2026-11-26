@@ -1,36 +1,41 @@
-//! A module's holders (`balance(module:)` without `accountName`): every `(account, chain)` a
-//! fungible TRANSFER event named, at any balance, ordered by its first transfer.
+//! A module's holders (`balance(module:)` without `accountName`): every `(account, chain)`
+//! stock's `Balances` table would hold for the module, at any balance, ordered by the first
+//! event that named it.
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
 //! | `Holders` | ModuleId u32, chain u8, first TxKey u64, AccountId u32 | empty |
 //! | `HolderFirst` | AccountId u32, ModuleId u32, chain u8 (the `Balances` key) | first TxKey u64 |
+//! | `HolderByTx` | first TxKey u64, ModuleId u32, AccountId u32 | empty |
 //!
-//! - The set is stock's `Balances` set for a module: the from and to sides of every TRANSFER
-//!   event (`from`/`to` not empty), so it includes holders at 0. It is read from the `xfer`
-//!   postings, which carry exactly those sides (`kdx_decode::index::output_postings`).
+//! - The set is stock's `Balances` set for a module (`payload.ts`): the from and to sides of
+//!   every event named exactly `TRANSFER` with three params (fungible-v2), the marmalade
+//!   ledgers' `MINT` account and `TRANSFER` receiver, and both sides of a marmalade `RECONCILE`
+//!   (`kdx_decode::build::holder_sides`, carried as `TxIndex::holders`). Sides not empty and
+//!   at most 1024 bytes. One difference, on purpose: coinbase miners are holders here (stock
+//!   adds no `Balances` row on its coinbase path; a miner holds coin).
 //! - Order: stock serves its own insert id, newest first. That id is the order stock's ingest
 //!   happened to insert, which cannot be reproduced; the closest stable order is the first
-//!   transfer that named the row (`first`, the TxKey: height, chain, position), newest first,
-//!   then AccountId. `HolderFirst` holds the same `first` per row, so an entry is found and
-//!   removed exactly.
+//!   event that named the row (`first`, the TxKey: height, chain, position), newest first,
+//!   then AccountId. `HolderFirst` holds the same `first` per row, and `HolderByTx` lists the
+//!   rows a tx is the first of, so an entry is found and removed exactly.
 //! - Kept from block 0 by every writer, in the write txn of the change: `tail::apply` notes each
-//!   `xfer` posting ([`touch`]), undo of a posting removes the entry when that posting was its
-//!   first ([`untouch`]); backfill notes each range's postings in the range's MDBX commit
-//!   ([`add_tally`]). [`touch`] keeps the smallest `first`, so a range built twice, or in any
-//!   order, gives the same table.
-//! - Storage per tx: at most one `Holders` and one `HolderFirst` row per new `xfer` posting,
-//!   each smaller than the posting row itself (`TailPostings`), so a holder flood costs no
-//!   more than the postings it already writes.
-//! - Readiness (the PR #48 pattern, own keys): `Meta holders_ready` and per-chain stamps
-//!   `holders_at@<chain>` = the chain's `Tail` checkpoint, written by apply and unwind. A new
-//!   store sets the marker (every writer keeps the table from block 0); an existing store gets
-//!   it from `kda-indexer reconcile-holders`. Readers use the table only while [`ready`].
+//!   side ([`touch`]), the undo of a tx removes the rows it is the first of ([`untouch_tx`]);
+//!   backfill notes each range's sides in the range's MDBX commit ([`add_tally`]). [`touch`]
+//!   keeps the smallest `first`, so a range built twice, or in any order, gives the same table.
+//! - Storage per tx: at most one row in each table per new side, and at most three sides per
+//!   event (`holder_sides`), so a holder flood costs a bounded amount per event, paid in gas.
+//! - Readiness (the PR #48 and #51 patterns, own keys): `Meta holders_ready`; per-chain stamps
+//!   `holders_at@<chain>` = the chain's `Tail` checkpoint, written by apply and unwind; and
+//!   `Meta holders_txnum` ([`TXNUM_AT`]) = `next_txnum`, written in the txn of every move of
+//!   `next_txnum` (backfill range, freeze) and by `reconcile-holders` and a new store, so a
+//!   range an older build backfilled is caught although no tip moved. A new store sets the
+//!   marker (every writer keeps the table from block 0); an existing store gets it from
+//!   `kda-indexer reconcile-holders`. Readers use the table only while [`ready`].
 
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
-use kdx_decode::Family;
 use kdx_types::TxKey;
 
 use crate::balances::{bal_key, parse_bal_key};
@@ -42,6 +47,14 @@ use crate::tables::Table;
 pub const READY: &str = "holders_ready";
 /// Meta key prefix of the per-chain tip the table follows (`holders_at@<chain>`).
 pub const AT_PREFIX: &str = "holders_at@";
+/// Meta key of the TxNum frontier the table follows (u64; review I-1 of PR #54).
+pub const TXNUM_AT: &str = "holders_txnum";
+
+/// Record that the table follows the store's current `next_txnum`, in the write txn that
+/// moved it (a backfill range with its first transfers, a freeze) or set the marker.
+pub fn stamp_txnum(txn: &mut RwTxn<'_>) -> Result<()> {
+    crate::rowcount::stamp_txnum_at(txn, TXNUM_AT)
+}
 
 pub fn at_key(chain: u8) -> String {
     format!("{AT_PREFIX}{chain}")
@@ -54,6 +67,15 @@ pub fn hold_key(module: u32, chain: u8, first: TxKey, account: u32) -> [u8; 17] 
     k[4] = chain;
     k[5..13].copy_from_slice(&first.to_be_bytes());
     k[13..].copy_from_slice(&account.to_be_bytes());
+    k
+}
+
+/// `HolderByTx` key.
+pub fn by_tx_key(first: TxKey, module: u32, account: u32) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[..8].copy_from_slice(&first.to_be_bytes());
+    k[8..12].copy_from_slice(&module.to_be_bytes());
+    k[12..].copy_from_slice(&account.to_be_bytes());
     k
 }
 
@@ -92,7 +114,7 @@ pub fn first_of(txn: &impl Txn, account: u32, module: u32, chain: u8) -> Result<
         .and_then(|v| Some(TxKey::from_be_bytes(v.as_slice().try_into().ok()?))))
 }
 
-/// Note a TRANSFER side `(account, module)` of the tx at `key`: the row is listed from its
+/// Note a holder side `(account, module)` of the tx at `key`: the row is listed from its
 /// smallest `first`. Returns whether the table changed.
 pub fn touch(txn: &mut RwTxn<'_>, account: u32, module: u32, key: TxKey) -> Result<bool> {
     let chain = key.chain();
@@ -102,6 +124,7 @@ pub fn touch(txn: &mut RwTxn<'_>, account: u32, module: u32, key: TxKey) -> Resu
         }
         // Only out-of-order writers (backfill ranges, the rebuild walk) get here.
         txn.del(Table::Holders, &hold_key(module, chain, old, account))?;
+        txn.del(Table::HolderByTx, &by_tx_key(old, module, account))?;
     }
     txn.put(
         Table::HolderFirst,
@@ -109,25 +132,35 @@ pub fn touch(txn: &mut RwTxn<'_>, account: u32, module: u32, key: TxKey) -> Resu
         &key.to_be_bytes(),
     )?;
     txn.put(Table::Holders, &hold_key(module, chain, key, account), &[])?;
+    txn.put(Table::HolderByTx, &by_tx_key(key, module, account), &[])?;
     Ok(true)
 }
 
-/// Undo of a TRANSFER side noted at `key`: the entry goes when `key` was its first transfer
-/// (an unwind removes every later tx of the chain too, so no later one is left to keep it).
-/// Returns whether it removed one.
-pub fn untouch(txn: &mut RwTxn<'_>, account: u32, module: u32, key: TxKey) -> Result<bool> {
-    let chain = key.chain();
-    if first_of(txn, account, module, chain)? != Some(key) {
-        return Ok(false);
+/// Undo of the tx at `key`: every row it is the first of goes (an unwind removes every later
+/// tx of the chain too, so no later one is left to keep it; an earlier first, from backfill
+/// or an earlier block, is not listed under `key` and stays). Reads only the rows `key`
+/// created. Returns how many it removed.
+pub fn untouch_tx(txn: &mut RwTxn<'_>, key: TxKey) -> Result<usize> {
+    let p = key.to_be_bytes();
+    let rows = txn.scan(Table::HolderByTx, &p, |k| k.starts_with(&p))?;
+    for (k, _) in &rows {
+        let (Some(m), Some(a)) = (
+            k.get(8..12)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_be_bytes),
+            k.get(12..16)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_be_bytes),
+        ) else {
+            anyhow::bail!("bad HolderByTx key");
+        };
+        txn.del(Table::HolderByTx, k)?;
+        if first_of(txn, a, m, key.chain())? == Some(key) {
+            txn.del(Table::HolderFirst, &bal_key(a, m, key.chain()))?;
+            txn.del(Table::Holders, &hold_key(m, key.chain(), key, a))?;
+        }
     }
-    txn.del(Table::HolderFirst, &bal_key(account, module, chain))?;
-    txn.del(Table::Holders, &hold_key(module, chain, key, account))?;
-    Ok(true)
-}
-
-/// The `(account, module)` of an `xfer` posting.
-pub fn xfer_sides(family: u8, entity: u64) -> Option<(u32, u32)> {
-    (family == Family::Xfer as u8).then_some(((entity >> 32) as u32, entity as u32))
+    Ok(rows.len())
 }
 
 /// First transfers of a batch of records (a backfill range or a rebuild walk): the smallest
@@ -147,11 +180,10 @@ impl Tally {
             *e = key;
         }
     }
-    pub fn add_postings(&mut self, postings: &[(Family, u64)], key: TxKey) {
-        for &(f, e) in postings {
-            if let Some((a, m)) = xfer_sides(f as u8, e) {
-                self.add(a, m, key);
-            }
+    /// The sides of one tx (`TxIndex::holders`).
+    pub fn add_sides(&mut self, sides: &[(u32, u32)], key: TxKey) {
+        for &(a, m) in sides {
+            self.add(a, m, key);
         }
     }
     pub fn merge(&mut self, o: Tally) {
@@ -213,7 +245,8 @@ pub fn read_all(txn: &impl Txn) -> Result<Vec<Holder>> {
 /// Remove every entry (the start of a rebuild).
 pub fn clear_table(txn: &mut RwTxn<'_>) -> Result<()> {
     txn.clear(Table::Holders)?;
-    txn.clear(Table::HolderFirst)
+    txn.clear(Table::HolderFirst)?;
+    txn.clear(Table::HolderByTx)
 }
 
 /// Which way a page reads.
@@ -358,25 +391,37 @@ pub fn marker_set(txn: &impl Txn) -> Result<bool> {
     Ok(txn.meta(READY)?.is_some())
 }
 
-/// Whether the table may answer: both tables exist, the marker is set and every chain's stamp
-/// equals its hot tip, read in `txn`'s snapshot.
+/// Why the table cannot be trusted (None: it can, as far as the stamps show): a chain's
+/// `holders_at@` stamp differs from its `Tail` checkpoint ([`tip_mismatch`]), or
+/// `holders_txnum` differs from `next_txnum` (a range backfilled or frozen by a build
+/// without the stamp).
+pub fn untrusted(txn: &impl Txn) -> Result<Option<String>> {
+    if let Some(why) = tip_mismatch(txn)? {
+        return Ok(Some(why));
+    }
+    crate::rowcount::txnum_mismatch(txn, TXNUM_AT)
+}
+
+/// Whether the table may answer: the tables exist, the marker is set, every chain's stamp
+/// equals its hot tip and `holders_txnum` equals `next_txnum`, read in `txn`'s snapshot.
 pub fn ready(txn: &impl Txn) -> Result<bool> {
     Ok(txn.has_table(Table::Holders)
         && txn.has_table(Table::HolderFirst)
+        && txn.has_table(Table::HolderByTx)
         && marker_set(txn)?
-        && tip_mismatch(txn)?.is_none())
+        && untrusted(txn)?.is_none())
 }
 
-/// Clear a set marker whose table does not follow the tips (startup, and before every apply
-/// and unwind). Returns the reason when it cleared it.
+/// Clear a set marker whose table does not follow the store (startup, before every apply
+/// and unwind, before every move of `next_txnum`). Returns the reason when it cleared it.
 pub fn guard(txn: &mut RwTxn<'_>) -> Result<Option<String>> {
     if !marker_set(txn)? {
         return Ok(None);
     }
-    let Some(why) = tip_mismatch(txn)? else {
+    let Some(why) = untrusted(txn)? else {
         return Ok(None);
     };
-    tracing::warn!(reason = %why, "holders: the table does not follow the hot tips");
+    tracing::warn!(reason = %why, "holders: the table does not follow the store");
     clear_ready(txn)?;
     Ok(Some(why))
 }
@@ -449,6 +494,12 @@ mod tests {
                 pact_id: None,
                 code_hash: None,
                 d3: Default::default(),
+                holders: {
+                    let mut h = sides.clone();
+                    h.sort_unstable();
+                    h.dedup();
+                    h
+                },
             });
         }
         IndexedBlock {
@@ -467,8 +518,11 @@ mod tests {
 
     /// The replay model: the smallest TxKey per `(account, module, chain)` over the applied
     /// blocks.
-    fn model(applied: &BTreeMap<u8, Vec<Blk>>) -> Vec<Holder> {
+    fn model(applied: &BTreeMap<u8, Vec<Blk>>, backfilled: &[(u32, u32, u8)]) -> Vec<Holder> {
         let mut first: BTreeMap<(u32, u32, u8), TxKey> = BTreeMap::new();
+        for &(a, m, c) in backfilled {
+            first.insert((a, m, c), TxKey::new(0, c, 0));
+        }
         for (&c, blocks) in applied {
             for (h, txs) in blocks.iter().enumerate() {
                 for (i, sides) in txs.iter().enumerate() {
@@ -505,12 +559,21 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut applied: BTreeMap<u8, Vec<Blk>> = BTreeMap::new();
             let mut fork = 1u8;
+            // Rows a backfill range noted (its first at a frozen position below every tail
+            // tx: height 0, pos 0), mixed with the tail's applies and unwinds on the same rows.
+            let mut backfilled = Vec::new();
             for _ in 0..60 {
                 let mut txn = hot.rw().unwrap();
                 let mut dict = HotDict::load(&txn).unwrap();
                 let c = rng.below(3) as u8;
                 let chain = applied.entry(c).or_default();
-                if !chain.is_empty() && rng.below(4) == 0 {
+                if rng.below(8) == 0 {
+                    let (a, m) = (1 + rng.below(5) as u32, 1 + rng.below(2) as u32);
+                    let mut t = super::Tally::default();
+                    t.add(a, m, TxKey::new(0, c, 0));
+                    super::add_tally(&mut txn, &t).unwrap();
+                    backfilled.push((a, m, c));
+                } else if !chain.is_empty() && rng.below(4) == 0 {
                     let to = rng.below(chain.len() as u64) as u32;
                     // Unwind to `to - 1` (keep heights below `to`); height 0 stays.
                     let keep = to.max(1);
@@ -532,8 +595,9 @@ mod tests {
                 txn.commit().unwrap();
                 let ro = hot.ro().unwrap();
                 let got = read_all(&ro).unwrap();
-                assert_eq!(got, model(&applied), "seed {seed}");
+                assert_eq!(got, model(&applied, &backfilled), "seed {seed}");
                 assert_eq!(ro.count(Table::HolderFirst).unwrap(), got.len());
+                assert_eq!(ro.count(Table::HolderByTx).unwrap(), got.len());
                 for h in &got {
                     assert_eq!(
                         super::first_of(&ro, h.account, h.module, h.chain).unwrap(),
@@ -579,7 +643,7 @@ mod tests {
             let mut t = super::Tally::default();
             for b in part {
                 for x in &b.idx {
-                    t.add_postings(&x.postings, x.key);
+                    t.add_sides(&x.holders, x.key);
                 }
             }
             let mut txn = hot2.rw().unwrap();
@@ -589,6 +653,104 @@ mod tests {
         let ro = hot2.ro().unwrap();
         assert_eq!(read_all(&ro).unwrap(), want);
         assert_eq!(ro.count(Table::HolderFirst).unwrap(), want.len());
+    }
+
+    /// Review M-6 of PR #54: a row whose first transfer came from backfill keeps it through a
+    /// tail apply and unwind of a later transfer on the same row; a row the tail created and
+    /// backfill later lowered survives the unwind of the tail's tx; a row only the unwound tx
+    /// named goes. `HolderByTx` lists exactly the current firsts.
+    #[test]
+    fn backfill_first_then_tail_apply_and_unwind_on_the_same_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let (a, b, c, m) = (1u32, 2u32, 3u32, 7u32);
+        // Backfill: `a` first at height 2 (pos 1).
+        let early = TxKey::new(2, 0, 1);
+        let mut t = super::Tally::default();
+        t.add(a, m, early);
+        let mut txn = hot.rw().unwrap();
+        super::add_tally(&mut txn, &t).unwrap();
+        txn.commit().unwrap();
+        // The tail applies heights 0..=6 on chain 0 (empty), then height 7 naming a, b and c.
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        for h in 0..7 {
+            crate::tail::apply(&mut txn, &block(0, h, &vec![vec![]], 1), &mut dict).unwrap();
+        }
+        let txs: Blk = vec![vec![(a, m), (b, m), (c, m)]];
+        crate::tail::apply(&mut txn, &block(0, 7, &txs, 1), &mut dict).unwrap();
+        txn.commit().unwrap();
+        let late = TxKey::new(7, 0, 1);
+        // Backfill lowers `b` below the tail's first afterwards.
+        let mut txn = hot.rw().unwrap();
+        let mut t = super::Tally::default();
+        t.add(b, m, TxKey::new(1, 0, 1));
+        super::add_tally(&mut txn, &t).unwrap();
+        txn.commit().unwrap();
+        let ro = hot.ro().unwrap();
+        assert_eq!(super::first_of(&ro, a, m, 0).unwrap(), Some(early));
+        assert_eq!(super::first_of(&ro, c, m, 0).unwrap(), Some(late));
+        assert_eq!(ro.count(Table::HolderByTx).unwrap(), 3);
+        drop(ro);
+        // Unwind height 7.
+        let mut txn = hot.rw().unwrap();
+        crate::tail::unwind_to(&mut txn, 0, 6).unwrap();
+        txn.commit().unwrap();
+        let ro = hot.ro().unwrap();
+        let got: Vec<(u32, TxKey)> = read_all(&ro)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.account, h.first))
+            .collect();
+        assert_eq!(got, vec![(b, TxKey::new(1, 0, 1)), (a, early)]);
+        assert_eq!(super::first_of(&ro, c, m, 0).unwrap(), None);
+        assert_eq!(ro.count(Table::HolderFirst).unwrap(), 2);
+        assert_eq!(ro.count(Table::HolderByTx).unwrap(), 2);
+        assert!(ready(&ro).unwrap());
+    }
+
+    /// Review I-1 of PR #54: a range backfilled (or frozen) by a build without the
+    /// `holders_txnum` stamp moves `next_txnum` but no tip: `ready` is false and `guard`
+    /// clears the marker. This build's writers stamp in the txn that moves it.
+    #[test]
+    fn a_range_backfilled_without_the_txnum_stamp_is_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+        let ro = hot.ro().unwrap();
+        assert!(ready(&ro).unwrap(), "a new store is ready at TxNum 0");
+        drop(ro);
+        // This build: a range commit moves `next_txnum` with the stamp.
+        let mut txn = hot.rw().unwrap();
+        assert_eq!(super::guard(&mut txn).unwrap(), None);
+        txn.set_next_txnum(100).unwrap();
+        super::stamp_txnum(&mut txn).unwrap();
+        txn.commit().unwrap();
+        assert!(ready(&hot.ro().unwrap()).unwrap());
+        // An older build: the next range moves `next_txnum`, no stamp, no tip.
+        let mut txn = hot.rw().unwrap();
+        txn.set_next_txnum(250).unwrap();
+        txn.commit().unwrap();
+        let ro = hot.ro().unwrap();
+        assert!(!ready(&ro).unwrap());
+        let why = super::untrusted(&ro).unwrap().unwrap();
+        assert!(why.contains("holders_txnum"), "{why}");
+        drop(ro);
+        // Back on this build: the guard (startup, apply, unwind, the next range or freeze)
+        // clears the marker instead of stamping over it.
+        let mut txn = hot.rw().unwrap();
+        assert!(super::guard(&mut txn).unwrap().is_some());
+        super::stamp_txnum(&mut txn).unwrap();
+        txn.commit().unwrap();
+        let ro = hot.ro().unwrap();
+        assert!(!super::marker_set(&ro).unwrap());
+        assert!(!ready(&ro).unwrap());
+        drop(ro);
+        // A missing stamp (a store from before this stamp) is a mismatch too.
+        let mut txn = hot.rw().unwrap();
+        super::set_ready(&mut txn, 250).unwrap();
+        txn.del(Table::Meta, super::TXNUM_AT.as_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert!(!ready(&hot.ro().unwrap()).unwrap());
     }
 
     /// Pages walk a module's holders over several chains newest first (and oldest first),
