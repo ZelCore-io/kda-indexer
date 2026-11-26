@@ -3,8 +3,8 @@
 kda-indexer serves Kadena's GraphQL schema, the schema of `@kadena/graph`. An explorer built on
 that schema, such as kadscan or the Kadena explorer, can change its GraphQL URL to a kda-indexer
 endpoint and keep its own operations, with two documented limits: the default query-cost limit
-refuses an events query that spans all 20 chains, and `totalCount` on a long list can answer a
-lower bound (slowly today, see [Speed](#speed)). This page gives the evidence for that claim and
+refuses an events query that spans all 20 chains, and `totalCount` on a very long list can
+answer a `COUNT_TIMEOUT` error where stock answers a number (see [Speed](#speed)). This page gives the evidence for that claim and
 lists where the answers differ.
 
 Status: validated against chainweb-data and the GraphQL indexer on mainnet; a 72-hour final
@@ -25,7 +25,7 @@ defaults, nullability, interfaces and unions are identical.
 | Works | Subscriptions: `newBlocks`, `newBlocksFromDepth`, `events`, `transaction` | Over a websocket on the same `/graphql` path (`graphql-transport-ws` or the older `graphql-ws`). A load test held <!--m:gql-subs-held-->500<!--/m--> live subscriptions with <!--m:gql-subs-duplicates-->0<!--/m--> duplicate and <!--m:gql-subs-misses-->0<!--/m--> missed items, and <!--m:gql-subs-headers-checked-->631<!--/m--> block headers checked against the node |
 | Works | The additions kadscan uses: `balance`, `transactionsByPactCode`, `Block.coinbase`, `Block.canonical`, `transactions(isCoinbase)` (coinbases listed as transactions, as stock), `transfers(isNFT)`, the `transactions` subscription and others | Additive only: every Kadena document stays valid ([graphql.md](graphql.md#zelcore-extensions)) |
 | Same | Page sizes | 20 items when `first`/`last` is omitted (the schema text says 500), as stock; any page the complexity limit admits is answered in full, up to a 1,000-row safety cap stock does not have |
-| Differs | `totalCount` on long lists | Counted up to 10,000 rows within a time budget; a count cut short answers a lower bound and the response carries `"extensions": {"totalCountLowerBound": true}`. Today the budget is up to half of the 5 s request deadline; the fix caps it at 200 ms by default (see [Speed](#speed)) |
+| Differs | `totalCount` on very long lists | Exact, as stock's, with no cap. A count the 5 s request deadline cuts answers a `COUNT_TIMEOUT` error at the field where stock answers a number; only lists with tens of thousands of rows to decode reach it (see [Speed](#speed)) |
 | Same | Depth and complexity | Stock's: depth 9 and complexity 4,000 counted as stock counts them, refused with stock's text, code and HTTP status ([graphql.md](graphql.md#limits)) |
 | Differs | Other resource limits | 10 operations per batch, a 5 s deadline, 20,000 fields after fragment expansion, 8 directives per field, an introspection cost cap. A refusal is a GraphQL error with `extensions.code = "LIMIT"` |
 | Same | Events over all 20 chains | The Kadena explorer builds one `events` field per ticked chain; with all 20 chains ticked it is answered or refused exactly as stock answers or refuses it |
@@ -145,16 +145,17 @@ itself takes about <!--m:exp-account-page-ms-->3 ms<!--/m-->. The time goes to `
 Profiled on a heavy account and on an ordinary active account, the count took about
 <!--m:exp-count-heavy-ms-->2,470 ms<!--/m--> and <!--m:exp-count-active-ms-->2,500 ms<!--/m-->.
 
-Why: the count walks the account's postings and decodes each one until it has 10,000 rows
-or has used its time budget. Today that budget is up to half of the 5 s request deadline,
-about 2.5 s, and then the answer is a lower bound, flagged with `totalCountLowerBound`. Some
-accounts reach the 10,000-row cap first, in well under a second. In this sample,
+Why: in that measured build the count walked the account's postings and decoded each one
+until it had 10,000 rows or had used its time budget, up to half of the 5 s request deadline,
+about 2.5 s, and then answered a lower bound (a flag that no longer exists). Some accounts
+reached the 10,000-row cap first, in well under a second. In this sample,
 <!--m:exp-account-timeouts-->3<!--/m--> requests of the account tab's `Transactions` operation
 ran out of the whole deadline (`TIMEOUT`).
 
-The fix caps the count at a short budget, 200 ms by default, and returns the same flagged lower
-bound, with the same response shape as today. It is fixed, not released yet. The new times will be
-published once they are measured.
+That count is replaced: `totalCount` is now exact, with no cap and no lower bound, and runs to
+the request deadline; a count the deadline cuts answers `COUNT_TIMEOUT` (see
+[graphql.md](graphql.md#transactions-events-and-transfers)). It is not released yet. The new times will be published once
+they are measured.
 
 ## Screenshots
 

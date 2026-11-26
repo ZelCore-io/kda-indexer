@@ -4350,14 +4350,12 @@ mod tests {
         use crate::graphql_scope::SCOPED_FINISHED_PATH;
         let hits = [
             PAGE_CUT_PATH,
-            TOTALCOUNT_CAP_PATH,
             ORACLE_STALL_PATH,
             F2_PATH,
             F7_PATH,
             FIELD_PATH,
             TIE_CUT_PATH,
             ORACLE_EMPTY_PATH,
-            COUNT_LOWER_BOUND_PATH,
             ORPHAN_DUPES_PATH,
             BY_KEY_EXTRA_PATH,
             STRIPS_QUOTES_PATH,
@@ -4371,7 +4369,18 @@ mod tests {
         .map(|p| entry(p, DiffKind::Changed));
         let (un, ids) = allow.classify_request(&RouteKind::Other, "graphql:QBlock", &[], &hits);
         assert!(un.is_empty(), "{un:?}");
-        assert_eq!(ids.len(), 18);
+        assert_eq!(ids.len(), 16);
+        // GQ-10 (owner ruling 2026-11-26): `totalCount` is exact, so a capped or lower-bound
+        // count is no longer explained by any entry.
+        for p in [TOTALCOUNT_CAP_PATH, COUNT_LOWER_BOUND_PATH] {
+            let (un, _) = allow.classify_request(
+                &RouteKind::Other,
+                "graphql:QBlock",
+                &[],
+                &[entry(p, DiffKind::Changed)],
+            );
+            assert_eq!(un.len(), 1, "{p} is unexplained");
+        }
         // R-P5P9-62: one entry per new rule, PROPOSED until the FV preconditions flip it.
         for id in [
             "graphql-h7-window-referee",
@@ -4452,7 +4461,6 @@ mod tests {
             "graphql-r60-count-self-consistent",
             "graphql-r60-scoped-list",
             "graphql-r58-oracle-empty",
-            "graphql-r58-count-lower-bound",
             "graphql-r58-oracle-orphan-dupes",
             "graphql-r58-by-key-extra-row",
         ] {
