@@ -137,6 +137,17 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
     Ok(n)
 }
 
+/// Move `next_txnum` to `n` for a freeze: the stored counts do not change (the records only
+/// move), so their TxNum stamps follow it in this txn. A stamp an older build left behind is
+/// not stamped over: the guards run first and clear such a marker (review I-2 of PR #51).
+fn move_txnum(txn: &mut kdx_hot::RwTxn<'_>, n: u64) -> Result<()> {
+    kdx_hot::rowcount::guard(txn)?;
+    kdx_hot::chaincount::guard(txn)?;
+    txn.set_next_txnum(n)?;
+    kdx_hot::rowcount::stamp_txnum(txn)?;
+    kdx_hot::chaincount::stamp_txnum(txn)
+}
+
 /// On start: clear `etl/`, delete segment files the manifest does not list, and finish a
 /// freeze that reached the manifest but not the hot store.
 pub fn reconcile(ctx: &Ctx) -> Result<()> {
@@ -157,7 +168,7 @@ pub fn reconcile(ctx: &Ctx) -> Result<()> {
         let _d = ctx.dict.lock().unwrap_or_else(|e| e.into_inner());
         let mut txn = ctx.hot.rw()?;
         let n = drop_hot_below(&mut txn, m.frontier)?;
-        txn.set_next_txnum(m.next_txnum)?;
+        move_txnum(&mut txn, m.next_txnum)?;
         // Only when absent: the current sizes may include names interned after the
         // interrupted freeze (review L3).
         if txn.meta(&dict::lens_key(m.frontier))?.is_none() {
@@ -339,7 +350,7 @@ fn freeze_step(ctx: &Ctx) -> Result<Option<RangeEntry>> {
             n == blocks,
             "freezer: deleted {n} hot blocks, froze {blocks}"
         );
-        txn.set_next_txnum(entry.end_txnum())?;
+        move_txnum(&mut txn, entry.end_txnum())?;
         txn.set_meta(&dict::lens_key(end), &dict::encode_lens(&d))?;
         txn.commit()?;
     }

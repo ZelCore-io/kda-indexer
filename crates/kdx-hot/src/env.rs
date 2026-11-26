@@ -113,6 +113,10 @@ impl HotStore {
                 // An empty tail: every tx the tail writes from here on carries its `sndr`
                 // posting (`tail::apply`), so the freezer can take them from the hot store.
                 put(meta::SNDR_HOT, &1u64.to_be_bytes())?;
+                // An empty store: the (empty) per-chain counters are exact, and every writer
+                // keeps them so from block 0 (`chaincount.rs`).
+                put(crate::chaincount::READY, &0u64.to_be_bytes())?;
+                put(crate::chaincount::TXNUM_AT, &0u64.to_be_bytes())?;
             }
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;

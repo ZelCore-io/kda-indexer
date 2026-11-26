@@ -270,6 +270,52 @@ systemctl start kda-indexer-<network>
   build before PR #48 moves the tips without it. The counts are then not used (lists walk),
   and `run` clears the marker at startup with a warning that names the chain and heights.
   Run `reconcile-counts` again after such a rollback.
+- They are also tied to the TxNum frontier: each freeze writes the store's new `next_txnum`
+  in `Meta row_counts_txnum` in its own commit, and the run writes it too. A build without
+  that stamp moves `next_txnum` without it when it freezes or backfills a range; the counts
+  are then not used either (same startup warning, naming the TxNum). A store whose marker
+  was set by a build before this stamp has none, so its lists walk until one more
+  `reconcile-counts`.
+
+### Per-chain counters (`countersOfEachChain`)
+
+`networkInfo.countersOfEachChain.transactionCount` and `totalGasUsedInKda` are read from
+the hot `ChainCounters` table (one row per chain: user txs, exact gas in KDA). Unlike the
+row counts, every writer keeps it from block 0: a new store starts it ready, the tail adds
+and unwinds it per block, and backfill adds each range's totals in the range's commit. So a
+reindex from scratch serves them with no extra step. Its marker (`Meta
+chain_counters_ready`) is cleared by `rebuild-range`, by a backfill resume that resets the
+hot frontier (a range committed to MDBX but not to the manifest), by a partial store (`run
+--start-height`, or `backfill --from H` with H above 0 into a new data dir: no all-time
+counts, and `reconcile-counts` leaves the marker unset there), by a sum out of range and by a
+damaged row; the fields then answer `NOT_AVAILABLE` (logged as `chain counters: readiness
+marker cleared`).
+
+Two stamps catch writes by a build without this table; the counters are then not served,
+and `run` (at startup), every tail apply or unwind, every backfill range and every freeze
+clear the marker with a warning:
+
+- `Meta chain_counters_at@<chain>`: the `Tail` tip the counters follow, written with each
+  apply and unwind. It catches blocks such a build applied or unwound (a build with PR #48
+  but not this table included).
+- `Meta chain_counters_txnum`: the `next_txnum` the counters follow, written in each backfill
+  range's commit with its totals and in each freeze's commit. It catches ranges such a build
+  backfilled (and, needlessly, ranges it froze).
+
+A build without this table that only reads the store is not caught and needs nothing.
+
+`reconcile-counts` rebuilds this table in the same pass (it adds a JSON parse of each user
+tx's `cmd` for `meta.gasPrice`) and sets its marker, so an existing store needs one run
+after the upgrade. Its report adds `chain_txs` (user txs counted), `unpriced` (user txs
+whose `gasPrice` did not parse; they count, with 0 gas), `chain_counters_ready` and, with
+`--check`, `chain_counters_differing` (0 on a healthy store). Unrendered records do not hold
+this marker back.
+
+`unpriced` should be 0: such a tx has a price at stock, so each one makes our gas sum short.
+Backfill and the tail count them in `kdx_chain_counters_unpriced_total{mode}`. After a
+reindex, check that metric's sum over the run, or the `unpriced` of `reconcile-counts --check`,
+before claiming gas parity, and explain any non-zero count (the records are those whose
+`cmd` could not be parsed or was re-encoded).
 
 ## Rolling back to a build before FIX-2
 
@@ -418,6 +464,7 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_freezer_runs_total`, `kdx_freezer_seconds` | op (freeze, merge) |
 | `kdx_read_view_seconds` | phase (open, held) |
 | `kdx_merkle_blocks_total` | result (verified, mismatch_legacy, mismatch) |
+| `kdx_chain_counters_unpriced_total` | mode (backfill, tail): user txs added to `countersOfEachChain` with 0 gas because their `gasPrice` did not parse |
 
 Alerts to set up in your own alerting:
 
@@ -425,6 +472,8 @@ Alerts to set up in your own alerting:
 - any `kdx_chain_halted` equal to 1 (see "Halted chains" above);
 - any increase of `kdx_merkle_blocks_total` with `result` other than `verified`
   (`mismatch_legacy` or `mismatch`: every era must verify);
+- any increase of `kdx_chain_counters_unpriced_total` (`totalGasUsedInKda` is then short of
+  stock's by those txs' gas; see "Per-chain counters");
 - `kdx_disk_free_bytes` below 15% of the volume;
 - a reorg deeper than 50 (`kdx_reorg_depth`);
 - the comparison harness reporting unexplained differences over an hour;

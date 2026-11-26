@@ -7,6 +7,7 @@
 //! order. No `rkyv` in P2.
 
 pub mod balances;
+pub mod chaincount;
 pub mod checkpoint;
 pub mod dict;
 pub mod env;

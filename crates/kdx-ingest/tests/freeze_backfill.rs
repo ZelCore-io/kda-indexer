@@ -40,7 +40,15 @@ async fn freeze_equals_backfill(range: u64) {
     let frozen = {
         let c = ctx(df.path(), 2, range, 2);
         apply_linear(&c, &pool, &chain, 5);
+        // Row counts set by `reconcile-counts`, then frozen: a freeze moves `next_txnum` and
+        // the TxNum stamps with it in its txn (review I-2), so neither marker is cleared.
+        let rep =
+            kdx_ingest::row_counts::reconcile(&c.segdir, &c.hot, 2, false, &|| false).unwrap();
+        assert!(rep.ready && rep.chain_counters_ready, "{rep:?}");
         while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+        assert!(kdx_hot::rowcount::ready(&c.hot.ro().unwrap()).unwrap());
+        // Ingest (tail apply, then the freezer) kept the chain counters from block 0.
+        chain_counters_match_the_walk(&c);
         kdx_segment::manifest::Manifest::load(&c.segdir)
             .unwrap()
             .unwrap()
@@ -58,6 +66,18 @@ async fn freeze_equals_backfill(range: u64) {
         !count_marker(&c),
         "PR #48: backfill clears the stored-counts marker"
     );
+    // Backfill keeps the chain counters (and their marker) from block 0.
+    chain_counters_match_the_walk(&c);
+    // A resume that resets the hot frontier (a range whose MDBX commit landed but whose
+    // manifest commit did not) would count that range twice: the marker is cleared.
+    {
+        let mut t = c.hot.rw().unwrap();
+        t.set_frozen_frontier(22).unwrap();
+        t.commit().unwrap();
+    }
+    let (_, _, info) = kdx_ingest::backfill::resume(&c).unwrap();
+    assert!(info.hot_reset);
+    assert!(!kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap());
     let backfilled = kdx_segment::manifest::Manifest::load(&c.segdir)
         .unwrap()
         .unwrap();
@@ -144,6 +164,7 @@ async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
         .entries[3]
         .clone();
     set_count_marker(&c);
+    assert!(kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap());
     let rep = kdx_ingest::rebuild::run(
         c.clone(),
         e.kind,
@@ -157,6 +178,10 @@ async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
     assert!(
         !count_marker(&c),
         "PR #48: rebuild-range clears the stored-counts marker"
+    );
+    assert!(
+        !kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap(),
+        "rebuild-range clears the chain counters' marker"
     );
     assert_eq!(rep.content_equal, Some(true));
     assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
@@ -675,6 +700,22 @@ fn startup_cleanup_keeps_listed_optional_files() {
     assert_eq!(want.keys().filter(|n| n.contains("-sndr-")).count(), 10);
 }
 
+/// The stored chain counters are ready, non-trivial and equal to what `reconcile-counts`
+/// builds from every record of the store (frozen and hot).
+fn chain_counters_match_the_walk(c: &kdx_ingest::Ctx) {
+    let (walked, _) = kdx_ingest::row_counts::tally_both(&c.segdir, &c.hot, 2, &|| false).unwrap();
+    let ro = c.hot.ro().unwrap();
+    assert!(kdx_hot::chaincount::ready(&ro).unwrap());
+    assert!(
+        walked.chains.chains.values().any(|v| v.user_txs > 0),
+        "{walked:?}"
+    );
+    assert_eq!(
+        kdx_hot::chaincount::differing(&ro, &walked.chains).unwrap(),
+        0
+    );
+}
+
 fn set_count_marker(c: &kdx_ingest::Ctx) {
     let mut t = c.hot.rw().unwrap();
     kdx_hot::rowcount::set_ready(&mut t, 0).unwrap();
@@ -683,4 +724,42 @@ fn set_count_marker(c: &kdx_ingest::Ctx) {
 
 fn count_marker(c: &kdx_ingest::Ctx) -> bool {
     kdx_hot::rowcount::marker_set(&c.hot.ro().unwrap()).unwrap()
+}
+
+/// Review I-1: `backfill --from H` (H > 0) into a new data dir stores counters that miss
+/// every height below H. They are not served as exact, and `reconcile-counts` does not mark
+/// them ready (a partial store, like `run --start-height`). The row counts describe what is
+/// stored, which is also what the list walk reads, so `reconcile-counts` still sets theirs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backfill_from_mid_chain_is_not_served_as_exact() {
+    let pool = pool();
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let base = fake_node(&pool, &[(0, branch(&all, 0, 0, 0))]);
+    let db = tempfile::tempdir().unwrap();
+    let c = Arc::new(ctx_with_node(db.path(), 2, 1000, 2, &base));
+    assert!(kdx_hot::chaincount::ready(&c.hot.ro().unwrap()).unwrap());
+    kdx_ingest::backfill::run(c.clone(), 10, 19, kdx_ingest::HeaderMode::Cut)
+        .await
+        .unwrap();
+    let m = kdx_segment::manifest::Manifest::load(&c.segdir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.entries.first().unwrap().start, 10);
+    assert!(!kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap());
+    let rep = kdx_ingest::row_counts::reconcile(&c.segdir, &c.hot, 2, false, &|| false).unwrap();
+    assert!(!rep.chain_counters_ready, "{rep:?}");
+    let ro = c.hot.ro().unwrap();
+    assert!(!kdx_hot::chaincount::marker_set(&ro).unwrap());
+    assert!(!kdx_hot::chaincount::ready(&ro).unwrap());
+    assert!(
+        rep.ready && kdx_hot::rowcount::ready(&ro).unwrap(),
+        "{rep:?}"
+    );
+    drop(ro);
+    let rep = kdx_ingest::row_counts::reconcile(&c.segdir, &c.hot, 2, true, &|| false).unwrap();
+    assert_eq!(
+        rep.differing,
+        Some(0),
+        "row counts equal the stored records"
+    );
 }

@@ -179,6 +179,7 @@ pub async fn run(
         // A rebuilt range may store other records: the stored row counts no longer hold.
         let mut txn = ctx.hot.rw()?;
         kdx_hot::rowcount::clear_ready(&mut txn)?;
+        kdx_hot::chaincount::clear_ready(&mut txn)?;
         txn.commit()?;
     }
     {

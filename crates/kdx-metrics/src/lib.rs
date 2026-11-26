@@ -108,6 +108,9 @@ pub struct Metrics {
     /// Optional range files (`file` = sndr | kf) that `range.toml` lists but that are missing
     /// at range open (FIX-2); the range is read without them.
     pub segment_optional_missing: Count,
+    /// User txs counted in the per-chain counters with 0 gas because their `gasPrice` did not
+    /// parse (`mode` = backfill | tail): stock has a price for them, so any is an under-count.
+    pub chain_counters_unpriced: Count,
     /// `kf.fil` files present but not trusted at range open (checksum, header or key count
     /// mismatch); the range is probed as if it had no filter.
     pub key_filter_untrusted: Counter,
@@ -356,6 +359,11 @@ impl Metrics {
             "Optional range files listed in range.toml but missing at open, by file",
             Count::default()
         );
+        let chain_counters_unpriced = reg!(
+            "kdx_chain_counters_unpriced",
+            "User txs added to the per-chain counters with 0 gas (gasPrice did not parse), by mode",
+            Count::default()
+        );
         let key_filter_untrusted = reg!(
             "kdx_key_filter_untrusted",
             "Key filter files not trusted at range open (the range is probed without a filter)",
@@ -419,6 +427,7 @@ impl Metrics {
             alloc_retained_bytes,
             alloc_mapped_bytes,
             segment_optional_missing,
+            chain_counters_unpriced,
             key_filter_untrusted,
             key_filter_bytes,
             sender_index_ready,
@@ -426,6 +435,13 @@ impl Metrics {
     }
 
     // Recording helpers: one place that fixes label names.
+
+    /// `n` user txs added to the per-chain counters with 0 gas (`mode` = backfill | tail).
+    pub fn chain_counters_unpriced(&self, mode: &'static str, n: u64) {
+        self.chain_counters_unpriced
+            .get_or_create(&vec![("mode", mode.to_string())])
+            .inc_by(n);
+    }
 
     /// A listed optional range file (`sndr` | `kf`) was missing at open.
     pub fn segment_optional_missing(&self, file: &'static str) {

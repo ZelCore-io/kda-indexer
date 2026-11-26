@@ -36,6 +36,11 @@ pub fn run(
     let rep = kdx_ingest::row_counts::reconcile(&segdir, &hs, threads, check, &|| false)?;
     tracing::info!(?rep, "reconcile-counts: done");
     println!("{}", serde_json::to_string_pretty(&rep)?);
+    if !check && !rep.chain_counters_ready {
+        tracing::warn!(
+            "reconcile-counts: the chain counters are written but not marked ready (a per-chain gas sum past u128 KDA, or a partial store); countersOfEachChain answers NOT_AVAILABLE"
+        );
+    }
     if !check && !rep.ready {
         anyhow::bail!(
             "{} records do not render: the counts are written but not marked ready (totalCount keeps walking)",

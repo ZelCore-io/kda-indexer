@@ -21,13 +21,19 @@ pub struct NetworkInfo {
 }
 
 /// ZelCore extension `NetworkInfo.countersOfEachChain`. `blocksCount` is the chain's block
-/// count from its genesis height to the stored tip (blocks are dense). The all-time
-/// per-chain user-tx count and gas sum are not kept by the store: `transactionCount` and
-/// `totalGasUsedInKda` answer `null` with `NOT_AVAILABLE` (R7I-6).
+/// count from its genesis height to the stored tip (blocks are dense). `transactionCount`
+/// and `totalGasUsedInKda` come from the stored per-chain counters (`kdx_hot::chaincount`),
+/// read in the same snapshot as the tips: the chain's user txs (coinbase excluded, as
+/// stock) and Σ gas × gasPrice, exact, printed as stock prints its `DECIMAL(20,10)`
+/// column (half-up, exactly 10 decimals, a string). While the counters are not ready
+/// (`reconcile-counts` not run on an older store, or a guard cleared them) both answer
+/// `null` with `NOT_AVAILABLE`.
 #[derive(Debug, Clone)]
 pub struct CountersOfEachChain {
     pub chain: u8,
     pub blocks: u64,
+    /// `None` while the stored counters are not ready.
+    pub counts: Option<kdx_hot::chaincount::Counts>,
 }
 
 #[Object]
@@ -39,17 +45,21 @@ impl CountersOfEachChain {
         self.blocks.min(i32::MAX as u64) as i32
     }
     async fn transaction_count(&self) -> Result<Option<i32>> {
-        Err(not_kept("transactionCount"))
+        let c = self.counts.ok_or_else(|| not_ready("transactionCount"))?;
+        Ok(Some(c.user_txs.min(i32::MAX as u64) as i32))
     }
     async fn total_gas_used_in_kda(&self) -> Result<Option<String>> {
-        Err(not_kept("totalGasUsedInKda"))
+        let c = self.counts.ok_or_else(|| not_ready("totalGasUsedInKda"))?;
+        Ok(Some(c.gas.to_stock_text()))
     }
 }
 
-fn not_kept(field: &str) -> async_graphql::Error {
+fn not_ready(field: &str) -> async_graphql::Error {
     crate::error::err(
         crate::error::Code::NotAvailable,
-        format!("{field}: the store keeps no all-time per-chain counter for it"),
+        format!(
+            "{field}: the per-chain counters are not built yet (`kda-indexer reconcile-counts`)"
+        ),
     )
 }
 
@@ -57,9 +67,22 @@ fn not_kept(field: &str) -> async_graphql::Error {
 impl NetworkInfo {
     /// ZelCore extension: per-chain counters, ascending by chain id.
     async fn counters_of_each_chain(&self, ctx: &Context<'_>) -> Result<Vec<CountersOfEachChain>> {
-        let tips = gql(ctx)
+        let (tips, counts) = gql(ctx)
             .state()?
-            .read_status(super::block::tips_and_genesis)
+            .read_status(|view| {
+                let tips = super::block::tips_and_genesis(view)?;
+                // O(20) reads in the tips' snapshot: never ahead of or behind them.
+                let counts = if kdx_hot::chaincount::ready(&view.txn)? {
+                    let mut m = std::collections::BTreeMap::new();
+                    for &(c, _, _) in &tips {
+                        m.insert(c, kdx_hot::chaincount::get(&view.txn, c)?);
+                    }
+                    Some(m)
+                } else {
+                    None
+                };
+                Ok((tips, counts))
+            })
             .await
             .map_err(from_api)?;
         let mut out: Vec<CountersOfEachChain> = tips
@@ -67,6 +90,9 @@ impl NetworkInfo {
             .map(|(c, g, t)| CountersOfEachChain {
                 chain: c,
                 blocks: (t + 1).saturating_sub(g),
+                counts: counts
+                    .as_ref()
+                    .map(|m| m.get(&c).copied().unwrap_or_default()),
             })
             .collect();
         out.sort_by_key(|x| x.chain);
@@ -137,4 +163,81 @@ pub fn cut_numbers(tips: &[kdx_types::record::BlockRecord]) -> (f64, f64) {
         .sum::<f64>()
         / BLOCK_SECONDS;
     (total, rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_graphql::{EmptyMutation, EmptySubscription, Schema};
+    use kdx_hot::chaincount::{parse_price, Counts};
+
+    struct Q(Vec<CountersOfEachChain>);
+
+    #[Object]
+    impl Q {
+        async fn counters(&self) -> Vec<CountersOfEachChain> {
+            self.0.clone()
+        }
+    }
+
+    async fn run(rows: Vec<CountersOfEachChain>) -> async_graphql::Response {
+        Schema::new(Q(rows), EmptyMutation, EmptySubscription)
+            .execute("{ counters { chainId blocksCount transactionCount totalGasUsedInKda } }")
+            .await
+    }
+
+    /// Stock's live values (2026-11-26) come out with stock's types and text: `Int`, and a
+    /// string with exactly 10 decimals, trailing zeros kept.
+    #[tokio::test]
+    async fn ready_counters_answer_as_stock() {
+        let row = |chain, blocks, txs, gas: &str| CountersOfEachChain {
+            chain,
+            blocks,
+            counts: Some(Counts {
+                user_txs: txs,
+                gas: parse_price(gas).unwrap(),
+            }),
+        };
+        let r = run(vec![
+            row(0, 7_438_327, 189_149_913, "126267.904006390149"),
+            row(18, 6_586_279, 859_255, "205.878216864"),
+            row(19, 1, 0, "0"),
+        ])
+        .await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"counters": [
+                {"chainId": "0", "blocksCount": 7438327, "transactionCount": 189149913,
+                 "totalGasUsedInKda": "126267.9040063901"},
+                {"chainId": "18", "blocksCount": 6586279, "transactionCount": 859255,
+                 "totalGasUsedInKda": "205.8782168640"},
+                {"chainId": "19", "blocksCount": 1, "transactionCount": 0,
+                 "totalGasUsedInKda": "0.0000000000"},
+            ]})
+        );
+    }
+
+    /// Not ready: both fields `null` with `NOT_AVAILABLE`; `blocksCount` still answers.
+    #[tokio::test]
+    async fn unready_counters_answer_not_available() {
+        let r = run(vec![CountersOfEachChain {
+            chain: 3,
+            blocks: 9,
+            counts: None,
+        }])
+        .await;
+        assert_eq!(r.errors.len(), 2, "{:?}", r.errors);
+        for e in &r.errors {
+            assert!(
+                format!("{:?}", e.extensions).contains("NOT_AVAILABLE"),
+                "{e:?}"
+            );
+        }
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(v["counters"][0]["blocksCount"], 9);
+        assert!(v["counters"][0]["transactionCount"].is_null());
+        assert!(v["counters"][0]["totalGasUsedInKda"].is_null());
+    }
 }

@@ -381,6 +381,9 @@ async fn init_partial(ctx: &Ctx, cut: &kdx_node::Cut, h: u32) -> anyhow::Result<
     }
     txn.set_frozen_frontier(h)?;
     txn.set_meta(META_PARTIAL_FROM, &h.to_be_bytes())?;
+    // A store from height h has no all-time per-chain counters: `countersOfEachChain`
+    // answers NOT_AVAILABLE rather than counts that miss heights below h.
+    kdx_hot::chaincount::clear_ready(&mut txn)?;
     txn.set_meta(&dict::lens_key(h), &dict::encode_lens(&d))?;
     txn.commit()?;
     tracing::info!(

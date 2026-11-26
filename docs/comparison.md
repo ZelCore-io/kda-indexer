@@ -248,6 +248,13 @@ The G4 replay of real traffic (below) met most of these classes again; its
 
 ### Intended differences
 
+- `networkInfo.countersOfEachChain.totalGasUsedInKda`: ours is the exact Σ `gas × gasPrice`
+  of each chain's user txs, reduced when a reorg unwinds a block, rounded once to 10
+  decimals. Stock adds float64 (backfill) and `Decimal.toNumber()` (live) terms into a
+  `DECIMAL(20,10)` column, rounding each addition, and never subtracts an orphaned block's
+  gas, so it drifts up. The comparison accepts a relative difference of at most 1e-6 per
+  chain (stock's chain 0 total is about 126,268 KDA: 0.13 KDA). `transactionCount` is
+  compared exactly, less the blocks in flight between the two reads.
 - Event text search covers a bounded recent window; chainweb-data scans further back
   (`event-search-window`). Only whole rows stock lists and kda-indexer does not are explained;
   a row only kda-indexer lists, or a field that differs on a row both sides list, is reported.
@@ -454,7 +461,7 @@ documented difference), **unknown** (not settled yet).
 | 25 | ours' rows read before the queue drained, now equal to the node | 216 | both (transient) | [graphql.md](graphql.md#accounts) |
 | 26 | `lastBlockHeight` +1 and balance tip races | ~30 + 16 | both | [graphql.md](graphql.md#fields-compared-with-the-node-not-an-oracle) |
 | 27 | `__schema` differs; stock-only DEX fields | 4 + 1 (15 + 4) | both | [graphql.md](graphql.md#schema) |
-| 28 | `networkInfo` `coinsInCirculation` / `totalGasUsedInKda` | 2 | both | [graphql.md](graphql.md#zelcore-extensions) |
+| 28 | `networkInfo` `coinsInCirculation` / `totalGasUsedInKda` (`totalGasUsedInKda` is now served exact; stock's float sum agrees within a relative 1e-6, see [Intended differences](#intended-differences)) | 2 | both | [graphql.md](graphql.md#zelcore-extensions) |
 | 29 | `pactQuery` answers `NOT_SUPPORTED` | 26 (97) | both | [graphql.md](graphql.md#schema) |
 | 30 | `blocksFromHeight` with an inverted range | 1 | ours | [graphql.md](graphql.md#blocks-and-network) |
 | 31 | kda-txs pairs a request key with another tx's block, time, code or chain | ~200 | ours (node 24/24) | [api.md](api.md#compat-notes) |

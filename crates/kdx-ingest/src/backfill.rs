@@ -232,6 +232,9 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
         let mut txn = ctx.hot.rw()?;
         // Frozen ranges written outside the freezer: the stored row counts no longer hold.
         kdx_hot::rowcount::clear_ready(&mut txn)?;
+        // A range whose MDBX commit (with its chain counter totals) landed but whose
+        // manifest commit did not is built again: its totals would count twice.
+        kdx_hot::chaincount::clear_ready(&mut txn)?;
         txn.set_frozen_frontier(m.frontier)?;
         txn.set_next_txnum(m.next_txnum)?;
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
@@ -715,6 +718,8 @@ fn build_and_commit(
     }
     let t = Instant::now();
     let mut unindexed = 0u64;
+    // The range's per-chain user-tx and gas totals, added in its MDBX commit.
+    let mut chains = kdx_hot::chaincount::Tally::default();
     let mut w = RangeWriter::create(
         &ctx.segdir,
         &ctx.etl,
@@ -771,6 +776,9 @@ fn build_and_commit(
             }
             let ib = pipeline::index(p, &mut *dict)?;
             unindexed += u64::from(ib.unindexed_accounts);
+            for r in &ib.txs {
+                chains.add(r);
+            }
             w.push(&ib)?;
             prev.insert(c, (h, hd.hash));
         }
@@ -806,16 +814,33 @@ fn build_and_commit(
             set_checkpoint(&mut txn, Stage::Headers, c, h, hash)?;
         }
     }
+    // Review I-2: counters that do not follow this store (a range an older build added
+    // since the last stamp) are cleared before this range moves `next_txnum`, not stamped over.
+    kdx_hot::chaincount::guard(&mut txn)?;
     txn.set_next_txnum(entry.end_txnum())?;
     txn.set_frozen_frontier(entry.end)?;
     // A range written outside the freezer: the stored row counts no longer hold (PR #48).
     kdx_hot::rowcount::clear_ready(&mut txn)?;
+    // The chain counters follow backfill from block 0 (`kdx_hot::chaincount`).
+    kdx_hot::chaincount::add_tally(&mut txn, &chains)?;
+    // Review I-1: a store whose first range starts above height 0 (`backfill --from H` into
+    // a new data dir) has no all-time counters.
+    let first = manifest.entries.first().map_or(entry.start, |e| e.start);
+    if first > 0 {
+        kdx_hot::chaincount::clear_ready(&mut txn)?;
+    }
+    // The totals and the frontier they reach, in one commit (review I-2).
+    kdx_hot::chaincount::stamp_txnum(&mut txn)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
     let tc = Instant::now();
     txn.commit()?;
     kdx_metrics::get()
         .mdbx_commit_seconds
         .observe(tc.elapsed().as_secs_f64());
+    if chains.unpriced > 0 {
+        // Review M-1: counted with 0 gas where stock has a price.
+        kdx_metrics::get().chain_counters_unpriced("backfill", chains.unpriced);
+    }
     debug_abort("hot", u.start);
     manifest.push(entry.clone())?;
     manifest.commit(&ctx.segdir)?;
