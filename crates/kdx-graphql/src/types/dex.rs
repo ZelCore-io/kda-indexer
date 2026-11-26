@@ -60,6 +60,10 @@ fn dex_gate(view: &View) -> ApiResult<Option<&'static str>> {
     ))
 }
 
+/// A gated read: the value with its response marks (pairs capped, prices partial), or the
+/// gate's reason.
+type Gated<T> = Result<(T, (bool, bool)), &'static str>;
+
 /// `tokens` reads the token chain list (`kdx_hot::token_chains`), not the DEX ledger.
 fn tokens_gate(view: &View) -> ApiResult<Option<&'static str>> {
     if kdx_hot::token_chains::ready(&view.txn).map_err(unavailable)? {
@@ -89,25 +93,28 @@ where
 {
     let dl = crate::deadline(ctx);
     let st = crate::gql(ctx).state()?;
-    let go = move |view: &View| -> ApiResult<Result<(T, bool), &'static str>> {
+    let go = move |view: &View| -> ApiResult<Gated<T>> {
         view.check_deadline()?;
         if let Some(why) = gate(view)? {
             return Ok(Err(why));
         }
         let mut b = Budget::new(dl);
         let t = f(view, &mut b)?;
-        Ok(Ok((t, b.capped)))
+        Ok(Ok((t, (b.capped, b.prices_partial))))
     };
     let r = if heavy {
         st.read_heavy(go).await
     } else {
         st.read(go).await
     };
-    let (t, capped) = r
+    let (t, (capped, prices_partial)) = r
         .map_err(crate::error::from_api)?
         .map_err(|why| crate::error::err(crate::error::Code::NotAvailable, why))?;
     if capped {
         crate::flags::mark(ctx, crate::flags::Flag::DexPairsCapped);
+    }
+    if prices_partial {
+        crate::flags::mark(ctx, crate::flags::Flag::DexPricesPartial);
     }
     Ok(t)
 }

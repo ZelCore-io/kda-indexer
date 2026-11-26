@@ -543,12 +543,20 @@ async fn follow(
 /// First wait after a one-off fill fails; it doubles per failure up to [`FILL_RETRY_MAX`].
 const FILL_RETRY_FIRST: Duration = Duration::from_secs(30);
 const FILL_RETRY_MAX: Duration = Duration::from_secs(3_600);
+/// Longest one attempt of a one-off fill may run before it is told to stop and counted as a
+/// failure (`kdx_fill_timeouts`). Generous: a full mainnet history fill takes hours, and
+/// each fill resumes where the stopped attempt left it.
+const FILL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(24 * 3_600);
 
 /// Run a one-off fill until it succeeds or `stop`. A failure (an error or a panic) is logged,
 /// counted (`kdx_fill_failures`, `kdx_fill_failed` = 1), recorded in `Meta fill_failed/<name>`
 /// (readers then answer "fill failed" rather than "being filled") and retried after
 /// [`FILL_RETRY_FIRST`], doubling to [`FILL_RETRY_MAX`]: a transient error heals without a
 /// restart, and a deterministic one stays visible instead of leaving the gate shut silently.
+/// An attempt that runs past [`FILL_ATTEMPT_TIMEOUT`] is logged and counted at once, told to
+/// stop (its own stop flag), and, once it has returned, recorded as failed and retried. A fill
+/// stuck where it never checks its stop flag is reported but cannot be replaced (a blocking
+/// thread cannot be killed, and two attempts must not run at once).
 async fn supervise_fill(
     ctx: Arc<Ctx>,
     name: &'static str,
@@ -557,11 +565,32 @@ async fn supervise_fill(
 ) {
     let mut wait = FILL_RETRY_FIRST;
     loop {
-        let (c, s) = (ctx.clone(), stop.clone());
-        let err = match tokio::task::spawn_blocking(move || f(&c, &|| s.is_cancelled())).await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(format!("{e:#}")),
-            Err(e) => Some(format!("fill task: {e}")),
+        let attempt = stop.child_token();
+        let (c, s) = (ctx.clone(), attempt.clone());
+        let mut h = tokio::task::spawn_blocking(move || f(&c, &|| s.is_cancelled()));
+        let joined = match tokio::time::timeout(FILL_ATTEMPT_TIMEOUT, &mut h).await {
+            Ok(r) => Some(r),
+            Err(_) => {
+                kdx_metrics::get().fill_timeout(name);
+                tracing::error!(
+                    fill = name,
+                    timeout_secs = FILL_ATTEMPT_TIMEOUT.as_secs(),
+                    "fill attempt timed out; stopping it"
+                );
+                attempt.cancel();
+                // Whatever it returns after the stop (an early Ok included) is a failure.
+                let _ = h.await;
+                None
+            }
+        };
+        let err = match joined {
+            None => Some(format!(
+                "attempt timed out after {} s",
+                FILL_ATTEMPT_TIMEOUT.as_secs()
+            )),
+            Some(Ok(Ok(()))) => None,
+            Some(Ok(Err(e))) => Some(format!("{e:#}")),
+            Some(Err(e)) => Some(format!("fill task: {e}")),
         };
         let ok = err.is_none();
         if !ok && stop.is_cancelled() {
@@ -633,12 +662,12 @@ fn dex_fill(c: &Ctx, stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
 
 /// The token chain list of a store an older build wrote (`kdx_hot::token_chains`): built
 /// from `Holders` in one write txn (one seek per module and chain), no manual step.
-fn token_chains_fill(c: &Ctx, _stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
-    if kdx_hot::token_chains::marker_set(&c.hot.ro()?)? {
+fn token_chains_fill(c: &Ctx, stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
+    if stop() || kdx_hot::token_chains::marker_set(&c.hot.ro()?)? {
         return Ok(());
     }
     let mut w = c.hot.rw()?;
-    let n = kdx_hot::token_chains::fill(&mut w)?;
+    let n = kdx_hot::token_chains::fill(&mut w, stop)?;
     w.commit()?;
     tracing::info!(
         module_chains = n,

@@ -12,6 +12,9 @@
 //! - `dexPairsCapped: true`: a DEX listing (`pools`, `dexMetrics`, `liquidityPositions`,
 //!   `tokenPrices`) had more listable pairs than `dexserve::MAX_PAIRS` and served the ones
 //!   with the largest coin reserve.
+//! - `dexPricesPartial: true`: a `tokenPrice` or `tokenPrices` price search ran out of its row
+//!   budget or the request deadline; the tokens it could not finish answer 0 (stock's answer
+//!   with no path), so a 0 in such a response may be a real price left unsearched.
 //!
 //! One [`RespFlags`] per request (an extension instance is created per request), so the
 //! requests of a batch are flagged separately. Subscription events carry no flags.
@@ -31,6 +34,7 @@ pub struct RespFlags {
     key_accounts_truncated: AtomicBool,
     node_read_incomplete: AtomicBool,
     dex_pairs_capped: AtomicBool,
+    dex_prices_partial: AtomicBool,
 }
 
 /// Which mark to set.
@@ -42,6 +46,8 @@ pub enum Flag {
     NodeReadIncomplete,
     /// A DEX listing served `dexserve::MAX_PAIRS` of more listable pairs.
     DexPairsCapped,
+    /// A DEX price search was cut by the budget or deadline (some prices answer 0).
+    DexPricesPartial,
 }
 
 impl RespFlags {
@@ -51,6 +57,7 @@ impl RespFlags {
             Flag::KeyAccountsTruncated => &self.key_accounts_truncated,
             Flag::NodeReadIncomplete => &self.node_read_incomplete,
             Flag::DexPairsCapped => &self.dex_pairs_capped,
+            Flag::DexPricesPartial => &self.dex_prices_partial,
         }
     }
     pub fn is_set(&self, f: Flag) -> bool {
@@ -104,6 +111,7 @@ impl Extension for FlagsExt {
             (Flag::KeyAccountsTruncated, "truncated"),
             (Flag::NodeReadIncomplete, "nodeReadIncomplete"),
             (Flag::DexPairsCapped, "dexPairsCapped"),
+            (Flag::DexPricesPartial, "dexPricesPartial"),
         ] {
             if self.0.is_set(f) {
                 r.extensions.insert(name.to_owned(), Value::Boolean(true));

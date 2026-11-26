@@ -1001,7 +1001,19 @@ async fn a_spent_price_search_is_no_path() {
         format!("{:?}", p.price_in_kda).contains("text: \"0\""),
         "{p:?}"
     );
-    // With room it finds the path.
+    // The 0 is flagged (`extensions.dexPricesPartial`), not silent.
+    assert!(b.prices_partial);
+    // A spent deadline is flagged the same way.
+    let mut b = Budget::new(Instant::now());
+    let p = dexserve::token_price(&ro, now(), "free.x", dexserve::DEFAULT_PROTOCOL, &mut b)
+        .unwrap()
+        .unwrap();
+    assert!(
+        format!("{:?}", p.price_in_kda).contains("text: \"0\""),
+        "{p:?}"
+    );
+    assert!(b.prices_partial);
+    // With room it finds the path, unflagged.
     let mut b = Budget::new(Instant::now() + Duration::from_secs(30));
     let p = dexserve::token_price(&ro, now(), "free.x", dexserve::DEFAULT_PROTOCOL, &mut b)
         .unwrap()
@@ -1010,4 +1022,5 @@ async fn a_spent_price_search_is_no_path() {
         !format!("{:?}", p.price_in_kda).contains("text: \"0\""),
         "{p:?}"
     );
+    assert!(!b.prices_partial);
 }

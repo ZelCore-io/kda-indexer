@@ -940,9 +940,14 @@ ranks per request, so a reserve change between two pages can move a pool across 
 boundary. Token prices follow stock's path search with its 3-hop limit (a direct `coin` pair
 is checked first at each token; with zero reserves it prices at 0, as stock), reading up to
 1,024 pairs per token (the oldest `CREATE_PAIR`s: a token with more pairs than that has its
-newer ones left out), ranked by that token's own reserve (a coin pair never funded is not
-read), expanding the top 256 and visiting at most 2,048 tokens. A search that spends the
-field's row budget or deadline answers no path (price 0, stock's answer with no path). Every
+newer ones left out; `kdx_dex_ranked_neighbors_capped_total` counts it), ranked by that token's
+own reserve (a coin pair never funded is not read), expanding the top 256 and visiting at most
+2,048 tokens. A search that spends the field's row budget or deadline answers no path (price 0,
+stock's answer with no path) and the response carries
+`"extensions": {"dexPricesPartial": true}`: a 0 in such a response may be a price that was not
+searched. `tokenPrices` gives its price searches a row budget of their own (250,000 more rows;
+the request deadline is shared), so a listing that spent its rows on the capped walk does not
+zero every price after it. Every
 DEX field answers `NOT_AVAILABLE` until the DEX history fill has finished; while that fill
 fails and retries (with backoff; `kdx_fill_failed{fill="dex"}` = 1, `Meta fill_failed/dex`)
 the message says so. `tokens` reads the token chain list (`kdx_hot::token_chains`, kept with

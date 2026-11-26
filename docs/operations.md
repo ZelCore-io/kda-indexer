@@ -371,6 +371,13 @@ systemctl start kda-indexer-<network>
 - Since the whole-branch security pass, the holder sides follow stock's amount check too
   (a number, `{decimal: "<s>"}`, `{integer: "<s>"}`) and any truthy marmalade token id; a
   store built earlier needs one `reconcile-holders` (or the reindex) to match.
+- The token chain list (`TokenChains`, read by `tokens`) is kept in the same txn as every
+  `Holders` write, and a store an older build wrote gets it from one `run` (a seek per
+  module and chain, seconds; `Meta token_chains_ready` is set when done). **Downgrade:** a
+  build older than the list updates `Holders` without it, so after running such a build on
+  a store this build already marked, the list goes stale while the marker stays set. Before
+  starting this build again, either delete `Meta token_chains_ready` (the next `run` rebuilds
+  the list from `Holders`), or run `reconcile-holders`, which rebuilds both tables together.
 - A store whose table was built before PR #54's fix round (suffix `*TRANSFER` names, no
   marmalade rows, accounts at most 256 bytes) needs one `reconcile-holders` to match the new
   rule; on such a store, names longer than 256 bytes that were never interned stay out until
@@ -524,6 +531,8 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_read_view_seconds` | phase (open, held) |
 | `kdx_merkle_blocks_total` | result (verified, mismatch_legacy, mismatch) |
 | `kdx_chain_counters_unpriced_total` | mode (backfill, tail): user txs added to `countersOfEachChain` with 0 gas because their `gasPrice` did not parse |
+| `kdx_fill_failures_total`, `kdx_fill_failed`, `kdx_fill_timeouts_total` | fill (prices, dex, token_chains): failed attempts of a one-off fill (retried with backoff), 1 while the last attempt failed, attempts stopped by the 24 h per-attempt timeout |
+| `kdx_dex_ranked_neighbors_capped_total` | price searches that ranked only the oldest 1,024 pairs of a token with more |
 
 Alerts to set up in your own alerting:
 

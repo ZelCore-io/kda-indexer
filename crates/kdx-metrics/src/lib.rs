@@ -117,6 +117,12 @@ pub struct Metrics {
     pub chain_counters_unpriced: Count,
     /// Failed attempts of the swap history fill (each is retried; secpass A I-3).
     pub price_fill_failures: Counter,
+    /// DEX price searches that read `MAX_RANKED_NEIGHBORS` pairs of one token and left its
+    /// newer pairs out of the ranking.
+    pub dex_ranked_neighbors_capped: Counter,
+    /// One-off fill attempts stopped by the per-attempt timeout (counted per fill in
+    /// `kdx_fill_failures` too).
+    pub fill_timeouts: Count,
     /// `kf.fil` files present but not trusted at range open (checksum, header or key count
     /// mismatch); the range is probed as if it had no filter.
     pub key_filter_untrusted: Counter,
@@ -380,6 +386,16 @@ impl Metrics {
             "Failed attempts of the swap history fill (retried; lastTokenPriceInKda is NOT_AVAILABLE until it finishes)",
             Counter::default()
         );
+        let dex_ranked_neighbors_capped = reg!(
+            "kdx_dex_ranked_neighbors_capped",
+            "DEX price searches that ranked only the oldest dexserve::MAX_RANKED_NEIGHBORS pairs of a token with more",
+            Counter::default()
+        );
+        let fill_timeouts = reg!(
+            "kdx_fill_timeouts",
+            "One-off fill attempts that hit the per-attempt timeout, by fill",
+            Count::default()
+        );
         let chain_counters_unpriced = reg!(
             "kdx_chain_counters_unpriced",
             "User txs added to the per-chain counters with 0 gas (gasPrice did not parse), by mode; mode=unwind counts their removal, so backfill + tail - unwind is the net stored",
@@ -452,6 +468,8 @@ impl Metrics {
             segment_optional_missing,
             chain_counters_unpriced,
             price_fill_failures,
+            dex_ranked_neighbors_capped,
+            fill_timeouts,
             key_filter_untrusted,
             key_filter_bytes,
             sender_index_ready,
@@ -522,6 +540,12 @@ impl Metrics {
             }
         }
         self.fill_failed.get_or_create(&l).set(i64::from(!ok));
+    }
+
+    /// A one-off fill attempt hit its timeout (its failure is counted by [`Self::fill`]).
+    pub fn fill_timeout(&self, fill: &'static str) {
+        let l: Labels = vec![("fill", fill.into())];
+        self.fill_timeouts.get_or_create(&l).inc();
     }
 
     pub fn freezer(&self, op: &'static str, secs: f64) {

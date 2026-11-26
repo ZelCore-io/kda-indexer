@@ -99,6 +99,9 @@ pub struct Budget {
     /// A listing had more than [`MAX_PAIRS`] listable pairs and served the largest: the
     /// resolver flags the response (never a silent partial list).
     pub capped: bool,
+    /// A price search ran out of the budget or the deadline and answered no path (price 0)
+    /// for a token it did not finish: the resolver flags `extensions.dexPricesPartial`.
+    pub prices_partial: bool,
 }
 
 impl Budget {
@@ -114,6 +117,7 @@ impl Budget {
             max,
             out: false,
             capped: false,
+            prices_partial: false,
         }
     }
 
@@ -1454,10 +1458,14 @@ impl<T: Txn> PriceSearch<'_, T> {
     /// hide it (then the token prices at 0, as stock prices a token with no path).
     ///
     /// A search that spends the field's row budget or deadline answers no path (`None`: price
-    /// 0, stock's answer with no path) rather than an error.
+    /// 0, stock's answer with no path) rather than an error, and marks
+    /// [`Budget::prices_partial`] so the response says some prices were not searched.
     fn price_in_kda(&mut self, token: &str, b: &mut Budget) -> ApiResult<Option<Dec>> {
         match self.search(token, b) {
-            Err(ApiError::Deadline) => Ok(None),
+            Err(ApiError::Deadline) => {
+                b.prices_partial = true;
+                Ok(None)
+            }
             r => r,
         }
     }
@@ -1481,16 +1489,24 @@ impl<T: Txn> PriceSearch<'_, T> {
                 continue;
             }
             let mut names = HashSet::new();
+            let mut ranked_capped = false;
             hd::token_pairs(self.txn, &t, |pair| {
-                if b.tick() && names.len() < MAX_RANKED_NEIGHBORS {
+                if !b.tick() {
+                    return false;
+                }
+                if names.len() < MAX_RANKED_NEIGHBORS {
                     names.insert(pair.to_owned());
                     true
                 } else {
+                    ranked_capped = true;
                     false
                 }
             })
             .map_err(api)?;
             b.check()?;
+            if ranked_capped {
+                kdx_metrics::get().dex_ranked_neighbors_capped.inc();
+            }
             // Rank by this token's own reserve (one read each), so dust pairs spammed onto a
             // token cannot crowd its real pairs out of the expansion; ties by pair key.
             let mut ranked: Vec<(Dec, String)> = Vec::with_capacity(names.len());
@@ -1609,6 +1625,9 @@ pub fn token_prices(
         return Ok(Vec::new());
     }
     let pairs = listable(txn, b)?;
+    // The price searches get their own row budget (the request deadline still bounds them):
+    // a listing that spent the rows on a capped walk does not zero every price after it.
+    let mut pb = Budget::with_rows(b.dl, b.max);
     let rate = dex_usd::latest(txn).map_err(api)?.map(|r| r.1);
     let mut names: Vec<&str> = pairs
         .iter()
@@ -1622,9 +1641,10 @@ pub fn token_prices(
     };
     let mut out = Vec::with_capacity(names.len());
     for n in names {
-        let kda = ps.price_in_kda(n, b)?;
+        let kda = ps.price_in_kda(n, &mut pb)?;
         out.push(price_node(kda, n, protocol, rate.as_ref(), now));
     }
+    b.prices_partial |= pb.prices_partial;
     Ok(out)
 }
 

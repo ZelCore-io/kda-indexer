@@ -148,12 +148,20 @@ pub fn clear(txn: &mut RwTxn<'_>) -> Result<()> {
 
 /// Build the table from `Holders` in `txn` and set the marker: one seek per `(module, chain)`
 /// that has holders (the walk skips past each prefix). Returns the `(module, chain)` count.
-pub fn fill(txn: &mut RwTxn<'_>) -> Result<u64> {
+/// `stop` is checked every 1,024 seeks; a stop is an error and the caller drops the txn.
+pub fn fill(txn: &mut RwTxn<'_>, stop: &dyn Fn() -> bool) -> Result<u64> {
     clear(txn)?;
     let mut rows: BTreeMap<u32, ChainsRow> = BTreeMap::new();
     let mut from: Vec<u8> = Vec::new();
     let mut n = 0u64;
+    let mut seeks = 0u64;
     loop {
+        seeks += 1;
+        if seeks.is_multiple_of(1_024) && stop() {
+            anyhow::bail!(
+                "token chain list fill stopped (the txn is dropped; the next run redoes it)"
+            );
+        }
         let Some(h) = txn
             .scan_limit(Table::Holders, &from, 1, |_| true)?
             .first()
@@ -250,10 +258,21 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(64))]
         /// Any sequence of the `Holders` writers (touch in any order, undo of any tx) leaves
         /// `TokenChains` equal to what the `Holders` rows give, after every step; a fill from
-        /// the final `Holders` gives the same table.
+        /// the final `Holders` gives the same table. Chains at and past [`MAX_CHAINS`] have
+        /// `Holders` rows but no bit (skipped by every writer, `derive` and `fill`).
         #[test]
         fn follows_holders_under_apply_and_unwind(
-            ops in prop::collection::vec((0u8..4, 1u32..5, 1u32..3, 0u8..3, 0u32..6, 0u16..3), 1..80)
+            ops in prop::collection::vec(
+                (
+                    0u8..4,
+                    1u32..5,
+                    1u32..3,
+                    prop::sample::select(vec![0u8, 1, 2, MAX_CHAINS - 1, MAX_CHAINS, 40]),
+                    0u32..6,
+                    0u16..3,
+                ),
+                1..80,
+            )
         ) {
             let dir = tempfile::tempdir().unwrap();
             let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
@@ -270,7 +289,7 @@ mod tests {
             }
             let mut txn = hot.rw().unwrap();
             let before = read_all(&txn, || true).unwrap();
-            fill(&mut txn).unwrap();
+            fill(&mut txn, &|| false).unwrap();
             prop_assert_eq!(read_all(&txn, || true).unwrap(), before);
         }
     }
@@ -304,7 +323,7 @@ mod tests {
         txn.clear(Table::TokenChains).unwrap();
         txn.del(Table::Meta, READY.as_bytes()).unwrap();
         assert!(!ready(&txn).unwrap());
-        assert_eq!(fill(&mut txn).unwrap(), 3);
+        assert_eq!(fill(&mut txn, &|| false).unwrap(), 3);
         check(&txn);
         assert!(ready(&txn).unwrap());
         let r = row(&txn, 3).unwrap().unwrap();
