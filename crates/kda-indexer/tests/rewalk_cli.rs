@@ -8,7 +8,7 @@ use kda_indexer::config::Config;
 use kdx_decode::Family;
 use kdx_hot::balances::{self, bal_key};
 use kdx_hot::{HotDict, HotStore, Table, Txn};
-use kdx_types::{DictKind, DictMut, TxKey};
+use kdx_types::{Dict, DictKind, DictMut, TxKey};
 
 fn cfg() -> Config {
     Config::load(std::path::Path::new(concat!(
@@ -30,7 +30,7 @@ fn names(v: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn rewalk_marks_queues_and_refuses_coin_unknown_and_a_held_lock() {
+fn rewalk_marks_queues_and_refuses_unknown_and_a_held_lock() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(kdx_ingest::ctx::segments_dir(dir.path())).unwrap();
     let hot_dir = kda_indexer::cmd::hot::hot_dir(dir.path());
@@ -38,13 +38,14 @@ fn rewalk_marks_queues_and_refuses_coin_unknown_and_a_held_lock() {
         let hs = HotStore::open(&hot_dir, kda_indexer::cmd::hot::geometry(&cfg())).unwrap();
         let mut txn = hs.rw().unwrap();
         let mut dict = HotDict::load(&txn).unwrap();
-        dict.intern(DictKind::Module, "coin");
+        let coin = dict.intern(DictKind::Module, "coin");
         let wiza = dict.intern(DictKind::Module, "free.wiza");
         let other = dict.intern(DictKind::Module, "free.other");
         let alice = dict.intern(DictKind::Account, "alice");
         let bob = dict.intern(DictKind::Account, "bob");
         dict.persist(&mut txn).unwrap();
         for k in [
+            posting(bob, coin, 3),
             posting(alice, wiza, 1),
             posting(bob, wiza, 2),
             posting(alice, other, 0),
@@ -69,9 +70,6 @@ fn rewalk_marks_queues_and_refuses_coin_unknown_and_a_held_lock() {
     let err = rewalk(&cfg(), dir.path(), &names(&["free.wiza", "free.nope"])).unwrap_err();
     assert!(format!("{err:#}").contains("unknown module"), "{err:#}");
     untouched("unknown name");
-    let err = rewalk(&cfg(), dir.path(), &names(&["free.wiza", " coin"])).unwrap_err();
-    assert!(format!("{err:#}").contains("coin"), "{err:#}");
-    untouched("coin");
 
     let out = rewalk(&cfg(), dir.path(), &names(&["free.wiza"])).unwrap();
     assert_eq!(out["posting_rows_marked"], 2, "{out}");
@@ -99,6 +97,23 @@ fn rewalk_marks_queues_and_refuses_coin_unknown_and_a_held_lock() {
     let again = rewalk(&cfg(), dir.path(), &names(&["free.wiza", "free.wiza"])).unwrap();
     assert_eq!(again["posting_rows_marked"], 0, "{again}");
     assert_eq!(again["rewalk_pending"], 1, "{again}");
+    {
+        let hs = HotStore::open_ro(&hot_dir).unwrap();
+        assert_eq!(balances::dirty_count(&hs.ro().unwrap()).unwrap(), 2);
+    }
+
+    // `coin` (zero rows gap Q): only its history walk is queued; its posting holders are not
+    // marked (N-6).
+    let out = rewalk(&cfg(), dir.path(), &names(&["coin"])).unwrap();
+    assert_eq!(out["posting_rows_marked"], 0, "{out}");
+    assert_eq!(out["rewalk_queued"], 1, "{out}");
+    assert_eq!(out["rewalk_pending"], 2, "{out}");
     let hs = HotStore::open_ro(&hot_dir).unwrap();
-    assert_eq!(balances::dirty_count(&hs.ro().unwrap()).unwrap(), 2);
+    let txn = hs.ro().unwrap();
+    assert_eq!(balances::dirty_count(&txn).unwrap(), 2);
+    let coin = HotDict::load(&txn)
+        .unwrap()
+        .find(DictKind::Module, "coin")
+        .unwrap();
+    assert!(balances::rewalk_pending(&txn).unwrap().contains(&coin));
 }

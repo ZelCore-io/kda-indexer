@@ -130,19 +130,19 @@ pub async fn run(cfg: &Config, data_dir: &Path, mode: Mode) -> anyhow::Result<()
 }
 
 /// `--rewalk`: under the data-dir lock, mark every row the listed modules' `xfer` postings
-/// name and queue their D3 history walk now. `coin` and unknown names are refused before
-/// anything is written. Returns the JSON report the command prints.
+/// name and queue their D3 history walk now. Unknown names are refused before anything is
+/// written. `coin` queues only its history walk from the events fork (rule 2c: accounts
+/// `coin.create-account` made, never funded, that no event names; zero rows gap Q); its
+/// posting holders are not marked (N-6: millions; the tail and `--seed`/`--all` keep them).
+/// Returns the JSON report the command prints.
 pub fn rewalk(cfg: &Config, data_dir: &Path, names: &[String]) -> anyhow::Result<Value> {
-    // N-6: `coin` would mark every coin holder (millions) into the seed backlog; its rows are
-    // kept by the tail and `--seed`/`--all`, not by the token walk.
-    if names.iter().any(|n| n.trim() == "coin") {
-        anyhow::bail!("--rewalk does not take coin (use --seed or --all)");
-    }
     let _lock = super::lock_data_dir(data_dir)?;
     let hs = HotStore::open(&super::hot::hot_dir(data_dir), super::hot::geometry(cfg))?;
     let segdir = kdx_ingest::ctx::segments_dir(data_dir);
     let ids = module_ids(&hs, names)?;
-    let set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+    let coin = kdx_hot::balances::coin_module(&hs.ro()?)?;
+    let set: std::collections::HashSet<u32> =
+        ids.iter().copied().filter(|m| Some(*m) != coin).collect();
     let rep = kdx_ingest::seed::mark_modules(&hs, &segdir, &set, &|| false)?;
     let mut txn = hs.rw()?;
     let restarted = kdx_hot::balances::queue_rewalk(&mut txn, &ids)?;

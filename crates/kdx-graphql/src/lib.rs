@@ -98,6 +98,9 @@ pub struct GraphqlSettings {
     /// Keys a `last`/`before` page of a source with no oldest-first walk may collect between
     /// its cursor and the newest end ([`txlist::BACK_KEYS`]; tests lower it).
     pub back_keys: usize,
+    /// Transfer keys `balance(...)` reads per (account, module) to decide which zero rows a
+    /// TRANSFER touched ([`types::account::BALANCE_TOUCH_KEYS`]; tests lower it).
+    pub balance_touch_keys: usize,
 }
 
 /// Hard safety cap of the rows of one list page (`first`/`last`), of a subscription's
@@ -146,6 +149,7 @@ impl Default for GraphqlSettings {
             apq: false,
             count_budget: Duration::from_millis(200),
             back_keys: txlist::BACK_KEYS,
+            balance_touch_keys: types::account::BALANCE_TOUCH_KEYS,
         }
     }
 }

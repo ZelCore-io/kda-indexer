@@ -1359,6 +1359,8 @@ pub struct HistoryStep {
 ///
 /// A walk that begins (`next` 0, not in the hot part) starts at the frozen TxNum of
 /// [`walk_start_height`] instead of 0: no tx below a module's deploy can name it successfully.
+/// A walk of `coin` (`reconcile-balances --rewalk coin`, zero rows gap Q) begins at the events
+/// fork: below it the first pass already counted every exec string for coin.
 pub fn history_begin(
     hot: &HotStore,
     dict: &Mutex<HotDict>,
@@ -1406,7 +1408,8 @@ pub fn history_begin(
         .ids
         .iter()
         .filter_map(|id| snap.name(DictKind::Module, *id).map(str::to_owned))
-        .filter(|m| tokens.contains(m))
+        // `coin` (`--rewalk coin`, zero rows gap Q) is always fungible.
+        .filter(|m| tokens.contains(m) || m == COIN)
         .collect();
     if st.next == 0 && !st.hot && !names.is_empty() {
         let txn = hot.ro()?;
@@ -1422,7 +1425,16 @@ pub fn history_begin(
         }
         drop(txn);
         let data_dir = segdir.parent().unwrap_or(segdir);
-        let height = walk_start_height(&kdx_search::search_dir(data_dir), &mods);
+        // Coin's only rule a walk can add is 2c (`coin.create-account`), which the first pass
+        // already applied below the events fork (rule 2 for coin): its walk begins there.
+        mods.retain(|(m, _)| m != COIN);
+        let coin_floor = names.contains(COIN).then_some(o.forks.events);
+        let height = if mods.is_empty() {
+            coin_floor
+        } else {
+            walk_start_height(&kdx_search::search_dir(data_dir), &mods)
+                .map(|h| coin_floor.map_or(h, |c| h.min(c)))
+        };
         let segs = Segments::open_without_filters(segdir, snap.clone())?;
         st.next = height.map_or(0, |h| frozen_start(&segs, h));
         tracing::info!(tokens = ?names, start_height = ?height, start_txnum = st.next,
@@ -1439,6 +1451,9 @@ pub fn history_begin(
         st,
     }))
 }
+
+/// The coin module's name.
+const COIN: &str = "coin";
 
 /// Wall-clock budget of one deploy lookup in the code search index.
 const DEPLOY_LOOKUP_SECS: u64 = 30;

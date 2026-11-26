@@ -86,6 +86,9 @@ pub struct Metrics {
     pub graphql_requests: Count,
     /// GraphQL refusals by limit (`reason` = depth | complexity | batch | query_size | ...).
     pub graphql_rejected: Count,
+    /// `balance(...)` rows at 0 listed because the transfer probe hit its key cap before it
+    /// could tell whether a TRANSFER touched them (kept, the safe side).
+    pub graphql_balance_touch_capped: Counter,
     /// Open GraphQL subscriptions.
     pub graphql_subscriptions: Gauge,
     /// Age of the newest block the subscription feed has seen.
@@ -289,6 +292,11 @@ impl Metrics {
             "GraphQL requests refused by a limit (reason)",
             Count::default()
         );
+        let graphql_balance_touch_capped = reg!(
+            "kdx_graphql_balance_touch_capped",
+            "balance() zero rows kept unchecked because the transfer probe hit its key cap",
+            Counter::default()
+        );
         let graphql_subscriptions = reg!(
             "kdx_graphql_subscriptions",
             "Open GraphQL subscriptions",
@@ -391,6 +399,7 @@ impl Metrics {
             balance_reconcile_seconds,
             graphql_requests,
             graphql_rejected,
+            graphql_balance_touch_capped,
             graphql_subscriptions,
             graphql_feed_lag_seconds,
             graphql_feed_ring_bytes,

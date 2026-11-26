@@ -980,3 +980,85 @@ fn many_names_in_one_call_do_not_copy_its_strings_per_name() {
     }
     assert_eq!(r.modref_capped, 64 - 15);
 }
+
+/// Zero rows (owner ruling 2026-11-26, gap Q): `coin.create-account` after the events fork
+/// writes a row at 0 and emits no event naming the account (only the gas TRANSFER of the
+/// payer), so no posting reaches it. The exec's strings count for coin (mainnet chain 0,
+/// height 2,273,485 shape; account name replaced), so the created row is read and stored.
+#[test]
+fn a_coin_create_account_after_the_events_fork_names_its_account() {
+    let cmd = json!({"payload": {"exec": {"data": {"ks": {"keys": [R1], "pred": "keys-all"}},
+        "code": format!("(coin.create-account \"{R2}\" (read-keyset \"ks\"))")}},
+        "meta": {"sender": SRC}});
+    let gas = ev("coin", "TRANSFER", json!([SRC, "k:miner", 2.41e-6]));
+    let o = out(json!("Write succeeded"), json!([gas]), Value::Null);
+    for h in [1_138_000, 2_273_485, 7_000_000] {
+        let r = token_receivers(Some(&cmd), &o, h, MAINNET01, &tokens);
+        let p = pairs(&r.pairs);
+        assert!(p.contains(&(R2, "coin")), "{h}: {p:?}");
+    }
+    // A literal that only mentions the call is data, not a call: nothing for coin.
+    let cmd = json!({"payload": {"exec": {"data": null,
+        "code": format!("(free.memo.note \"coin.create-account\" \"{R2}\")")}}});
+    let r = token_receivers(Some(&cmd), &o, 2_273_485, MAINNET01, &tokens);
+    assert!(
+        !pairs(&r.pairs).iter().any(|(_, m)| *m == "coin"),
+        "{:?}",
+        r.pairs
+    );
+    // Another coin call after the fork still gives nothing from the exec (its credits have
+    // events).
+    let cmd = json!({"payload": {"exec": {"data": null,
+        "code": format!("(coin.rotate \"{R2}\" (read-keyset \"ks\"))")}}});
+    let r = token_receivers(Some(&cmd), &o, 2_273_485, MAINNET01, &tokens);
+    assert!(
+        !pairs(&r.pairs).iter().any(|(_, m)| *m == "coin"),
+        "{:?}",
+        r.pairs
+    );
+}
+
+/// PR #47 review minor 1: rule 2c never marks `result.data` strings (`Write succeeded`) or a
+/// keyset's predicate (`keys-all`, in data or code): they are never accounts.
+#[test]
+fn a_coin_create_account_marks_no_result_text_or_keyset_predicate() {
+    let cmd = json!({"payload": {"exec": {"data": {"ks": {"keys": [R1], "pred": "keys-any"}},
+        "code": format!("(coin.create-account \"{R2}\" (read-keyset \"ks\")) (free.x.f \"keys-all\")")}},
+        "meta": {"sender": SRC}});
+    let gas = ev("coin", "TRANSFER", json!([SRC, "k:miner", 2.41e-6]));
+    let o = out(json!("Write succeeded"), json!([gas]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 2_273_485, MAINNET01, &tokens);
+    let p = pairs(&r.pairs);
+    assert!(p.contains(&(R2, "coin")), "{p:?}");
+    assert!(
+        p.contains(&(R1, "coin")),
+        "a keyset's key may be an account: {p:?}"
+    );
+    for s in ["Write succeeded", "keys-all", "keys-any"] {
+        assert!(!p.contains(&(s, "coin")), "{s}: {p:?}");
+    }
+}
+
+/// PR #47 review minor 2: rule 2c reads the code literals before the data strings, so a batch
+/// create-account whose data holds more keys than the cap still marks every account named in
+/// the code.
+#[test]
+fn a_batch_coin_create_account_marks_its_accounts_before_the_cap() {
+    let keys: Vec<String> = (0..80).map(|i| format!("{i:064x}")).collect();
+    let accounts: Vec<String> = (0..5).map(|i| format!("k:batch-account-{i}")).collect();
+    let code: String = accounts
+        .iter()
+        .map(|a| format!("(coin.create-account \"{a}\" (read-keyset \"ks\"))"))
+        .collect();
+    let cmd = json!({"payload": {"exec": {"data": {"ks": {"keys": keys, "pred": "keys-all"}},
+        "code": code}}, "meta": {"sender": SRC}});
+    let gas = ev("coin", "TRANSFER", json!([SRC, "k:miner", 2.41e-6]));
+    let o = out(json!("Write succeeded"), json!([gas]), Value::Null);
+    let r = token_receivers(Some(&cmd), &o, 2_273_485, MAINNET01, &tokens);
+    let p = pairs(&r.pairs);
+    for a in &accounts {
+        assert!(p.contains(&(a.as_str(), "coin")), "{a}: {p:?}");
+    }
+    let coin_rows = p.iter().filter(|(_, m)| *m == "coin").count();
+    assert!(coin_rows <= 64 + 1, "capped: {coin_rows}");
+}

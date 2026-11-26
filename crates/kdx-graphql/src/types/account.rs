@@ -2,16 +2,20 @@
 //! `KeyAccounts` rows. Resolvers never call the node.
 //!
 //! - Rows marked stale are served; a chain with no row (or a row the node reported absent)
-//!   is missing from `chainAccounts`, and so is a row at 0; with no row on any chain the
-//!   account is `null`. An account whose rows are all at 0 still resolves (empty
-//!   `chainAccounts`, `totalBalance` 0), so its history stays reachable.
+//!   is missing from `chainAccounts`; with no row on any chain the account is `null`. A row
+//!   that exists on chain is listed at any balance, 0 included, as stock lists it (owner
+//!   ruling 2026-11-26: a row created and never funded, or funded and drained, is listed).
 //! - Rows of a module marked not fungible are never served (as native).
 //! - `…ByPublicKey` lists only rows whose guard holds the key, of `coin` (the default
 //!   `fungibleName`, SEC-2) or of a module confirmed `fungible-v2` on the row's chain (I-6).
 //!   At most [`MAX_KEY_ACCOUNTS`] matching accounts; a cut answer is flagged (L-2).
 
 use async_graphql::{Context, Object, Result, ID};
-use kdx_api::{ApiResult, View};
+use std::collections::{BTreeMap, BTreeSet};
+
+use kdx_api::{ApiResult, PostingQuery, View};
+use kdx_decode::index::xfer_entity;
+use kdx_decode::Family;
 use kdx_hot::balances::{self, key_hash, parse_bal_key, ref_hash, BalanceRow, GuardKeys};
 use kdx_hot::{Table, Txn};
 use kdx_types::{Dict, DictKind};
@@ -73,26 +77,14 @@ fn hidden(view: &View, m: u32) -> ApiResult<bool> {
     Ok(balances::token_row(&view.txn, m)?.is_some_and(|t| t.kind == balances::KIND_NOT_FUNGIBLE))
 }
 
-/// The listed rows of `(account, module)`, by chain, optionally on `chains` only: a row the
-/// node holds at 0 is left out like an absent one (WP-L concern 3; one rule on every balance
-/// list, native and GraphQL).
+/// The listed rows of `(account, module)`, by chain, optionally on `chains` only: every row
+/// that exists on chain, at any balance (0 included, as stock); a row the node reported
+/// absent is left out (one rule on every balance list, native and GraphQL).
 pub fn chain_rows(
     view: &View,
     account: &str,
     module: &str,
     chains: Option<&[u8]>,
-) -> ApiResult<Vec<ChainRow>> {
-    listed_rows(view, account, module, chains, false)
-}
-
-/// `chain_rows`, keeping rows at 0 when `keep_zero` (a single known row, as
-/// `Block.minerAccount`, is served whatever its balance).
-fn listed_rows(
-    view: &View,
-    account: &str,
-    module: &str,
-    chains: Option<&[u8]>,
-    keep_zero: bool,
 ) -> ApiResult<Vec<ChainRow>> {
     let d = view.dict();
     let (Some(a), Some(m)) = (
@@ -114,8 +106,7 @@ fn listed_rows(
         let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
             continue;
         };
-        let listed = if keep_zero { !r.absent } else { r.positive() };
-        if !listed || chains.is_some_and(|cs| !cs.contains(&c)) {
+        if r.absent || chains.is_some_and(|cs| !cs.contains(&c)) {
             continue;
         }
         out.push(ChainRow {
@@ -128,27 +119,21 @@ fn listed_rows(
 }
 
 /// The rows `fungibleAccount` serves: `None` when the account has no stored row the node did
-/// not report absent; otherwise its rows above 0, possibly none (an account drained to 0
-/// everywhere still resolves, so its `transfers` and `transactions` stay reachable; PR #44
-/// review I-1).
+/// not report absent (it does not exist on chain); otherwise every row at any balance.
 fn account_rows(view: &View, account: &str, module: &str) -> ApiResult<Option<Vec<ChainRow>>> {
-    let rows = listed_rows(view, account, module, None, true)?;
-    Ok((!rows.is_empty()).then(|| {
-        rows.into_iter()
-            .filter(|r| balances::decimal_positive(&r.balance))
-            .collect()
-    }))
+    let rows = chain_rows(view, account, module, None)?;
+    Ok((!rows.is_empty()).then_some(rows))
 }
 
 /// `Block.minerAccount`, the `FungibleChainAccount` node and other single chain-account
-/// lookups inside a read (a row at 0 is served).
+/// lookups inside a read (any balance, as every list).
 pub fn chain_account_in(
     view: &View,
     account: &str,
     chain: u8,
     module: &str,
 ) -> ApiResult<Option<FungibleChainAccount>> {
-    Ok(listed_rows(view, account, module, Some(&[chain]), true)?
+    Ok(chain_rows(view, account, module, Some(&[chain]))?
         .into_iter()
         .next()
         .map(|row| FungibleChainAccount {
@@ -185,7 +170,7 @@ fn by_key(
     let mut out = Vec::new();
     let mut truncated = false;
     let mut failed = None;
-    // One account's rows of `m`, kept when above 0, on `chain`, trusted and guarded by `pk`.
+    // One account's rows of `m` (any balance, not absent), on `chain`, trusted and guarded by `pk`.
     let rows_of = |a: u32| -> ApiResult<Vec<ChainRow>> {
         let mut prefix = a.to_be_bytes().to_vec();
         prefix.extend_from_slice(&m.to_be_bytes());
@@ -197,7 +182,7 @@ fn by_key(
             let (Some((_, _, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                 continue;
             };
-            if !r.positive()
+            if r.absent
                 || chain.is_some_and(|x| x != c)
                 || !balances::trusted(&view.txn, m, c, coin)?
                 || !balances::stored_guard_keys(&view.txn, &r.guard, c)?
@@ -716,10 +701,47 @@ pub fn decode_balance_cursor(s: &str) -> Result<(String, u8)> {
     Ok((m.to_owned(), c.parse::<u8>().map_err(|_| bad())?))
 }
 
-/// `balance(accountName, module, chainIds)`: an account's fungible rows above 0 (the
-/// reconciled balances), listed by module name then chain, filtered by `module` and
-/// `chainIds`. Without `accountName` (a module's holders) it is `NOT_SUPPORTED`: the store
-/// keeps no holders-by-module index, and a scan of every balance row is not bounded (R7I-5).
+/// Transfer keys read per (account, module) by `balance(...)`'s zero-row probe
+/// ([`xfer_touched`]). Keys are height-major, so a probe for a chain the account rarely uses
+/// can walk the whole list; this bounds it.
+pub const BALANCE_TOUCH_KEYS: usize = 10_000;
+
+/// Chains among `want` on which the `xfer` posting list of `(a, m)` has a key, newest first,
+/// reading at most `cap` keys. Stops early once every wanted chain is found. The flag is true
+/// when the cap ended the walk with some wanted chain still unfound.
+fn xfer_touched(
+    view: &View,
+    a: u32,
+    m: u32,
+    want: &BTreeSet<u8>,
+    cap: usize,
+) -> ApiResult<(BTreeSet<u8>, bool)> {
+    let mut found = BTreeSet::new();
+    let mut it = view.postings(Family::Xfer, xfer_entity(a, m), PostingQuery::default())?;
+    let mut read = 0usize;
+    while found.len() < want.len() {
+        if read >= cap {
+            // Capped only if keys remain unread.
+            let more = it.next().is_some();
+            return Ok((found, more));
+        }
+        let Some(k) = it.next() else {
+            break;
+        };
+        read += 1;
+        let c = k?.chain();
+        if want.contains(&c) {
+            found.insert(c);
+        }
+    }
+    Ok((found, false))
+}
+
+/// `balance(accountName, module, chainIds)`: an account's fungible rows above 0, plus its rows
+/// at 0 that a TRANSFER touched (stock's rule; [`xfer_touched`]), listed by module name then
+/// chain, filtered by `module` and `chainIds`. Without `accountName` (a module's holders) it
+/// is `NOT_SUPPORTED`: the store keeps no holders-by-module index, and a scan of every balance
+/// row is not bounded (R7I-5).
 #[allow(clippy::too_many_arguments)]
 pub async fn query_balance(
     ctx: &Context<'_>,
@@ -782,6 +804,7 @@ pub async fn query_balance(
         .map(decode_balance_cursor)
         .transpose()?;
     let acct = account.clone();
+    let touch_keys = g.settings.balance_touch_keys;
     let mut rows: Vec<(String, u8, String)> = g
         .state()?
         .read(move |view| {
@@ -801,12 +824,14 @@ pub async fn query_balance(
                 )));
             }
             let mut out = Vec::new();
+            // Rows at 0 wait for the transfer probe of their module (stock's rule, below).
+            let mut zero: BTreeMap<u32, (String, BTreeMap<u8, String>)> = BTreeMap::new();
             for (k, v) in found {
                 view.check_deadline()?;
                 let (Some((_, m, c)), Some(r)) = (parse_bal_key(&k), BalanceRow::decode(&v)) else {
                     continue;
                 };
-                if !r.positive() || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
+                if r.absent || chains.as_ref().is_some_and(|cs| !cs.contains(&c)) {
                     continue;
                 }
                 let Some(name) = d.name(DictKind::Module, m).map(str::to_owned) else {
@@ -815,7 +840,33 @@ pub async fn query_balance(
                 if module.as_ref().is_some_and(|x| *x != name) || hidden(view, m)? {
                     continue;
                 }
-                out.push((name, c, balance_text(&r.balance)));
+                if r.positive() {
+                    out.push((name, c, balance_text(&r.balance)));
+                } else {
+                    zero.entry(m)
+                        .or_insert_with(|| (name, BTreeMap::new()))
+                        .1
+                        .insert(c, balance_text(&r.balance));
+                }
+            }
+            // Stock lists a row at 0 only when a TRANSFER event touched it: the account's
+            // transfer list in that module has a key on the row's chain (the list
+            // `transfers(accountName, fungibleName, chainId)` reads). Rows above 0 are always
+            // listed. Our transfer postings come only from node events, which start at the
+            // events fork, as stock's TRANSFER rows do, so no height bound is needed.
+            for (m, (name, rows)) in zero {
+                let want: BTreeSet<u8> = rows.keys().copied().collect();
+                let (touched, capped) = xfer_touched(view, a, m, &want, touch_keys)?;
+                for (c, text) in rows {
+                    if touched.contains(&c) {
+                        out.push((name.clone(), c, text));
+                    } else if capped {
+                        // Not resolved within the cap: kept, the safe side (the row exists on
+                        // chain), and counted.
+                        kdx_metrics::get().graphql_balance_touch_capped.inc();
+                        out.push((name.clone(), c, text));
+                    }
+                }
             }
             Ok(out)
         })
@@ -1107,10 +1158,10 @@ mod by_key_tests {
         assert_eq!((k2.len(), cut), (super::MAX_KEY_ACCOUNTS, true));
     }
 
-    /// The review's minor 6: the `…ByPublicKey` lists leave rows at 0 out, and an account
-    /// with every row at 0 is not listed.
+    /// Owner ruling 2026-11-26 (stock compatibility): the `…ByPublicKey` lists hold every row
+    /// that exists on chain at any balance, so an account with every row at 0 is listed too.
     #[tokio::test]
-    async fn rows_at_zero_are_left_out_by_key() {
+    async fn rows_at_zero_are_listed_by_key() {
         let (_d, st) = fixture();
         let accts = st
             .read(|view| by_key(view, "k3", "coin", None))
@@ -1121,6 +1172,14 @@ mod by_key_tests {
             .into_iter()
             .map(|a| (a.account, a.rows.iter().map(|r| r.chain).collect()))
             .collect();
-        assert_eq!(got, [("mixed".to_owned(), vec![0])]);
+        let mut got = got;
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("drained".to_owned(), vec![0, 1]),
+                ("mixed".to_owned(), vec![0, 1])
+            ]
+        );
     }
 }
