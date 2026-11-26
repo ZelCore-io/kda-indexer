@@ -18,6 +18,11 @@
 //!   compare streams the stored table in chunks inside one hot read txn.
 //! - A record whose output does not render is counted nowhere and leaves the marker unset
 //!   (the walk fails on that tx too; stored counts would hide it).
+//! - The same pass builds the per-chain counters (`kdx_hot::chaincount`: user txs and gas in
+//!   KDA, served by `networkInfo.countersOfEachChain`), replaces that table and sets its own
+//!   marker (`chain_counters_ready`) in the txn that sets the row counts' marker and stamps.
+//!   It needs no rendering, so unrendered records do not hold it back; only a sum past
+//!   `u128` KDA does.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -26,6 +31,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use kdx_decode::rowcount::CountKind;
+use kdx_hot::chaincount;
 use kdx_hot::rowcount::{self, Tally};
 use kdx_hot::{HotDict, HotStore, RoTxn, Table, Txn};
 use kdx_segment::Segments;
@@ -56,6 +62,34 @@ pub struct Report {
     /// Records counted per second (frozen and hot, counting only).
     pub rate: f64,
     pub ready: bool,
+    /// User txs counted into the per-chain counters (coinbase excluded).
+    pub chain_txs: u64,
+    /// User txs whose `meta.gasPrice` is missing or malformed (counted, 0 KDA of gas).
+    pub unpriced: u64,
+    /// `--check`: per-chain counter rows that differ from the rebuilt ones.
+    pub chain_counters_differing: Option<u64>,
+    /// Whether the per-chain counters may answer after the run.
+    pub chain_counters_ready: bool,
+}
+
+/// What the walk builds: the row counts and the per-chain counters.
+#[derive(Debug, Default)]
+pub struct Both {
+    pub rows: Tally,
+    pub chains: chaincount::Tally,
+}
+
+impl Both {
+    /// Add `r`; `false` when its output does not render (the chain counters still take it).
+    fn add(&mut self, r: &kdx_types::record::TxRecord, dict: &dyn kdx_types::Dict) -> bool {
+        self.chains.add(r);
+        self.rows.add(r, dict)
+    }
+
+    fn merge(&mut self, o: Both) {
+        self.rows.merge(o.rows);
+        self.chains.merge(o.chains);
+    }
 }
 
 /// Count the frozen records with TxNum in `txnums` and height in `heights` into `total`, on
@@ -67,7 +101,7 @@ fn count_frozen(
     heights: Range<u32>,
     threads: usize,
     stop: &(dyn Fn() -> bool + Sync),
-    total: &mut Tally,
+    total: &mut Both,
 ) -> Result<(u64, u64)> {
     let slices = (txnums.end.saturating_sub(txnums.start)).div_ceil(SLICE_TXS) as usize;
     let next = AtomicUsize::new(0);
@@ -88,7 +122,7 @@ fn count_frozen(
                     }
                     let a = txnums.start + i as u64 * SLICE_TXS;
                     let b = txnums.end.min(a + SLICE_TXS);
-                    let (mut t, mut n, mut bad) = (Tally::default(), 0u64, 0u64);
+                    let (mut t, mut n, mut bad) = (Both::default(), 0u64, 0u64);
                     for txnum in a..b {
                         let Some(key) = segs.txkey(txnum) else {
                             continue;
@@ -134,7 +168,7 @@ fn tally_in(
     hot: &HotStore,
     threads: usize,
     stop: &(dyn Fn() -> bool + Sync),
-) -> Result<(Tally, Report, RoTxn)> {
+) -> Result<(Both, Report, RoTxn)> {
     let t0 = Instant::now();
     let threads = threads.max(1);
     let (snap, frontier) = {
@@ -146,7 +180,7 @@ fn tally_in(
     let start = segs.manifest.entries.first().map_or(0, |e| e.first_txnum);
     let end = frozen_end(&segs, start, frontier);
     drop(segs);
-    let mut total = Tally::default();
+    let mut total = Both::default();
     let (frozen, unrendered) = count_frozen_at(
         segdir,
         &snap,
@@ -198,7 +232,9 @@ fn tally_in(
             rep.unrendered += 1;
         }
     }
-    rep.keys = total.len() as u64;
+    rep.keys = total.rows.len() as u64;
+    rep.chain_txs = total.chains.chains.values().map(|c| c.user_txs).sum();
+    rep.unpriced = total.chains.unpriced;
     rep.count_secs = t0.elapsed().as_secs_f64();
     rep.rate = (rep.frozen_txs + rep.hot_txs) as f64 / rep.count_secs.max(1e-9);
     Ok((total, rep, ro))
@@ -211,7 +247,7 @@ fn count_frozen_at(
     heights: Range<u32>,
     threads: usize,
     stop: &(dyn Fn() -> bool + Sync),
-    total: &mut Tally,
+    total: &mut Both,
 ) -> Result<(u64, u64)> {
     let segs = Segments::open_without_filters(segdir, snap.clone())?;
     count_frozen(&segs, snap, txnums, heights, threads, stop, total)
@@ -225,6 +261,17 @@ pub fn tally(
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(Tally, Report)> {
     let (t, rep, _ro) = tally_in(segdir, hot, threads, stop)?;
+    Ok((t.rows, rep))
+}
+
+/// [`tally`] with the per-chain counters.
+pub fn tally_both(
+    segdir: &Path,
+    hot: &HotStore,
+    threads: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<(Both, Report)> {
+    let (t, rep, _ro) = tally_in(segdir, hot, threads, stop)?;
     Ok((t, rep))
 }
 
@@ -232,6 +279,7 @@ pub fn tally(
 fn clear_marker(hot: &HotStore) -> Result<()> {
     let mut txn = hot.rw()?;
     rowcount::clear_ready(&mut txn)?;
+    chaincount::clear_ready(&mut txn)?;
     txn.commit()
 }
 
@@ -244,6 +292,7 @@ pub fn startup_guard(hot: &HotStore) -> Result<Option<String>> {
     }
     let mut txn = hot.rw()?;
     let why = rowcount::guard(&mut txn)?;
+    let why = chaincount::guard(&mut txn)?.or(why);
     if why.is_some() {
         txn.commit()?;
     }
@@ -262,7 +311,14 @@ pub fn reconcile(
     if !check {
         clear_marker(hot)?;
     }
-    let (mut t, mut rep, ro) = tally_in(segdir, hot, threads, stop)?;
+    let (
+        Both {
+            rows: mut t,
+            chains,
+        },
+        mut rep,
+        ro,
+    ) = tally_in(segdir, hot, threads, stop)?;
     if check {
         let mut diff = rowcount::unknown_kind_rows(&ro)?;
         for k in CountKind::ALL {
@@ -271,6 +327,8 @@ pub fn reconcile(
         }
         rep.differing = Some(diff);
         rep.ready = rowcount::ready(&ro)?;
+        rep.chain_counters_differing = Some(chaincount::differing(&ro, &chains)?);
+        rep.chain_counters_ready = chaincount::ready(&ro)?;
         return Ok(rep);
     }
     drop(ro);
@@ -279,6 +337,7 @@ pub fn reconcile(
         let mut txn = hot.rw()?;
         rowcount::clear_ready(&mut txn)?;
         rowcount::clear_table(&mut txn)?;
+        chaincount::clear_ready(&mut txn)?;
         let n = txn.next_txnum()?;
         txn.commit()?;
         n
@@ -298,13 +357,24 @@ pub fn reconcile(
             txn.commit()?;
         }
     }
+    // One txn: the per-chain counters (twenty rows), both markers and the stamps.
+    let mut txn = hot.rw()?;
+    chaincount::replace(&mut txn, &chains)?;
+    // A partial store (from a height above 0) has no all-time counters to serve.
+    let partial = txn.meta(crate::freezer::META_PARTIAL_FROM)?.is_some();
+    if !chains.overflow && !partial {
+        chaincount::set_ready(&mut txn, next_txnum)?;
+        chaincount::stamp_all(&mut txn)?;
+        rep.chain_counters_ready = true;
+    }
     if rep.unrendered == 0 {
-        let mut txn = hot.rw()?;
         rowcount::set_ready(&mut txn, next_txnum)?;
-        rowcount::stamp_all(&mut txn)?;
-        txn.commit()?;
         rep.ready = true;
     }
+    if rep.ready {
+        rowcount::stamp_all(&mut txn)?;
+    }
+    txn.commit()?;
     rep.write_secs = t1.elapsed().as_secs_f64();
     Ok(rep)
 }

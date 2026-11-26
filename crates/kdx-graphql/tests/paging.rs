@@ -2916,8 +2916,78 @@ mod stored_count {
         let ingest = rowcount::read_all(&t).unwrap();
         // Ingest keeps the table but never marks it ready: only the backfill does.
         assert!(!rowcount::ready(&t).unwrap());
+        // The per-chain counters: ingest keeps them ready from block 0, equal to the walk.
+        let (both, _) =
+            row_counts::tally_both(&fx.store.segdir, &fx.store.hot, 3, &|| false).unwrap();
+        assert!(kdx_hot::chaincount::ready(&t).unwrap());
+        assert_eq!(kdx_hot::chaincount::differing(&t, &both.chains).unwrap(), 0);
+        assert!(both
+            .chains
+            .chains
+            .values()
+            .all(|c| c.user_txs > 0 && c.gas.frac > 0));
+        assert_eq!(both.chains.chains.len(), 2);
         t.commit().unwrap();
         assert_eq!(ingest, built);
+    }
+
+    /// `reconcile-counts` builds the per-chain counters in the same pass and marks them
+    /// ready; they equal the walk and the stored text is stock's 10-decimal form. (The
+    /// resolver's GraphQL types and the `NOT_AVAILABLE` answer are tested in
+    /// `types/network.rs`: `networkInfo` needs the `/stats` count task, which this fixture
+    /// does not run.)
+    #[test]
+    fn reconcile_builds_the_chain_counters() {
+        let fx = fixture();
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::chaincount::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+        let r = reconcile(&fx);
+        assert!(r.chain_counters_ready && r.chain_txs > 0, "{r:?}");
+        assert_eq!(r.unpriced, 0, "{r:?}");
+        let (both, _) =
+            row_counts::tally_both(&fx.store.segdir, &fx.store.hot, 2, &|| false).unwrap();
+        let ro = fx.store.hot.ro().unwrap();
+        assert!(kdx_hot::chaincount::ready(&ro).unwrap());
+        assert_eq!(
+            kdx_hot::chaincount::differing(&ro, &both.chains).unwrap(),
+            0
+        );
+        let sum: u64 = both.chains.chains.values().map(|c| c.user_txs).sum();
+        assert_eq!(sum, r.chain_txs);
+        for c in both.chains.chains.values() {
+            let s = c.gas.to_stock_text();
+            assert_eq!(s.split_once('.').unwrap().1.len(), 10, "{s}");
+        }
+        drop(ro);
+        let r = row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, true, &|| false).unwrap();
+        assert_eq!(r.chain_counters_differing, Some(0));
+        assert!(r.chain_counters_ready);
+    }
+
+    /// Format parity with stock's live response (2026-11-26, chains 0, 1, 18 and 19):
+    /// every value is a 10-decimal string our formatter reproduces from the exact decimal,
+    /// trailing zeros included; `transactionCount` is a JSON number within `Int`.
+    #[test]
+    fn stock_counter_samples_round_trip() {
+        let stock: Value = serde_json::from_str(include_str!("data/stock_counters.json")).unwrap();
+        let rows = stock["data"]["networkInfo"]["countersOfEachChain"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        for row in rows {
+            assert!(row["chainId"].is_string());
+            let n = row["transactionCount"].as_i64().unwrap();
+            assert!((0..=i64::from(i32::MAX)).contains(&n));
+            let s = row["totalGasUsedInKda"].as_str().unwrap();
+            let k = kdx_hot::chaincount::parse_price(s).unwrap();
+            assert_eq!(k.to_stock_text(), s);
+            // One more digit below the 10th rounds half-up, as Postgres numeric does.
+            let up = kdx_hot::chaincount::parse_price(&format!("{s}5")).unwrap();
+            let down = kdx_hot::chaincount::parse_price(&format!("{s}4")).unwrap();
+            assert_eq!(down.to_stock_text(), s);
+            assert_ne!(up.to_stock_text(), s);
+        }
     }
 
     /// Stored counts equal the full walk on every plain list, and the backfill is idempotent.

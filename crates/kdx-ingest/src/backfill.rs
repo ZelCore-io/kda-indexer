@@ -232,6 +232,9 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
         let mut txn = ctx.hot.rw()?;
         // Frozen ranges written outside the freezer: the stored row counts no longer hold.
         kdx_hot::rowcount::clear_ready(&mut txn)?;
+        // A range whose MDBX commit (with its chain counter totals) landed but whose
+        // manifest commit did not is built again: its totals would count twice.
+        kdx_hot::chaincount::clear_ready(&mut txn)?;
         txn.set_frozen_frontier(m.frontier)?;
         txn.set_next_txnum(m.next_txnum)?;
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
@@ -715,6 +718,8 @@ fn build_and_commit(
     }
     let t = Instant::now();
     let mut unindexed = 0u64;
+    // The range's per-chain user-tx and gas totals, added in its MDBX commit.
+    let mut chains = kdx_hot::chaincount::Tally::default();
     let mut w = RangeWriter::create(
         &ctx.segdir,
         &ctx.etl,
@@ -771,6 +776,9 @@ fn build_and_commit(
             }
             let ib = pipeline::index(p, &mut *dict)?;
             unindexed += u64::from(ib.unindexed_accounts);
+            for r in &ib.txs {
+                chains.add(r);
+            }
             w.push(&ib)?;
             prev.insert(c, (h, hd.hash));
         }
@@ -810,6 +818,8 @@ fn build_and_commit(
     txn.set_frozen_frontier(entry.end)?;
     // A range written outside the freezer: the stored row counts no longer hold (PR #48).
     kdx_hot::rowcount::clear_ready(&mut txn)?;
+    // The chain counters follow backfill from block 0 (`kdx_hot::chaincount`).
+    kdx_hot::chaincount::add_tally(&mut txn, &chains)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
     let tc = Instant::now();
     txn.commit()?;

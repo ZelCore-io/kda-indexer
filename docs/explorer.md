@@ -30,7 +30,6 @@ defaults, nullability, interfaces and unions are identical.
 | Same | Depth and complexity | Stock's: depth 9 and complexity 4,000 counted as stock counts them, refused with stock's text, code and HTTP status ([graphql.md](graphql.md#limits)) |
 | Differs | Other resource limits | 10 operations per batch, a 5 s deadline, 20,000 fields after fragment expansion, 8 directives per field, an introspection cost cap. A refusal is a GraphQL error with `extensions.code = "LIMIT"` |
 | Same | Events over all 20 chains | The Kadena explorer builds one `events` field per ticked chain; with all 20 chains ticked it is answered or refused exactly as stock answers or refuses it |
-| Differs | `NetworkInfo.countersOfEachChain` | `blocksCount` answers; `transactionCount` and `totalGasUsedInKda` are `null` with `NOT_AVAILABLE` (no all-time per-chain counter is kept) |
 | Node passthrough | `pactQuery`, `gasLimitEstimate` | Client Pact runs on the node's `/local`, as stock runs it, with stock's answers and error texts (owner decision 2026-11-26; it replaces the earlier "never runs Pact for clients" rule). Capped per request, per IP and in flight: [graphql.md](graphql.md#pact-passthrough) |
 | Not supported | Mempool | `Transaction.result` is never a `TransactionMempoolInfo`; a transaction not yet in a block is `null` |
 | Same | `lastTokenPriceInKda` | Stock's price of the newest DEX swap naming the module (`toFixed(12)` text); see [graphql.md](graphql.md#token-price) for the rulings |

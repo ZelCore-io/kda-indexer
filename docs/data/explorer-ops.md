@@ -21,7 +21,7 @@ kadscan's source is not public; these are the documents its web app sends.
 | `BlocksByHeight-7d3a4973` | blocks in a height range, with gas prices | in-scope | <!--m:exp-blocksbyheight-7d3a4973-p50-->11.8 ms<!--/m--> | <!--m:exp-blocksbyheight-7d3a4973-p99-->110.0 ms<!--/m--> |  |
 | `BlocksFromHeight-2b764a6f` | blocks in a height range | in-scope | <!--m:exp-blocksfromheight-2b764a6f-p50-->2.8 ms<!--/m--> | <!--m:exp-blocksfromheight-2b764a6f-p99-->5.1 ms<!--/m--> |  |
 | `BlocksFromHeight-c137684a` | block heights per chain | in-scope | <!--m:exp-blocksfromheight-c137684a-p50-->1.4 ms<!--/m--> | <!--m:exp-blocksfromheight-c137684a-p99-->4.2 ms<!--/m--> |  |
-| `ChainsGas-4ccfcce3` | per-chain gas counters | in-scope |  |  | `totalGasUsedInKda` answers `null` with `NOT_AVAILABLE`: no all-time gas counter |
+| `ChainsGas-4ccfcce3` | per-chain gas counters | in-scope |  |  | `totalGasUsedInKda` and `transactionCount` served from the `ChainCounters` table: exact, stock's float gas sum within a relative 1e-6 |
 | `CoinsInCirculation-74ce39b0` | coins in circulation | in-scope |  |  |  |
 | `Events-618c9a0e` | events of a module | in-scope |  |  |  |
 | `FungibleAccount-57a45a6a` | account total balance | in-scope | <!--m:exp-fungibleaccount-57a45a6a-p50-->2.8 ms<!--/m--> | <!--m:exp-fungibleaccount-57a45a6a-p99-->11.5 ms<!--/m--> |  |

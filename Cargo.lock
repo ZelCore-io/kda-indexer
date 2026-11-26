@@ -1848,6 +1848,7 @@ dependencies = [
  "kdx-decode",
  "kdx-types",
  "reth-libmdbx",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

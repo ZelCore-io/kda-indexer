@@ -6,6 +6,7 @@ use kdx_types::record::{decode_block, encode_block, encode_tx};
 use kdx_types::TxKey;
 
 use crate::balances;
+use crate::chaincount;
 use crate::checkpoint::{clear_checkpoint, set_checkpoint, Stage};
 use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
@@ -57,6 +58,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     }
     // PR #48 review round 2 N-1: a tip an older build moved must not be stamped over below.
     rowcount::guard(txn)?;
+    chaincount::guard(txn)?;
     let mut ops = Vec::new();
     dict.persist(txn)?;
     let coin = balances::coin_module(txn)?;
@@ -87,6 +89,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
         ops.push(UndoOp::Tx(r.key));
         // PR #48: the stored list counts (undone from the record, no undo op).
         rowcount::add_tx(txn, r, &*dict, 1)?;
+        // The per-chain user-tx count and gas (`chaincount.rs`), undone the same way.
+        chaincount::add_tx(txn, r, 1)?;
         if let Some(rk) = &r.request_key {
             // A request key already present (same tx on another fork, not yet unwound) is
             // left to its owner; only rows this block created are undone.
@@ -169,6 +173,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
     // PR #48 review I-1: the counts now follow this tip.
     rowcount::stamp(txn, chain)?;
+    chaincount::stamp(txn, chain)?;
     Ok(())
 }
 
@@ -309,6 +314,7 @@ fn undo_op(
                 Some(v) => {
                     let r = kdx_types::record::decode_tx(&v).context("hot tx record")?;
                     rowcount::add_tx(txn, &r, dict, -1)?;
+                    chaincount::add_tx(txn, &r, -1)?;
                 }
                 // Review M-1: its counts cannot be subtracted, so none is trusted.
                 None => {
@@ -319,6 +325,7 @@ fn undo_op(
                         "row counts: undone tx has no hot record"
                     );
                     rowcount::clear_ready(txn)?;
+                    chaincount::clear_ready(txn)?;
                 }
             }
             txn.del(Table::TailTxs, &k.to_be_bytes())?;
@@ -375,6 +382,7 @@ pub fn unwind_to_with(
     // PR #48 review round 2 N-1: callers such as `kda-indexer unwind` run no startup guard,
     // so check it here, in this txn, before the counts move and the new tip is stamped.
     rowcount::guard(txn)?;
+    chaincount::guard(txn)?;
     let from = match height.checked_add(1) {
         Some(h) => block_key(chain, h),
         None => return Ok(0),
@@ -404,6 +412,7 @@ pub fn unwind_to_with(
     }
     // PR #48 review I-1: the counts follow the new tip (or no tip).
     rowcount::stamp(txn, chain)?;
+    chaincount::stamp(txn, chain)?;
     Ok(n)
 }
 

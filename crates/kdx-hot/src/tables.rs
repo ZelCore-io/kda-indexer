@@ -17,7 +17,8 @@
 //!
 //! Additive tables (rule A-1, P6; layouts in `balances.rs` and `nft.rs`): `Balances`,
 //! `BalanceDirty`, `BalanceSeed`, `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`,
-//! `NftDetails` (P7, GQ-15), `TokenSwaps` (`prices.rs`) and `RowCounts` (`rowcount.rs`). `HotStore::open` creates them;
+//! `NftDetails` (P7, GQ-15), `TokenSwaps` (`prices.rs`), `RowCounts` (`rowcount.rs`) and `ChainCounters`
+//! (`chaincount.rs`). `HotStore::open` creates them;
 //! `open_ro` opens them when present, and a missing one reads as empty. They change no stored
 //! byte of the base tables or the segments, so they need no format version.
 //!
@@ -52,6 +53,7 @@ pub enum Table {
     NftDetails,
     TokenSwaps,
     RowCounts,
+    ChainCounters,
 }
 
 fn kind_name(k: DictKind) -> &'static str {
@@ -87,7 +89,7 @@ impl Table {
 
     /// Tables added after format v2 without a version bump (rule A-1): optional on a
     /// read-only open, empty when missing.
-    pub fn additive() -> [Table; 11] {
+    pub fn additive() -> [Table; 12] {
         [
             Table::Balances,
             Table::BalanceDirty,
@@ -100,6 +102,7 @@ impl Table {
             Table::NftDetails,
             Table::TokenSwaps,
             Table::RowCounts,
+            Table::ChainCounters,
         ]
     }
 
@@ -132,6 +135,7 @@ impl Table {
             Table::NftDetails => "NftDetails".into(),
             Table::TokenSwaps => "TokenSwaps".into(),
             Table::RowCounts => "RowCounts".into(),
+            Table::ChainCounters => "ChainCounters".into(),
         }
     }
 }

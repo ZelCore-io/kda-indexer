@@ -41,6 +41,8 @@ async fn freeze_equals_backfill(range: u64) {
         let c = ctx(df.path(), 2, range, 2);
         apply_linear(&c, &pool, &chain, 5);
         while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+        // Ingest (tail apply, then the freezer) kept the chain counters from block 0.
+        chain_counters_match_the_walk(&c);
         kdx_segment::manifest::Manifest::load(&c.segdir)
             .unwrap()
             .unwrap()
@@ -58,6 +60,18 @@ async fn freeze_equals_backfill(range: u64) {
         !count_marker(&c),
         "PR #48: backfill clears the stored-counts marker"
     );
+    // Backfill keeps the chain counters (and their marker) from block 0.
+    chain_counters_match_the_walk(&c);
+    // A resume that resets the hot frontier (a range whose MDBX commit landed but whose
+    // manifest commit did not) would count that range twice: the marker is cleared.
+    {
+        let mut t = c.hot.rw().unwrap();
+        t.set_frozen_frontier(22).unwrap();
+        t.commit().unwrap();
+    }
+    let (_, _, info) = kdx_ingest::backfill::resume(&c).unwrap();
+    assert!(info.hot_reset);
+    assert!(!kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap());
     let backfilled = kdx_segment::manifest::Manifest::load(&c.segdir)
         .unwrap()
         .unwrap();
@@ -144,6 +158,7 @@ async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
         .entries[3]
         .clone();
     set_count_marker(&c);
+    assert!(kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap());
     let rep = kdx_ingest::rebuild::run(
         c.clone(),
         e.kind,
@@ -157,6 +172,10 @@ async fn rebuild_of_a_frozen_step_is_byte_equal_on_one_chain() {
     assert!(
         !count_marker(&c),
         "PR #48: rebuild-range clears the stored-counts marker"
+    );
+    assert!(
+        !kdx_hot::chaincount::marker_set(&c.hot.ro().unwrap()).unwrap(),
+        "rebuild-range clears the chain counters' marker"
     );
     assert_eq!(rep.content_equal, Some(true));
     assert!(!kdx_segment::swap::rebuild_dir(&c.segdir, e.start).exists());
@@ -673,6 +692,22 @@ fn startup_cleanup_keeps_listed_optional_files() {
     assert_eq!(files(&c.segdir), want);
     assert_eq!(want.keys().filter(|n| n.contains("-kf-")).count(), 10);
     assert_eq!(want.keys().filter(|n| n.contains("-sndr-")).count(), 10);
+}
+
+/// The stored chain counters are ready, non-trivial and equal to what `reconcile-counts`
+/// builds from every record of the store (frozen and hot).
+fn chain_counters_match_the_walk(c: &kdx_ingest::Ctx) {
+    let (walked, _) = kdx_ingest::row_counts::tally_both(&c.segdir, &c.hot, 2, &|| false).unwrap();
+    let ro = c.hot.ro().unwrap();
+    assert!(kdx_hot::chaincount::ready(&ro).unwrap());
+    assert!(
+        walked.chains.chains.values().any(|v| v.user_txs > 0),
+        "{walked:?}"
+    );
+    assert_eq!(
+        kdx_hot::chaincount::differing(&ro, &walked.chains).unwrap(),
+        0
+    );
 }
 
 fn set_count_marker(c: &kdx_ingest::Ctx) {

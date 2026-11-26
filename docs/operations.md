@@ -271,6 +271,28 @@ systemctl start kda-indexer-<network>
   and `run` clears the marker at startup with a warning that names the chain and heights.
   Run `reconcile-counts` again after such a rollback.
 
+### Per-chain counters (`countersOfEachChain`)
+
+`networkInfo.countersOfEachChain.transactionCount` and `totalGasUsedInKda` are read from
+the hot `ChainCounters` table (one row per chain: user txs, exact gas in KDA). Unlike the
+row counts, every writer keeps it from block 0: a new store starts it ready, the tail adds
+and unwinds it per block, and backfill adds each range's totals in the range's commit. So a
+reindex from scratch serves them with no extra step. Its marker (`Meta
+chain_counters_ready`) is cleared by `rebuild-range`, by a backfill resume that resets the
+hot frontier (a range committed to MDBX but not to the manifest), by a build without this
+table moving the tips (its own `Meta chain_counters_at@<chain>` stamps, checked like the row
+counts' at startup and before every apply or unwind; a build with PR #48 but not this table
+is caught too), by `run --start-height` (a partial store has no all-time counts; `reconcile-counts`
+leaves it unset there) and by a sum out of range; the fields then answer `NOT_AVAILABLE`
+(logged as `chain counters: readiness marker cleared`).
+
+`reconcile-counts` rebuilds this table in the same pass (it adds a JSON parse of each user
+tx's `cmd` for `meta.gasPrice`) and sets its marker, so an existing store needs one run
+after the upgrade. Its report adds `chain_txs` (user txs counted), `unpriced` (user txs
+whose `gasPrice` did not parse; they count, with 0 gas), `chain_counters_ready` and, with
+`--check`, `chain_counters_differing` (0 on a healthy store). Unrendered records do not hold
+this marker back.
+
 ## Rolling back to a build before FIX-2
 
 From FIX-2 on, the tail writes the `sndr` posting family (family 6, the txs an account sent;
