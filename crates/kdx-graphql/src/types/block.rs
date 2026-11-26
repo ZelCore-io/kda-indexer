@@ -875,6 +875,21 @@ mod walk_tests {
             rows(&v, "blocksFromHeight"),
             [(1, 0), (1, 1), (2, 0), (2, 1)]
         );
+        // `totalCount`, as stock's: the blocks of the range on the chains asked, up to the tip.
+        for (args, n) in [
+            ("startHeight: 1", 6),
+            ("startHeight: 1, endHeight: 2", 4),
+            ("startHeight: 1, endHeight: 99, chainIds: [\"1\"]", 3),
+            ("startHeight: 9", 0),
+        ] {
+            let v = run(format!(
+                "{{ blocksFromHeight({args}, first: 100) {{ totalCount edges {{ cursor }} }} }}"
+            ))
+            .await;
+            let c = &v["blocksFromHeight"];
+            assert_eq!(c["totalCount"], n, "{args}");
+            assert_eq!(c["edges"].as_array().unwrap().len(), n, "{args}");
+        }
         assert_eq!(v["blocksFromHeight"]["pageInfo"]["hasNextPage"], true);
         let end = v["blocksFromHeight"]["pageInfo"]["endCursor"].clone();
         let v = run(format!(

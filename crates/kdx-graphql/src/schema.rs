@@ -107,7 +107,7 @@ impl Query {
         let end = end_height
             .map(|e| non_negative("endHeight", e))
             .transpose()?;
-        let (edges, page_info, _) = block_page(
+        let (edges, page_info, total) = block_page(
             ctx,
             chain_set(chain_ids.as_deref())?,
             Span::Heights { start, end },
@@ -120,6 +120,7 @@ impl Query {
                 .map(|(cursor, node)| QueryBlocksFromHeightConnectionEdge { cursor, node })
                 .collect(),
             page_info,
+            total: crate::connection::Total::Exact(total),
         })
     }
 

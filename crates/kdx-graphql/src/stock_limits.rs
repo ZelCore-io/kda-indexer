@@ -694,6 +694,39 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// Every field of a stock type we serve is served: a stock client that selects one gets
+    /// an answer, not a validation error for the whole query (HTTP 400). Stock types we do
+    /// not serve at all are out of scope here; the fields below are known gaps.
+    #[test]
+    fn every_field_of_a_served_stock_type_is_served() {
+        const KNOWN_GAPS: &[&str] = &[
+            // Not served (docs/comparison.md, "Stock fields not served").
+            "Block.totalGasUsedInKda",
+            "NetworkInfo.genesisHeights",
+            "NetworkInfo.nodeBlockDelay",
+            "NetworkInfo.nodeChains",
+            "NetworkInfo.nodeLatestBehaviorHeight",
+            "NetworkInfo.nodePackageVersion",
+            "NetworkInfo.nodeServiceDate",
+            "NetworkInfo.numberOfChains",
+            "NonFungibleAccount.transfers",
+            "NonFungibleChainAccount.transfers",
+        ];
+        let reg = type_registry();
+        let missing: Vec<&str> = stock_schema::FIELDS
+            .iter()
+            .map(|f| f.coord)
+            .filter(|c| {
+                let (t, field) = c.split_once('.').unwrap();
+                reg.types
+                    .get(t)
+                    .is_some_and(|t| t.field_by_name(field).is_none())
+            })
+            .filter(|c| !KNOWN_GAPS.contains(c))
+            .collect();
+        assert!(missing.is_empty(), "{missing:#?}");
+    }
+
     /// The explorer's transactions-by-account document at `first: 100` costs (1 + 2) x 100.
     #[test]
     fn the_explorer_page_of_100_is_accepted() {

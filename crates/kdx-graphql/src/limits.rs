@@ -100,6 +100,7 @@ pub const MAX_COUNTS: u64 = 2;
 const CHEAP_COUNTS: &[&str] = &[
     "BlockTransactionsConnection",
     "QueryBlocksFromDepthConnection",
+    "QueryBlocksFromHeightConnection",
     "TransactionResultEventsConnection",
     "TransactionResultTransfersConnection",
 ];
@@ -1206,6 +1207,24 @@ mod tests {
             c("{ fungibleChainAccounts(accountName: \"a\", chainIds: []) { transactions { totalCount } } }"),
             Err("\"counts\"".into())
         );
+        // An account object's transfer count is a count walk like the root lists': two per
+        // operation, a third refused, and none under a per-chain list.
+        let xfer = |n: usize| -> String {
+            (0..n)
+                .map(|i| format!("a{i}: fungibleAccount(accountName: \"a\") {{ transfers {{ totalCount }} }} "))
+                .collect()
+        };
+        assert!(c(&format!("{{ {} }}", xfer(2))).is_ok());
+        assert_eq!(c(&format!("{{ {} }}", xfer(3))), Err("\"counts\"".into()));
+        assert_eq!(
+            c("{ fungibleChainAccounts(accountName: \"a\") { transfers { totalCount } } }"),
+            Err("\"counts\"".into())
+        );
+        // A block range's count is arithmetic (cheap): not a count walk.
+        let blocks: String = (0..3)
+            .map(|i| format!("b{i}: blocksFromHeight(startHeight: 0) {{ totalCount }} "))
+            .collect();
+        assert!(c(&format!("{{ {blocks} }}")).is_ok());
         let none = c("{ fungibleChainAccounts(accountName: \"a\") { balance } }");
         let empty = c("{ fungibleChainAccounts(accountName: \"a\", chainIds: []) { balance } }");
         assert_eq!(empty, none);

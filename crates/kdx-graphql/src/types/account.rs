@@ -498,6 +498,7 @@ impl FungibleAccount {
                 })
                 .collect(),
             page_info: p.info,
+            total: p.total,
         })
     }
 }
@@ -584,6 +585,7 @@ impl FungibleChainAccount {
                 })
                 .collect(),
             page_info: p.info,
+            total: p.total,
         })
     }
 }
