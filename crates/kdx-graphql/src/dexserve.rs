@@ -81,7 +81,7 @@ pub const MAX_HOPS: usize = 3;
 /// visits.
 pub const MAX_NEIGHBORS: usize = 256;
 /// Pairs of one token a price search reads to rank its neighbours.
-pub const MAX_RANKED_NEIGHBORS: usize = 4_096;
+pub const MAX_RANKED_NEIGHBORS: usize = 1_024;
 pub const MAX_PRICE_TOKENS: usize = 2_048;
 /// Longest `dexMetrics` range.
 pub const MAX_METRIC_DAYS: u64 = 1_100;
@@ -94,26 +94,37 @@ const HOUR: u64 = 3_600;
 pub struct Budget {
     dl: Instant,
     rows: u64,
+    max: u64,
     out: bool,
     /// A listing had more than [`MAX_PAIRS`] listable pairs and served the largest: the
     /// resolver flags the response (never a silent partial list).
     pub capped: bool,
+    /// A price search ran out of the budget or the deadline and answered no path (price 0)
+    /// for a token it did not finish: the resolver flags `extensions.dexPricesPartial`.
+    pub prices_partial: bool,
 }
 
 impl Budget {
     pub fn new(dl: Instant) -> Budget {
+        Budget::with_rows(dl, MAX_ROWS)
+    }
+
+    /// A budget of `max` rows instead of [`MAX_ROWS`] (tests of the spent-budget paths).
+    pub fn with_rows(dl: Instant, max: u64) -> Budget {
         Budget {
             dl,
             rows: 0,
+            max,
             out: false,
             capped: false,
+            prices_partial: false,
         }
     }
 
     /// Count a row; false once the budget or the deadline is spent.
     pub fn tick(&mut self) -> bool {
         self.rows += 1;
-        if self.rows > MAX_ROWS || (self.rows.is_multiple_of(64) && Instant::now() >= self.dl) {
+        if self.rows > self.max || (self.rows.is_multiple_of(64) && Instant::now() >= self.dl) {
             self.out = true;
         }
         !self.out
@@ -285,6 +296,12 @@ pub fn listable(txn: &impl Txn, b: &mut Budget) -> ApiResult<Vec<PairInfo>> {
         // A pair's info: its status (three reads) and two time reads.
         for _ in 0..5 {
             b.tick();
+        }
+        if out.len() == MAX_PAIRS && b.check().is_err() {
+            // The cap is reached and the budget ends before the next pair is known: serve
+            // the kept pairs, flagged (another listable pair may exist past them).
+            b.capped = true;
+            break;
         }
         b.check()?;
         let Some(p) = pair_info(txn, &k)? else {
@@ -1434,7 +1451,26 @@ impl<T: Txn> PriceSearch<'_, T> {
     /// ranked by the token's own reserve (largest first, then pair key); the top
     /// [`MAX_NEIGHBORS`] are expanded, and at most [`MAX_PRICE_TOKENS`] tokens are visited.
     /// (Stock walks its pairs in id order; ranking keeps dust spam from hiding real routes.)
+    ///
+    /// Limit: the token index lists a token's pairs oldest `CREATE_PAIR` first, and only the
+    /// first [`MAX_RANKED_NEIGHBORS`] are ranked. A token with more pairs than that has its
+    /// newer pairs left out of the search, so spam pairs created before a real route can still
+    /// hide it (then the token prices at 0, as stock prices a token with no path).
+    ///
+    /// A search that spends the field's row budget or deadline answers no path (`None`: price
+    /// 0, stock's answer with no path) rather than an error, and marks
+    /// [`Budget::prices_partial`] so the response says some prices were not searched.
     fn price_in_kda(&mut self, token: &str, b: &mut Budget) -> ApiResult<Option<Dec>> {
+        match self.search(token, b) {
+            Err(ApiError::Deadline) => {
+                b.prices_partial = true;
+                Ok(None)
+            }
+            r => r,
+        }
+    }
+
+    fn search(&mut self, token: &str, b: &mut Budget) -> ApiResult<Option<Dec>> {
         if token == "coin" {
             return Ok(Some(Dec::int(1)));
         }
@@ -1453,22 +1489,41 @@ impl<T: Txn> PriceSearch<'_, T> {
                 continue;
             }
             let mut names = HashSet::new();
+            let mut ranked_capped = false;
             hd::token_pairs(self.txn, &t, |pair| {
-                if b.tick() && names.len() < MAX_RANKED_NEIGHBORS {
+                if !b.tick() {
+                    return false;
+                }
+                if names.len() < MAX_RANKED_NEIGHBORS {
                     names.insert(pair.to_owned());
                     true
                 } else {
+                    ranked_capped = true;
                     false
                 }
             })
             .map_err(api)?;
             b.check()?;
+            if ranked_capped {
+                kdx_metrics::get().dex_ranked_neighbors_capped.inc();
+            }
             // Rank by this token's own reserve (one read each), so dust pairs spammed onto a
             // token cannot crowd its real pairs out of the expansion; ties by pair key.
             let mut ranked: Vec<(Dec, String)> = Vec::with_capacity(names.len());
             for pair in names {
                 if !b.tick() {
                     break;
+                }
+                // A coin pair never funded has no reserves to rank: skip its UPDATE read (the
+                // funded count is kept for coin pairs only; other pairs are read).
+                if pair.split(':').any(|x| x == "coin")
+                    && self
+                        .txn
+                        .get(Table::DexAgg, &hd::funded_key(&pair))
+                        .map_err(api)?
+                        .is_none()
+                {
+                    continue;
                 }
                 let Some((r0, r1)) = hd::latest_reserves(self.txn, &pair).map_err(api)? else {
                     continue;
@@ -1570,6 +1625,9 @@ pub fn token_prices(
         return Ok(Vec::new());
     }
     let pairs = listable(txn, b)?;
+    // The price searches get their own row budget (the request deadline still bounds them):
+    // a listing that spent the rows on a capped walk does not zero every price after it.
+    let mut pb = Budget::with_rows(b.dl, b.max);
     let rate = dex_usd::latest(txn).map_err(api)?.map(|r| r.1);
     let mut names: Vec<&str> = pairs
         .iter()
@@ -1583,16 +1641,20 @@ pub fn token_prices(
     };
     let mut out = Vec::with_capacity(names.len());
     for n in names {
-        let kda = ps.price_in_kda(n, b)?;
+        let kda = ps.price_in_kda(n, &mut pb)?;
         out.push(price_node(kda, n, protocol, rate.as_ref(), now));
     }
+    b.prices_partial |= pb.prices_partial;
     Ok(out)
 }
 
 // Tokens.
 
-/// `tokens`: one node per (non-coin module, fungible chain) of the `Tokens` table, newest
-/// first height first; cursor = first height ‖ module id ‖ chain.
+/// `tokens`: stock's set and order (`balance-db-repository.ts`): one node per (non-coin
+/// module, chain) with a holder row (`kdx_hot::token_chains`, built from `Holders`, stock's
+/// `Balances` set), newest first holder row first (stock: `MIN(Balances.id)`, its insert
+/// order); cursor = that row's TxKey ‖ module id ‖ chain (stock: the row id itself, an
+/// internal number we cannot reproduce). The caller checks `token_chains::ready`.
 pub fn tokens(
     view: &View,
     after: Option<&str>,
@@ -1603,30 +1665,19 @@ pub fn tokens(
 ) -> ApiResult<QueryTokensConnection> {
     let txn = &view.txn;
     let mut items: Vec<(u128, Token)> = Vec::new();
-    if txn.has_table(Table::Tokens) {
+    {
         let dict = view.dict();
-        let rows = txn.scan(Table::Tokens, &[], |_| b.tick()).map_err(api)?;
+        let rows = kdx_hot::token_chains::read_all(txn, || b.tick()).map_err(api)?;
         b.check()?;
-        for (k, v) in rows {
-            let (Ok(id), Some(row)) = (
-                <[u8; 4]>::try_from(k.as_slice()).map(u32::from_be_bytes),
-                kdx_hot::balances::TokenRow::decode(&v),
-            ) else {
-                continue;
-            };
+        for (id, row) in rows {
             let Some(name) = dict.name(DictKind::Module, id) else {
                 continue;
             };
             if name == "coin" {
                 continue;
             }
-            for chain in 0..32u32 {
-                if row.fungible_chains & (1 << chain) == 0 {
-                    continue;
-                }
-                let rank = (u128::from(row.first_height) << 40)
-                    | (u128::from(id) << 8)
-                    | u128::from(chain);
+            for (&chain, first) in &row.first {
+                let rank = (u128::from(first.0) << 40) | (u128::from(id) << 8) | u128::from(chain);
                 let tid = base64::engine::general_purpose::STANDARD
                     .encode(format!("Token:[{name},{chain}]"));
                 items.push((

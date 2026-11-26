@@ -29,36 +29,92 @@ where
     T: Send + 'static,
     F: FnOnce(&View, &mut Budget) -> ApiResult<T> + Send + 'static,
 {
+    run_gated(ctx, heavy, dex_gate, f).await
+}
+
+fn unavailable(e: anyhow::Error) -> kdx_api::ApiError {
+    kdx_api::ApiError::Unavailable(format!("{e:#}"))
+}
+
+/// Why the DEX fields cannot answer yet (None: they can): the history fill has not finished,
+/// or it failed and is retrying (`kdx_hot::fills`), each with its own message.
+fn dex_gate(view: &View) -> ApiResult<Option<&'static str>> {
     use kdx_hot::Txn;
+    if view
+        .txn
+        .meta(kdx_hot::dex::meta::DEX_FILLED)
+        .map_err(unavailable)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        if kdx_hot::fills::failed(&view.txn, kdx_hot::fills::DEX)
+            .map_err(unavailable)?
+            .is_some()
+        {
+            "the DEX history fill failed and is retrying; DEX fields answer once it succeeds"
+        } else {
+            "the DEX history is being filled; DEX fields answer once it is done"
+        },
+    ))
+}
+
+/// A gated read: the value with its response marks (pairs capped, prices partial), or the
+/// gate's reason.
+type Gated<T> = Result<(T, (bool, bool)), &'static str>;
+
+/// `tokens` reads the token chain list (`kdx_hot::token_chains`), not the DEX ledger.
+fn tokens_gate(view: &View) -> ApiResult<Option<&'static str>> {
+    if kdx_hot::token_chains::ready(&view.txn).map_err(unavailable)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        if kdx_hot::fills::failed(&view.txn, kdx_hot::fills::TOKEN_CHAINS)
+            .map_err(unavailable)?
+            .is_some()
+        {
+            "the token list build failed and is retrying; tokens answers once it succeeds"
+        } else {
+            "the token list is being built (it follows the module holder lists); tokens answers once it is done"
+        },
+    ))
+}
+
+async fn run_gated<T, F>(
+    ctx: &Context<'_>,
+    heavy: bool,
+    gate: fn(&View) -> ApiResult<Option<&'static str>>,
+    f: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&View, &mut Budget) -> ApiResult<T> + Send + 'static,
+{
     let dl = crate::deadline(ctx);
     let st = crate::gql(ctx).state()?;
-    let go = move |view: &View| -> ApiResult<Option<(T, bool)>> {
+    let go = move |view: &View| -> ApiResult<Gated<T>> {
         view.check_deadline()?;
-        if view
-            .txn
-            .meta(kdx_hot::dex::meta::DEX_FILLED)
-            .map_err(|e| kdx_api::ApiError::Unavailable(format!("{e:#}")))?
-            .is_none()
-        {
-            return Ok(None);
+        if let Some(why) = gate(view)? {
+            return Ok(Err(why));
         }
         let mut b = Budget::new(dl);
         let t = f(view, &mut b)?;
-        Ok(Some((t, b.capped)))
+        Ok(Ok((t, (b.capped, b.prices_partial))))
     };
     let r = if heavy {
         st.read_heavy(go).await
     } else {
         st.read(go).await
     };
-    let Some((t, capped)) = r.map_err(crate::error::from_api)? else {
-        return Err(crate::error::err(
-            crate::error::Code::NotAvailable,
-            "the DEX history is being filled; DEX fields answer once it is done",
-        ));
-    };
+    let (t, (capped, prices_partial)) = r
+        .map_err(crate::error::from_api)?
+        .map_err(|why| crate::error::err(crate::error::Code::NotAvailable, why))?;
     if capped {
         crate::flags::mark(ctx, crate::flags::Flag::DexPairsCapped);
+    }
+    if prices_partial {
+        crate::flags::mark(ctx, crate::flags::Flag::DexPricesPartial);
     }
     Ok(t)
 }
@@ -389,7 +445,7 @@ impl DexQuery {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<QueryTokensConnection> {
-        run(ctx, true, move |v, b| {
+        run_gated(ctx, true, tokens_gate, move |v, b| {
             ds::tokens(v, after.as_deref(), before.as_deref(), first, last, b)
         })
         .await

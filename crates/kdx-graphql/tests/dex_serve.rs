@@ -842,3 +842,185 @@ async fn large_history_reads_only_the_range() {
     assert_eq!(v["poolTransactions"]["edges"].as_array().unwrap().len(), 10);
     assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
 }
+
+/// `tokens` follows stock's set and order: every non-coin module with a holder row
+/// (`Holders`, stock's `Balances` set) on a chain, newest first holder first; a chain whose
+/// last holder row goes on unwind leaves the list. Before the list is built it answers
+/// `NOT_AVAILABLE`.
+#[tokio::test]
+async fn tokens_follow_the_holder_rows() {
+    use kdx_hot::{holders, token_chains};
+    use kdx_types::{DictKind, DictMut};
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let mut w = hot.rw().unwrap();
+    let mut dict = kdx_hot::dict::HotDict::load(&w).unwrap();
+    let id = |dict: &mut kdx_hot::dict::HotDict, n: &str| dict.intern(DictKind::Module, n);
+    let (coin, a, nft, gone) = (
+        id(&mut dict, "coin"),
+        id(&mut dict, "free.a"),
+        id(&mut dict, "marmalade-v2.ledger"),
+        id(&mut dict, "free.gone"),
+    );
+    dict.persist(&mut w).unwrap();
+    holders::touch(&mut w, 1, coin, TxKey::new(5, 0, 0)).unwrap();
+    holders::touch(&mut w, 1, a, TxKey::new(10, 3, 0)).unwrap();
+    holders::touch(&mut w, 2, a, TxKey::new(14, 3, 0)).unwrap();
+    holders::touch(&mut w, 2, a, TxKey::new(12, 1, 0)).unwrap();
+    holders::touch(&mut w, 3, nft, TxKey::new(11, 1, 1)).unwrap();
+    holders::touch(&mut w, 3, gone, TxKey::new(20, 2, 0)).unwrap();
+    // The unwind of the only tx that named free.gone.
+    holders::untouch_tx(&mut w, TxKey::new(20, 2, 0)).unwrap();
+    mark_filled(&mut w);
+    w.commit().unwrap();
+    let q = "{ tokens(first: 10){ edges{cursor node{id name chainId}}}}";
+    let v = data(&st, q).await;
+    let got: Vec<(String, String)> = v["tokens"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["node"]["name"].as_str().unwrap().to_owned(),
+                e["node"]["chainId"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let want = [
+        ("free.a", "1"),
+        ("marmalade-v2.ledger", "1"),
+        ("free.a", "3"),
+    ];
+    assert_eq!(got, want.map(|(n, c)| (n.to_owned(), c.to_owned())), "{v}");
+    // Paging: after the first edge, the next two.
+    let c = v["tokens"]["edges"][0]["cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let p = data(
+        &st,
+        &format!("{{ tokens(first: 2, after: \"{c}\"){{ edges{{node{{name chainId}}}}}}}}"),
+    )
+    .await;
+    assert_eq!(
+        p["tokens"]["edges"][0]["node"]["name"],
+        "marmalade-v2.ledger"
+    );
+    assert_eq!(p["tokens"]["edges"].as_array().unwrap().len(), 2);
+    // Not built: NOT_AVAILABLE.
+    let mut w = hot.rw().unwrap();
+    w.del(Table::Meta, token_chains::READY.as_bytes()).unwrap();
+    w.commit().unwrap();
+    let (_, e) = query(&st, q).await;
+    assert_eq!(e["errors"][0]["extensions"]["code"], "NOT_AVAILABLE", "{e}");
+}
+
+/// A failed DEX history fill answers its own message, not "being filled".
+#[tokio::test]
+async fn a_failed_fill_says_so() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, st) = state(&d);
+    let mut w = hot.rw().unwrap();
+    kdx_hot::fills::set_failed(&mut w, kdx_hot::fills::DEX, "boom").unwrap();
+    w.commit().unwrap();
+    let (_, v) = query(&st, "{ pools { totalCount } }").await;
+    assert_eq!(v["errors"][0]["extensions"]["code"], "NOT_AVAILABLE", "{v}");
+    let msg = v["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("failed") && !msg.contains("being filled"),
+        "{msg}"
+    );
+    let mut w = hot.rw().unwrap();
+    kdx_hot::fills::clear_failed(&mut w, kdx_hot::fills::DEX).unwrap();
+    w.commit().unwrap();
+    let (_, v) = query(&st, "{ pools { totalCount } }").await;
+    assert!(
+        v["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("being filled"),
+        "{v}"
+    );
+}
+
+/// Item 4: a budget spent after the cap is reached serves the kept pairs, flagged capped.
+#[tokio::test]
+async fn listable_keeps_the_capped_list_when_the_budget_ends() {
+    let d = tempfile::tempdir().unwrap();
+    let (hot, _st) = state(&d);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    let n = dexserve::MAX_PAIRS + 5;
+    for i in 0..n {
+        w.pair(&format!("a.s{i:05}:coin"), now() - DAY, "1", "1");
+    }
+    mark_filled(&mut w.txn);
+    w.txn.commit().unwrap();
+    let ro = hot.ro().unwrap();
+    // Enough for the ranking and the kept pairs, not for one more pair's info.
+    let rows = 2 * n as u64 + 5 * dexserve::MAX_PAIRS as u64 + 2;
+    let mut b = Budget::with_rows(Instant::now() + Duration::from_secs(30), rows);
+    let got = dexserve::listable(&ro, &mut b).unwrap();
+    assert_eq!(got.len(), dexserve::MAX_PAIRS);
+    assert!(b.capped);
+}
+
+/// Item 3: a price search that spends its budget answers no path (price 0, as stock with no
+/// path), not a deadline error; the ranked neighbours are capped at 1,024.
+#[tokio::test]
+async fn a_spent_price_search_is_no_path() {
+    assert_eq!(dexserve::MAX_RANKED_NEIGHBORS, 1_024);
+    let d = tempfile::tempdir().unwrap();
+    let (hot, _st) = state(&d);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    let t0 = now() - DAY;
+    for i in 0..300 {
+        w.pair(&format!("a.j{i:03}:free.x"), t0, "1", "0.000001");
+    }
+    w.pair("free.x:free.y", t0 + 60, "10", "10");
+    w.pair("coin:free.y", t0 + 60, "5", "50");
+    kdx_hot::dex_usd::put(
+        &mut w.txn,
+        (now() / 3600) as u32,
+        &Amount::parse("0.005").unwrap(),
+    )
+    .unwrap();
+    mark_filled(&mut w.txn);
+    w.txn.commit().unwrap();
+    let ro = hot.ro().unwrap();
+    let mut b = Budget::with_rows(Instant::now() + Duration::from_secs(30), 50);
+    let p = dexserve::token_price(&ro, now(), "free.x", dexserve::DEFAULT_PROTOCOL, &mut b)
+        .unwrap()
+        .unwrap();
+    assert!(
+        format!("{:?}", p.price_in_kda).contains("text: \"0\""),
+        "{p:?}"
+    );
+    // The 0 is flagged (`extensions.dexPricesPartial`), not silent.
+    assert!(b.prices_partial);
+    // A spent deadline is flagged the same way.
+    let mut b = Budget::new(Instant::now());
+    let p = dexserve::token_price(&ro, now(), "free.x", dexserve::DEFAULT_PROTOCOL, &mut b)
+        .unwrap()
+        .unwrap();
+    assert!(
+        format!("{:?}", p.price_in_kda).contains("text: \"0\""),
+        "{p:?}"
+    );
+    assert!(b.prices_partial);
+    // With room it finds the path, unflagged.
+    let mut b = Budget::new(Instant::now() + Duration::from_secs(30));
+    let p = dexserve::token_price(&ro, now(), "free.x", dexserve::DEFAULT_PROTOCOL, &mut b)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !format!("{:?}", p.price_in_kda).contains("text: \"0\""),
+        "{p:?}"
+    );
+    assert!(!b.prices_partial);
+}

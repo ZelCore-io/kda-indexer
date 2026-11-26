@@ -133,6 +133,7 @@ pub fn touch(txn: &mut RwTxn<'_>, account: u32, module: u32, key: TxKey) -> Resu
     )?;
     txn.put(Table::Holders, &hold_key(module, chain, key, account), &[])?;
     txn.put(Table::HolderByTx, &by_tx_key(key, module, account), &[])?;
+    crate::token_chains::note(txn, module, chain, key)?;
     Ok(true)
 }
 
@@ -158,6 +159,7 @@ pub fn untouch_tx(txn: &mut RwTxn<'_>, key: TxKey) -> Result<usize> {
         if first_of(txn, a, m, key.chain())? == Some(key) {
             txn.del(Table::HolderFirst, &bal_key(a, m, key.chain()))?;
             txn.del(Table::Holders, &hold_key(m, key.chain(), key, a))?;
+            crate::token_chains::recheck(txn, m, key.chain())?;
         }
     }
     Ok(rows.len())
@@ -172,6 +174,8 @@ pub fn untouch_tx(txn: &mut RwTxn<'_>, key: TxKey) -> Result<usize> {
 pub fn drop_from(txn: &mut RwTxn<'_>, from: u32) -> Result<usize> {
     let start = from.to_be_bytes();
     let rows = txn.scan(Table::HolderByTx, &start, |_| true)?;
+    // The token chain list follows `Holders` in the same txn (`token_chains.rs`).
+    let mut touched = std::collections::BTreeSet::new();
     for (k, _) in &rows {
         let (Some(first), Some(m), Some(a)) = (
             k.get(..8)
@@ -191,6 +195,10 @@ pub fn drop_from(txn: &mut RwTxn<'_>, from: u32) -> Result<usize> {
             txn.del(Table::HolderFirst, &bal_key(a, m, first.chain()))?;
         }
         txn.del(Table::Holders, &hold_key(m, first.chain(), first, a))?;
+        touched.insert((m, first.chain()));
+    }
+    for (m, chain) in touched {
+        crate::token_chains::recheck(txn, m, chain)?;
     }
     Ok(rows.len())
 }
@@ -278,6 +286,7 @@ pub fn read_all(txn: &impl Txn) -> Result<Vec<Holder>> {
 pub fn clear_table(txn: &mut RwTxn<'_>) -> Result<()> {
     txn.clear(Table::Holders)?;
     txn.clear(Table::HolderFirst)?;
+    crate::token_chains::clear(txn)?;
     txn.clear(Table::HolderByTx)
 }
 
@@ -647,6 +656,11 @@ mod tests {
                     );
                 }
                 assert!(ready(&ro).unwrap(), "seed {seed}: stamps follow the tips");
+                assert_eq!(
+                    crate::token_chains::read_all(&ro, || true).unwrap(),
+                    crate::token_chains::derive(&got),
+                    "seed {seed}: token chains follow holders"
+                );
             }
         }
     }
@@ -676,6 +690,8 @@ mod tests {
             crate::tail::apply(&mut txn, b, &mut dict).unwrap();
         }
         let want = read_all(&txn).unwrap();
+        let want_chains = crate::token_chains::read_all(&txn, || true).unwrap();
+        assert_eq!(want_chains, crate::token_chains::derive(&want));
         txn.commit().unwrap();
 
         let dir2 = tempfile::tempdir().unwrap();
@@ -695,6 +711,72 @@ mod tests {
         let ro = hot2.ro().unwrap();
         assert_eq!(read_all(&ro).unwrap(), want);
         assert_eq!(ro.count(Table::HolderFirst).unwrap(), want.len());
+        // Backfill equals tail for the token chain list too.
+        assert_eq!(
+            crate::token_chains::read_all(&ro, || true).unwrap(),
+            want_chains
+        );
+    }
+
+    /// A backfill resume's [`super::drop_from`] leaves the table the ranges below the cut give,
+    /// and the token chain list stays the one `Holders` gives (chain bits and firsts of the
+    /// dropped rows go or move later in the same txn).
+    #[test]
+    fn drop_from_keeps_the_token_chain_list_derived() {
+        let mut rng = Rng(91);
+        let mut blocks = Vec::new();
+        for h in 0..30u32 {
+            for c in 0..3u8 {
+                let txs: Blk = (0..2)
+                    .map(|_| {
+                        (0..2)
+                            .map(|_| (1 + rng.below(5) as u32, 1 + rng.below(3) as u32))
+                            .collect()
+                    })
+                    .collect();
+                blocks.push(block(c, h, &txs, 1));
+            }
+        }
+        let tally = |part: &[IndexedBlock]| {
+            let mut t = super::Tally::default();
+            for b in part {
+                for x in &b.idx {
+                    t.add_sides(&x.holders, x.key);
+                }
+            }
+            t
+        };
+        for cut in [0u32, 1, 7, 15, 29, 30] {
+            let dir = tempfile::tempdir().unwrap();
+            let hot = HotStore::open(dir.path(), Geometry::default()).unwrap();
+            let mut txn = hot.rw().unwrap();
+            super::add_tally(&mut txn, &tally(&blocks)).unwrap();
+            txn.commit().unwrap();
+            let mut txn = hot.rw().unwrap();
+            super::drop_from(&mut txn, cut).unwrap();
+            txn.commit().unwrap();
+
+            let dir2 = tempfile::tempdir().unwrap();
+            let hot2 = HotStore::open(dir2.path(), Geometry::default()).unwrap();
+            let below: Vec<_> = blocks
+                .iter()
+                .filter(|b| b.block.height < u64::from(cut))
+                .cloned()
+                .collect();
+            let mut txn = hot2.rw().unwrap();
+            super::add_tally(&mut txn, &tally(&below)).unwrap();
+            txn.commit().unwrap();
+
+            let (ro, want) = (hot.ro().unwrap(), hot2.ro().unwrap());
+            let got = read_all(&ro).unwrap();
+            assert_eq!(got, read_all(&want).unwrap(), "cut {cut}");
+            assert_eq!(
+                crate::token_chains::read_all(&ro, || true).unwrap(),
+                crate::token_chains::derive(&got),
+                "cut {cut}"
+            );
+            assert_eq!(ro.count(Table::HolderFirst).unwrap(), got.len());
+        }
     }
 
     /// Review M-6 of PR #54: a row whose first transfer came from backfill keeps it through a
