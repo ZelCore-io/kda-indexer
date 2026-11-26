@@ -24,6 +24,7 @@ pub mod ids;
 pub mod limits;
 pub mod loaders;
 pub mod miss;
+pub mod order;
 pub mod pact;
 pub mod scalars;
 pub mod schema;
@@ -295,6 +296,9 @@ fn build(
         pact,
         miss,
     })
+    // Outermost: puts the final response in selection-set order (async-graphql answers
+    // in completion order), and only keeps a document the limits accepted.
+    .extension(order::FieldOrder)
     .extension(limits::Limits)
     .extension(flags::Flags)
     .extension(ws::WsOps)
