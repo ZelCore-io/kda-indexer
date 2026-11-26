@@ -114,11 +114,19 @@ pub fn codeless_request_error(r: &async_graphql::Response) -> bool {
 /// `extensions.code`s of the errors this indexer raises itself on a field: a cut
 /// `totalCount` (`COUNT_TIMEOUT`), a cap or a busy slot (`LIMIT`: the search slot, page and
 /// item caps, DEX budgets), a passed deadline (`TIMEOUT`) and data still being built
-/// (`NOT_AVAILABLE`: a fill or readiness wait). Stock never raises these, so on a non-null
+/// (`NOT_AVAILABLE`: a fill or readiness wait), and a field or filter this indexer does not
+/// serve (`NOT_SUPPORTED`, `UNSUPPORTED_FILTER`). Stock never raises these, so on a non-null
 /// field they null that field in place and keep the rest of the page (the behaviour before
 /// #60) instead of bubbling to the nearest nullable parent ([`crate::order`]). Every other
 /// error, async-graphql's own included, bubbles as the spec says.
-pub const IN_PLACE_CODES: [&str; 4] = ["COUNT_TIMEOUT", "LIMIT", "TIMEOUT", "NOT_AVAILABLE"];
+pub const IN_PLACE_CODES: [&str; 6] = [
+    "COUNT_TIMEOUT",
+    "LIMIT",
+    "TIMEOUT",
+    "NOT_AVAILABLE",
+    "NOT_SUPPORTED",
+    "UNSUPPORTED_FILTER",
+];
 
 /// Whether an error with these extensions is nulled in place rather than bubbled: its code
 /// is in [`IN_PLACE_CODES`], or it is one of the Pact passthrough's caps, which carry stock's
@@ -280,5 +288,34 @@ mod tests {
         ];
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&batch).unwrap()).unwrap();
         assert!(v[0].get("data").is_none() && v[1]["data"] == 1, "{v}");
+    }
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    fn ext(code: &str) -> async_graphql::ErrorExtensionValues {
+        let mut x = async_graphql::ErrorExtensionValues::default();
+        x.set("code", code);
+        x
+    }
+
+    /// PR #62 review I-a: an unserved field (`minerAccount`, a search left off) or filter
+    /// keeps the rest of the page like the other indexer-raised codes.
+    #[test]
+    fn unserved_fields_and_filters_null_in_place() {
+        for c in [
+            "NOT_SUPPORTED",
+            "UNSUPPORTED_FILTER",
+            "COUNT_TIMEOUT",
+            "NOT_AVAILABLE",
+        ] {
+            assert!(nulls_in_place(Some(&ext(c))), "{c}");
+        }
+        for c in ["BAD_USER_INPUT", "INTERNAL", INTERNAL_SERVER_ERROR] {
+            assert!(!nulls_in_place(Some(&ext(c))), "{c}");
+        }
+        assert!(!nulls_in_place(None));
     }
 }

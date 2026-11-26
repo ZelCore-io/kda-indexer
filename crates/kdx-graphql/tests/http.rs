@@ -150,8 +150,9 @@ async fn introspection_and_unserved_fields() {
     assert!(v.get("errors").is_none(), "{v}");
     let types = v["data"]["__schema"]["types"].as_array().unwrap();
     assert!(types.iter().any(|t| t["name"] == "TransactionResult"));
-    // pactQuery is not served here. It is non-null (`[PactQueryResponse!]!`, as stock), so
-    // its error nulls `data` (spec null propagation, as graphql-js answers).
+    // pactQuery is not served here. It is non-null (`[PactQueryResponse!]!`, as stock), but
+    // `NOT_SUPPORTED` is this indexer's own error, so it nulls the field in place and the
+    // other root field still answers (PR #62 review I-a).
     let (_, v, _) = query(
         &f,
         "{ graphConfiguration { version minimumBlockHeight } pactQuery(pactQuery: [{chainId: \"0\", code: \"(+ 1 2)\"}]) { result } }",
@@ -160,7 +161,8 @@ async fn introspection_and_unserved_fields() {
     assert_eq!(v["errors"][0]["extensions"]["code"], "NOT_SUPPORTED", "{v}");
     // The oracle sends the code top-level: a copy rides along with `extensions.code`.
     assert_eq!(v["errors"][0]["code"], "NOT_SUPPORTED", "{v}");
-    assert_eq!(v["data"], Value::Null, "{v}");
+    assert_eq!(v["data"]["pactQuery"], Value::Null, "{v}");
+    assert!(v["data"]["graphConfiguration"].is_object(), "{v}");
     // Variables keep exact numbers (the workspace serde_json has arbitrary_precision).
     let (_, v, _) = post(
         &f,

@@ -87,7 +87,7 @@ Errors carry `extensions.code`:
 | `TIMEOUT` | the request deadline passed |
 | `COUNT_TIMEOUT` | `totalCount` could not be counted exactly before the request deadline; the field answers no number (see `totalCount`) |
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
-| `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
+| `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, a fill or readiness wait, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
 | `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable is missing or its value does not coerce to its type. Such a request answers HTTP 500 with no `data` key, as stock answers it; in a batch the status stays 200. Also `transaction(minimumDepth:)` outside 1..=100, with stock's message (`[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.` or `… higher than 100.`), `transaction: null` and HTTP 200 |
 | `GRAPHQL_PARSE_FAILED` | the document does not parse: HTTP 400 with no `data` key, as stock (Apollo Server 4) answers it. The message is ours (async-graphql's parser), not graphql-js's |
@@ -111,7 +111,8 @@ never raises, nulls a non-null field in place (the field answers `null`, the err
 does not bubble. These are the `extensions.code`s `COUNT_TIMEOUT` (a cut `totalCount`), `LIMIT`
 (the `transactionsByPactCode` search slot, page and item caps, DEX budgets), `TIMEOUT` (the
 request deadline, including the DEX one) and `NOT_AVAILABLE` (data still being built: a fill
-or readiness wait), plus the `pactQuery`/`gasLimitEstimate` caps, which carry stock's
+or readiness wait), `NOT_SUPPORTED` (a field not served, such as `Block.minerAccount`, or a
+search left off) and `UNSUPPORTED_FILTER` (an `events` filter form not served), plus the `pactQuery`/`gasLimitEstimate` caps, which carry stock's
 `INTERNAL_SERVER_ERROR` code and name the cap in `extensions.limit` (`pact_items`,
 `pact_rate`, `pact_busy`). A strict client sees `null` in a non-null slot for these; blanking
 the whole page would lose the fields that did answer. Every other error, async-graphql's own
