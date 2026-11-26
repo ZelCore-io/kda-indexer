@@ -139,6 +139,10 @@ pub struct TxIndex {
     /// D3 raw candidates (receivers no TRANSFER names), for the tail's marks (ruling
     /// R-P5P9-192); empty for the coinbase and wherever the tail does not apply the block.
     pub d3: crate::receivers::D3Candidates,
+    /// Sorted, deduplicated `(AccountId, ModuleId)` sides this tx adds to the module holders
+    /// lists (`build::holder_sides`; coinbase miners included). Not stored: the tail and
+    /// backfill feed `kdx_hot::holders` from it; empty where nothing reads it.
+    pub holders: Vec<(u32, u32)>,
 }
 
 /// One block ready for storage: records plus their index entries (Tasks 4, 6, 7).
@@ -207,6 +211,30 @@ fn output_postings(out: &Value, dict: &mut impl DictMut, p: &mut Vec<(Family, u6
     }
 }
 
+/// The holder sides of an output's events (`TxIndex::holders`), interned.
+fn holder_postings(out: &Value, dict: &mut impl DictMut, h: &mut Vec<(u32, u32)>) {
+    let Some(evs) = out.get("events").and_then(Value::as_array) else {
+        return;
+    };
+    let mut accts = Vec::new();
+    for e in evs {
+        let Some(ev) = parse_event(e) else { continue };
+        accts.clear();
+        crate::build::holder_sides(&ev, &mut accts);
+        if accts.is_empty() {
+            continue;
+        }
+        let module = dict.intern(DictKind::Module, &ev.module);
+        for a in &accts {
+            if crate::build::holder_account_ok(a) {
+                h.push((dict.intern(DictKind::Account, a), module));
+            }
+        }
+    }
+    h.sort_unstable();
+    h.dedup();
+}
+
 /// Acct posting for `a` (already interned by `intern_block` when `account_ok`).
 fn account_posting(a: &str, dict: &mut impl DictMut, p: &mut Vec<(Family, u64)>) {
     if account_ok(a) {
@@ -244,13 +272,17 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
         let mut pact_id = None;
         let mut code_hash = None;
         let mut d3 = crate::receivers::D3Candidates::default();
+        let mut holders = Vec::new();
         if pos == 0 {
             if let Some(a) = b.miner.get("account").and_then(Value::as_str) {
                 account_posting(a, dict, &mut p);
             }
             output_postings(&b.coinbase, dict, &mut p);
+            // Review I-3 of PR #54: miners hold coin, so they are holders (stock omits them).
+            holder_postings(&b.coinbase, dict, &mut holders);
         } else if let Some(t) = b.txs.get(pos - 1) {
             output_postings(&t.output, dict, &mut p);
+            holder_postings(&t.output, dict, &mut holders);
             // Fork heights: mainnet01's on every network (like the seed pass's fallback; on a
             // network with earlier forks this only adds candidates).
             let cmd = t.cmd_parsed.as_ref().filter(|_| !r.cmd_unparsed);
@@ -307,6 +339,7 @@ pub fn extract(b: &DecodedBlock, txs: &[TxRecord], dict: &mut impl DictMut) -> V
             pact_id,
             code_hash,
             d3,
+            holders,
         });
     }
     out

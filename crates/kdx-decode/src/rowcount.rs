@@ -80,6 +80,37 @@ impl CountKind {
     }
 }
 
+/// The `(AccountId, ModuleId)` holder sides of `r` (`build::holder_sides`, as
+/// `index::extract` derives `TxIndex::holders`), from the record: what the holders rebuild
+/// walk reads. Names the dictionary lacks are left out.
+pub fn holder_sides(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<(u32, u32)>, RenderError> {
+    let out = render_output(r, dict)?;
+    let mut sides: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut accts = Vec::new();
+    if let Some(raw) = out.get("events").and_then(Value::as_array) {
+        for e in raw {
+            let Some(ev) = parse_event(e) else { continue };
+            accts.clear();
+            crate::build::holder_sides(&ev, &mut accts);
+            if accts.is_empty() {
+                continue;
+            }
+            let Some(m) = dict.find(DictKind::Module, &ev.module) else {
+                continue;
+            };
+            for a in &accts {
+                if let Some(id) = crate::build::holder_account_ok(a)
+                    .then(|| dict.find(DictKind::Account, a))
+                    .flatten()
+                {
+                    sides.insert((id, m));
+                }
+            }
+        }
+    }
+    Ok(sides.into_iter().collect())
+}
+
 /// One term: `rows` rows of `kind` under `entity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowTerm {

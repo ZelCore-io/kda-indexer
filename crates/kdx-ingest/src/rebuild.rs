@@ -180,6 +180,8 @@ pub async fn run(
         let mut txn = ctx.hot.rw()?;
         kdx_hot::rowcount::clear_ready(&mut txn)?;
         kdx_hot::chaincount::clear_ready(&mut txn)?;
+        // Its transfers may differ too: the holders are rebuilt by `reconcile-holders`.
+        kdx_hot::holders::clear_ready(&mut txn)?;
         txn.commit()?;
     }
     {

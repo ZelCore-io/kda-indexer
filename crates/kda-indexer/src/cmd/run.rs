@@ -77,6 +77,7 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     // PR #48 review I-1: clear the stored-counts marker before serving when a build without
     // stored counts moved the tips (logged with the chain and heights).
     kdx_ingest::row_counts::startup_guard(&hot)?;
+    kdx_ingest::holders_fill::startup_guard(&hot)?;
     let ctx = Arc::new(Ctx::open_with(o, node, hot.clone()).await?);
     // The API binds before backfill: admin and status answer while it runs, data routes
     // serve what is committed. It stops with the process (token).
@@ -384,6 +385,8 @@ async fn init_partial(ctx: &Ctx, cut: &kdx_node::Cut, h: u32) -> anyhow::Result<
     // A store from height h has no all-time per-chain counters: `countersOfEachChain`
     // answers NOT_AVAILABLE rather than counts that miss heights below h.
     kdx_hot::chaincount::clear_ready(&mut txn)?;
+    // No history below `h`: the holders table (exact only from block 0) is not served.
+    kdx_hot::holders::clear_ready(&mut txn)?;
     txn.set_meta(&dict::lens_key(h), &dict::encode_lens(&d))?;
     txn.commit()?;
     tracing::info!(

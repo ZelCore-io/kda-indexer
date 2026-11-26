@@ -46,6 +46,7 @@ fn indexed(b: &Blk) -> IndexedBlock {
             pact_id: None,
             code_hash: None,
             d3: Default::default(),
+            holders: Vec::new(),
         })
         .collect();
     IndexedBlock {

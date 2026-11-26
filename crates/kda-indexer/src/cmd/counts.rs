@@ -49,3 +49,40 @@ pub fn run(
     }
     Ok(())
 }
+
+/// `kda-indexer reconcile-holders`: build the module holders table (`kdx_ingest::holders_fill`)
+/// of a store built before it existed. Offline like `reconcile-counts`; `--check` compares.
+pub fn run_holders(
+    cfg: &Config,
+    data_dir: &Path,
+    threads: Option<usize>,
+    check: bool,
+) -> anyhow::Result<()> {
+    let _lock = if check {
+        None
+    } else {
+        Some(super::lock_data_dir(data_dir)?)
+    };
+    let hot_dir = super::hot::hot_dir(data_dir);
+    let hs = if check {
+        HotStore::open_ro(&hot_dir)?
+    } else {
+        HotStore::open(&hot_dir, super::hot::geometry(cfg))?
+    };
+    let threads = threads
+        .filter(|&t| t > 0)
+        .or(Some(cfg.balances.history_walk_threads as usize).filter(|&t| t > 0))
+        .unwrap_or_else(kdx_ingest::seed_receivers::default_history_threads);
+    let segdir = super::segments::segments_dir(data_dir);
+    tracing::info!(threads, check, "reconcile-holders: reading every record");
+    let rep = kdx_ingest::holders_fill::reconcile(&segdir, &hs, threads, check, &|| false)?;
+    tracing::info!(?rep, "reconcile-holders: done");
+    println!("{}", serde_json::to_string_pretty(&rep)?);
+    if !check && !rep.ready {
+        anyhow::bail!(
+            "{} records do not render: the holders table is written but not marked ready",
+            rep.unrendered
+        );
+    }
+    Ok(())
+}

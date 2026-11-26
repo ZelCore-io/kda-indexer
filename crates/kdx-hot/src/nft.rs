@@ -1005,6 +1005,7 @@ mod tests {
                 pact_id: None,
                 code_hash: None,
                 d3: Default::default(),
+                holders: Vec::new(),
             }],
             cmd_reencoded: 0,
             unindexed_accounts: 0,

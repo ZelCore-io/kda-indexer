@@ -1206,6 +1206,7 @@ mod genesis_rk_tests {
                 pact_id: None,
                 code_hash: None,
                 d3: Default::default(),
+                holders: Vec::new(),
             })
             .collect();
         IndexedBlock {
@@ -1339,6 +1340,7 @@ mod code_search_tests {
                 pact_id: None,
                 code_hash: Some(h),
                 d3: Default::default(),
+                holders: Vec::new(),
             }],
             txs: vec![r],
             cmd_reencoded: 0,
@@ -1459,6 +1461,7 @@ mod pact_steps_tests {
                 pact_id: None,
                 code_hash: None,
                 d3: Default::default(),
+                holders: Vec::new(),
             })
             .collect();
         IndexedBlock {

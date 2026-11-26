@@ -143,9 +143,11 @@ fn drop_hot_below(txn: &mut kdx_hot::RwTxn<'_>, end: u32) -> Result<u64> {
 fn move_txnum(txn: &mut kdx_hot::RwTxn<'_>, n: u64) -> Result<()> {
     kdx_hot::rowcount::guard(txn)?;
     kdx_hot::chaincount::guard(txn)?;
+    kdx_hot::holders::guard(txn)?;
     txn.set_next_txnum(n)?;
     kdx_hot::rowcount::stamp_txnum(txn)?;
-    kdx_hot::chaincount::stamp_txnum(txn)
+    kdx_hot::chaincount::stamp_txnum(txn)?;
+    kdx_hot::holders::stamp_txnum(txn)
 }
 
 /// On start: clear `etl/`, delete segment files the manifest does not list, and finish a
@@ -255,6 +257,7 @@ fn write_hot_step(ctx: &Ctx, start: u32, end: u32, w: &mut RangeWriter) -> Resul
                         pact_id: None,
                         code_hash: None,
                         d3: Default::default(),
+                        holders: Vec::new(),
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -441,6 +444,7 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
                     pact_id: None,
                     code_hash: None,
                     d3: Default::default(),
+                    holders: Vec::new(),
                 });
                 txs.push(t);
             }

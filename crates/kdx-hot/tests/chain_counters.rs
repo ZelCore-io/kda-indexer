@@ -32,6 +32,7 @@ fn block(chain: u8, height: u32, fork: u8, users: &[(u64, &str)]) -> IndexedBloc
             pact_id: None,
             code_hash: None,
             d3: Default::default(),
+            holders: Vec::new(),
         })
         .collect();
     IndexedBlock {

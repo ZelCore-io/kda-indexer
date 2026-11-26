@@ -2,7 +2,7 @@
 
 ## Commands that write
 
-`run`, `backfill`, `rebuild-range`, `unwind`, `segments add-index` and `reconcile-counts` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
+`run`, `backfill`, `rebuild-range`, `unwind`, `segments add-index`, `reconcile-counts` and `reconcile-holders` (and the hidden `tail` and `hot drop-family`) write to the data directory. Each one
 takes an exclusive lock on `<data_dir>/LOCK` and exits at once with an error if another
 kda-indexer process holds it. Stop the service (`systemctl stop kda-indexer-<network>`) before running
 `backfill`, `unwind` or `segments add-index` by hand. Read-only commands (`inspect`,
@@ -316,6 +316,37 @@ Backfill and the tail count them in `kdx_chain_counters_unpriced_total{mode}`. A
 reindex, check that metric's sum over the run, or the `unpriced` of `reconcile-counts --check`,
 before claiming gas parity, and explain any non-zero count (the records are those whose
 `cmd` could not be parsed or was re-encoded).
+
+### Module holders (`reconcile-holders`)
+
+`balance(module:)` without `accountName` reads the holders table (`Holders`, format.md). A new
+store keeps it from block 0 (backfill and the tail), so a reindex from scratch needs nothing.
+A store built before the table answers `NOT_AVAILABLE` for these lists until one run of:
+
+```sh
+systemctl stop kda-indexer-<network>
+kda-indexer -c <config> reconcile-holders     # [--threads N] [--data-dir D]
+systemctl start kda-indexer-<network>
+```
+
+- Same walk and rules as `reconcile-counts`: marker cleared first, every frozen record on
+  `--threads` workers, then the hot records, the table replaced and the marker and per-chain
+  stamps set last; idempotent; data-dir lock, so the service is stopped. Memory: one map
+  entry per holder row (about 1.2M on mainnet, roughly 100 MB).
+- `reconcile-holders --check` compares the walk with the stored table without the lock or
+  any write and reports `differing` (0 on a healthy store: backfill and tail equal the walk).
+- `rebuild-range`, `run --start-height` and a rollback to a build without the table clear
+  the marker: the startup guard sees the per-chain stamps lag the tips (blocks that build
+  applied or unwound), or `Meta holders_txnum` differ from `next_txnum` (ranges that build
+  backfilled or froze, which move no tip). Each backfill range, each freeze and
+  `reconcile-holders` write `holders_txnum` in the txn that moves `next_txnum`.
+- A new store serves the list while backfill from block 0 is still running: it is partial
+  until backfill finishes, and a row moves down as backfill finds an earlier first transfer
+  for it. Same as the per-chain counters.
+- A store whose table was built before PR #54's fix round (suffix `*TRANSFER` names, no
+  marmalade rows, accounts at most 256 bytes) needs one `reconcile-holders` to match the new
+  rule; on such a store, names longer than 256 bytes that were never interned stay out until
+  a reindex.
 
 ## Rolling back to a build before FIX-2
 

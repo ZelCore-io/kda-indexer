@@ -677,6 +677,7 @@ mod tests {
                     pact_id: None,
                     code_hash: Some(h),
                     d3: Default::default(),
+                    holders: Vec::new(),
                 }
             })
             .collect();

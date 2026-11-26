@@ -236,7 +236,12 @@ pub fn resume(ctx: &Ctx) -> Result<(Manifest, Prev, ResumeInfo)> {
         // manifest commit did not is built again: its totals would count twice.
         kdx_hot::chaincount::clear_ready(&mut txn)?;
         txn.set_frozen_frontier(m.frontier)?;
+        // The holders keep the rows that range added: the range is built again with the same
+        // first transfers (`touch` keeps the smallest), so the table follows the frontier
+        // it is reset to (PR #54 review I-1). A stamp an older build left is not stamped over.
+        kdx_hot::holders::guard(&mut txn)?;
         txn.set_next_txnum(m.next_txnum)?;
+        kdx_hot::holders::stamp_txnum(&mut txn)?;
         for c in 0..kdx_segment::SLOT_WIDTH as u8 {
             match prev.get(&c) {
                 Some(&(h, hash)) => set_checkpoint(&mut txn, Stage::Headers, c, h, hash)?,
@@ -720,6 +725,8 @@ fn build_and_commit(
     let mut unindexed = 0u64;
     // The range's per-chain user-tx and gas totals, added in its MDBX commit.
     let mut chains = kdx_hot::chaincount::Tally::default();
+    // The range's first transfer per holder row, added in its MDBX commit (`kdx_hot::holders`).
+    let mut holders = kdx_hot::holders::Tally::default();
     let mut w = RangeWriter::create(
         &ctx.segdir,
         &ctx.etl,
@@ -779,6 +786,9 @@ fn build_and_commit(
             for r in &ib.txs {
                 chains.add(r);
             }
+            for x in &ib.idx {
+                holders.add_sides(&x.holders, x.key);
+            }
             w.push(&ib)?;
             prev.insert(c, (h, hd.hash));
         }
@@ -817,6 +827,8 @@ fn build_and_commit(
     // Review I-2: counters that do not follow this store (a range an older build added
     // since the last stamp) are cleared before this range moves `next_txnum`, not stamped over.
     kdx_hot::chaincount::guard(&mut txn)?;
+    // PR #54 review I-1: the same for the holders table.
+    kdx_hot::holders::guard(&mut txn)?;
     txn.set_next_txnum(entry.end_txnum())?;
     txn.set_frozen_frontier(entry.end)?;
     // A range written outside the freezer: the stored row counts no longer hold (PR #48).
@@ -828,9 +840,16 @@ fn build_and_commit(
     let first = manifest.entries.first().map_or(entry.start, |e| e.start);
     if first > 0 {
         kdx_hot::chaincount::clear_ready(&mut txn)?;
+        // Nor holders from block 0.
+        kdx_hot::holders::clear_ready(&mut txn)?;
     }
     // The totals and the frontier they reach, in one commit (review I-2).
     kdx_hot::chaincount::stamp_txnum(&mut txn)?;
+    // The holders follow backfill from block 0. A range built again (its MDBX commit landed,
+    // its manifest commit did not) adds the same first transfers: `touch` keeps the smallest.
+    kdx_hot::holders::add_tally(&mut txn, &holders)?;
+    // ... and the frontier they reach, in the same commit (PR #54 review I-1).
+    kdx_hot::holders::stamp_txnum(&mut txn)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
     let tc = Instant::now();
     txn.commit()?;
