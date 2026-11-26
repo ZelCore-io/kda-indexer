@@ -1942,7 +1942,6 @@ mod tests {
             ..Caps::default()
         };
         let mut kl = KeyList::default();
-        kl.next_at = None;
         step(&ctx, &local, &caps, &mut kl).await.unwrap();
         let first = calls.load(Ordering::SeqCst);
         assert!(first >= 2, "describe-module and keys on chain 0");

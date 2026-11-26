@@ -420,7 +420,10 @@ fn fill_under(
     Ok(())
 }
 
-fn undo_entries(v: &[u8]) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+/// One undo log entry: a `TokenSwaps` key and the row an unwind restores (none: delete).
+type UndoEntry = (Vec<u8>, Option<Vec<u8>>);
+
+fn undo_entries(v: &[u8]) -> Result<Vec<UndoEntry>> {
     let mut entries = Vec::new();
     let mut b = v;
     while !b.is_empty() {
@@ -434,7 +437,7 @@ fn undo_entries(v: &[u8]) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
     Ok(entries)
 }
 
-fn undo_encode(entries: &[(Vec<u8>, Option<Vec<u8>>)]) -> Vec<u8> {
+fn undo_encode(entries: &[UndoEntry]) -> Vec<u8> {
     let mut u = Vec::new();
     for (key, prev) in entries {
         put_bytes(&mut u, key);
