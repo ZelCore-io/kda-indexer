@@ -18,8 +18,9 @@
 //! Additive tables (rule A-1, P6; layouts in `balances.rs` and `nft.rs`): `Balances`,
 //! `BalanceDirty`, `BalanceSeed`, `Guards`, `KeyAccounts`, `Tokens`, `NftBalances`, `NftDirty`,
 //! `NftDetails` (P7, GQ-15), `TokenSwaps` (`prices.rs`), `RowCounts` (`rowcount.rs`), `ChainCounters`
-//! (`chaincount.rs`) and the Sushi DEX tables `DexPairs`, `DexEvents`, `DexByTx`, `DexLp`, `DexAgg`,
-//! `DexUsd` (`dex.rs`). `HotStore::open` creates them;
+//! (`chaincount.rs`) the Sushi DEX tables `DexPairs`, `DexEvents`, `DexByTx`, `DexLp`, `DexAgg`,
+//! `DexUsd` (`dex.rs`) and
+//! `Holders` / `HolderFirst` (`holders.rs`). `HotStore::open` creates them;
 //! `open_ro` opens them when present, and a missing one reads as empty. They change no stored
 //! byte of the base tables or the segments, so they need no format version.
 //!
@@ -62,6 +63,8 @@ pub enum Table {
     DexLp,
     DexAgg,
     DexUsd,
+    Holders,
+    HolderFirst,
 }
 
 fn kind_name(k: DictKind) -> &'static str {
@@ -97,7 +100,7 @@ impl Table {
 
     /// Tables added after format v2 without a version bump (rule A-1): optional on a
     /// read-only open, empty when missing.
-    pub fn additive() -> [Table; 18] {
+    pub fn additive() -> [Table; 20] {
         [
             Table::Balances,
             Table::BalanceDirty,
@@ -117,6 +120,8 @@ impl Table {
             Table::DexLp,
             Table::DexAgg,
             Table::DexUsd,
+            Table::Holders,
+            Table::HolderFirst,
         ]
     }
 
@@ -156,6 +161,8 @@ impl Table {
             Table::DexLp => "DexLp".into(),
             Table::DexAgg => "DexAgg".into(),
             Table::DexUsd => "DexUsd".into(),
+            Table::Holders => "Holders".into(),
+            Table::HolderFirst => "HolderFirst".into(),
         }
     }
 }

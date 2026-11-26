@@ -80,6 +80,34 @@ impl CountKind {
     }
 }
 
+/// The `(AccountId, ModuleId)` of every `xfer` posting `r` has (the TRANSFER sides
+/// `index::extract` posts), from the record: what the holders rebuild walk reads. Names the
+/// dictionary lacks have no posting and are left out.
+pub fn xfer_sides(r: &TxRecord, dict: &dyn Dict) -> Result<Vec<(u32, u32)>, RenderError> {
+    let out = render_output(r, dict)?;
+    let mut sides: BTreeSet<(u32, u32)> = BTreeSet::new();
+    if let Some(raw) = out.get("events").and_then(Value::as_array) {
+        for e in raw {
+            let Some(ev) = parse_event(e) else { continue };
+            let Some((from, to)) = transfer_accounts(&ev) else {
+                continue;
+            };
+            let Some(m) = dict.find(DictKind::Module, &ev.module) else {
+                continue;
+            };
+            for a in [from, to] {
+                if let Some(id) = account_ok(a)
+                    .then(|| dict.find(DictKind::Account, a))
+                    .flatten()
+                {
+                    sides.insert((id, m));
+                }
+            }
+        }
+    }
+    Ok(sides.into_iter().collect())
+}
+
 /// One term: `rows` rows of `kind` under `entity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowTerm {

@@ -757,9 +757,8 @@ fn xfer_touched(
 
 /// `balance(accountName, module, chainIds)`: an account's fungible rows above 0, plus its rows
 /// at 0 that a TRANSFER touched (stock's rule; [`xfer_touched`]), listed by module name then
-/// chain, filtered by `module` and `chainIds`. Without `accountName` (a module's holders) it
-/// is `NOT_SUPPORTED`: the store keeps no holders-by-module index, and a scan of every balance
-/// row is not bounded (R7I-5).
+/// chain, filtered by `module` and `chainIds`. Without `accountName`, a module's holders
+/// ([`query_holders`]); without both, stock's error.
 #[allow(clippy::too_many_arguments)]
 pub async fn query_balance(
     ctx: &Context<'_>,
@@ -772,10 +771,12 @@ pub async fn query_balance(
     last: Option<i32>,
 ) -> Result<super::QueryBalanceConnection> {
     use crate::connection::{finish, Dir, Page, PageCursor};
-    let Some(account) = account_name else {
-        return Err(crate::error::not_supported(
-            "balance without accountName (a module's holders)",
-        ));
+    // Stock's argument rule (`balance-query-resolver.ts`): an empty string counts as absent.
+    let Some(account) = account_name.filter(|a| !a.is_empty()) else {
+        return match module.filter(|m| !m.is_empty()) {
+            Some(m) => query_holders(ctx, chain_ids, m, after, before, first, last).await,
+            None => Err(either_account_or_module()),
+        };
     };
     let account = crate::txlist::name_arg("accountName", &account)?.to_owned();
     let module = module
@@ -940,6 +941,182 @@ pub async fn query_balance(
                     balance: b,
                 },
             })
+            .collect(),
+        page_info,
+    })
+}
+
+/// Stock's message when `balance` gets neither `accountName` nor `module`
+/// (`balance-query-resolver.ts`), with the code stock answers a thrown resolver error with.
+pub const EITHER_ACCOUNT_OR_MODULE: &str = "Either accountName or module must be provided.";
+
+fn either_account_or_module() -> async_graphql::Error {
+    use async_graphql::ErrorExtensions;
+    async_graphql::Error::new(EITHER_ACCOUNT_OR_MODULE)
+        .extend_with(|_, e| e.set("code", crate::error::INTERNAL_SERVER_ERROR))
+}
+
+/// A holders cursor: the row's first transfer (TxKey) and AccountId, as
+/// `hld1:<txkey>:<account>` in base64url. Stock's cursor is its own row id.
+pub fn holders_cursor(first: u64, account: u32) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("hld1:{first}:{account}"))
+}
+
+pub fn decode_holders_cursor(s: &str) -> Result<(u64, u32)> {
+    use base64::Engine;
+    let bad = || bad_input("invalid cursor");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map_err(|_| bad())?;
+    let t = String::from_utf8(raw).map_err(|_| bad())?;
+    let rest = t.strip_prefix("hld1:").ok_or_else(bad)?;
+    let (f, a) = rest.split_once(':').ok_or_else(bad)?;
+    Ok((
+        f.parse::<u64>().map_err(|_| bad())?,
+        a.parse::<u32>().map_err(|_| bad())?,
+    ))
+}
+
+/// One served holder: first TxKey, AccountId, account name, chain, balance text.
+type HolderRow = (u64, u32, String, u8, String);
+
+/// `balance(module, chainIds)` without `accountName`: the module's holders, stock's
+/// `getAccountBalances` holders mode. Every `(account, chain)` a TRANSFER of the module named,
+/// at any balance (zero included), newest first transfer first (stock: newest insert id
+/// first; `kdx_hot::holders` explains the order). The balance is the stored row's
+/// (stock reads the node per row); a row with no stored balance, or one the node reported
+/// absent, is `"0"`, as stock's failed node read.
+///
+/// Cost: the index only, one bounded seek per chain (at most `first`/`last` + 1 keys each),
+/// under the page cap (`MAX_PAGE_ROWS`, `LIMIT` above it) and the request deadline, checked
+/// inside the walk. Stock lets any `first` through and reads the node once per row; ours never
+/// reads the node here. `NOT_AVAILABLE` while the holders table is not ready (a store built
+/// before it, until `kda-indexer reconcile-holders`).
+#[allow(clippy::too_many_arguments)]
+pub async fn query_holders(
+    ctx: &Context<'_>,
+    chain_ids: Option<Vec<String>>,
+    module: String,
+    after: Option<String>,
+    before: Option<String>,
+    first: Option<i32>,
+    last: Option<i32>,
+) -> Result<super::QueryBalanceConnection> {
+    use crate::connection::{finish, Dir, Page, PageCursor};
+    use kdx_hot::holders::{self, Order};
+    let module = crate::txlist::name_arg("module", &module)?.to_owned();
+    // At most 100 ids, each once; absent or `[]` is every chain (`chain_set`).
+    let chains: Vec<u8> = super::block::chain_set(chain_ids.as_deref())?;
+    let g = gql(ctx);
+    if first.is_some_and(|n| n < 0) || last.is_some_and(|n| n < 0) {
+        return Err(bad_input("first and last must not be negative"));
+    }
+    if first.is_some_and(|n| n != 0) && last.is_some_and(|n| n != 0) {
+        return Err(bad_input("pass first or last, not both"));
+    }
+    if after.is_some() && before.is_some() {
+        return Err(bad_input("pass after or before, not both"));
+    }
+    let (dir, n) = crate::connection::served_page(
+        first.map(i64::from),
+        last.map(i64::from),
+        after.is_some(),
+        before.is_some(),
+        g.settings.default_page as u64,
+    );
+    let n = n as usize;
+    if n > crate::MAX_PAGE_ROWS {
+        return Err(crate::error::page_limit());
+    }
+    match (dir, &after, &before) {
+        (Dir::Forward, None, Some(_)) => return Err(bad_input("before goes with last")),
+        (Dir::Backward, Some(_), None) => return Err(bad_input("after goes with first")),
+        _ => {}
+    }
+    let cur = after
+        .as_deref()
+        .or(before.as_deref())
+        .map(decode_holders_cursor)
+        .transpose()?;
+    let order = match dir {
+        Dir::Forward => Order::NewestFirst,
+        Dir::Backward => Order::OldestFirst,
+    };
+    let dl = crate::deadline(ctx);
+    let name = module.clone();
+    // `None`: the table is not ready.
+    let rows: Option<Vec<HolderRow>> = g
+        .state()?
+        .read(move |view| {
+            if !holders::ready(&view.txn)? {
+                return Ok(None);
+            }
+            let d = view.dict();
+            let Some(m) = d.find(DictKind::Module, &name) else {
+                return Ok(Some(Vec::new()));
+            };
+            let mut check = || -> anyhow::Result<()> {
+                if std::time::Instant::now() >= dl {
+                    anyhow::bail!(kdx_api::ApiError::Deadline);
+                }
+                Ok(())
+            };
+            let page = holders::page(&view.txn, m, &chains, order, cur, n + 1, &mut check)
+                .map_err(|e| match e.downcast::<kdx_api::ApiError>() {
+                    Ok(a) => a,
+                    Err(e) => kdx_api::ApiError::from(e),
+                })?;
+            let mut out = Vec::with_capacity(page.len());
+            for h in page {
+                view.check_deadline()?;
+                let Some(acct) = d.name(DictKind::Account, h.account) else {
+                    continue;
+                };
+                let bal = view
+                    .txn
+                    .get(Table::Balances, &balances::bal_key(h.account, m, h.chain))?
+                    .and_then(|v| BalanceRow::decode(&v))
+                    .filter(|r| !r.absent)
+                    .map_or_else(|| "0".to_owned(), |r| balance_text(&r.balance));
+                out.push((h.first.0, h.account, acct.to_owned(), h.chain, bal));
+            }
+            Ok(Some(out))
+        })
+        .await
+        .map_err(from_api)?;
+    let Some(rows) = rows else {
+        return Err(crate::error::err(
+            crate::error::Code::NotAvailable,
+            "the module holders list is being built (kda-indexer reconcile-holders)",
+        ));
+    };
+    let page: Page<PageCursor> = Page {
+        dir,
+        n,
+        // Only its presence is read (hasPreviousPage / hasNextPage).
+        cursor: cur.map(|_| {
+            PageCursor::Block(crate::connection::BlockCursor {
+                height: 0,
+                chain: 0,
+            })
+        }),
+    };
+    let (edges, page_info) = finish(rows, &page, |r| holders_cursor(r.0, r.1));
+    Ok(super::QueryBalanceConnection {
+        edges: edges
+            .into_iter()
+            .map(
+                |(cursor, (_, _, a, c, b))| super::QueryBalanceConnectionEdge {
+                    cursor,
+                    node: BalanceNode {
+                        account_name: a,
+                        module: module.clone(),
+                        chain_id: c.to_string(),
+                        balance: b,
+                    },
+                },
+            )
             .collect(),
         page_info,
     })

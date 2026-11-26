@@ -720,6 +720,8 @@ fn build_and_commit(
     let mut unindexed = 0u64;
     // The range's per-chain user-tx and gas totals, added in its MDBX commit.
     let mut chains = kdx_hot::chaincount::Tally::default();
+    // The range's first transfer per holder row, added in its MDBX commit (`kdx_hot::holders`).
+    let mut holders = kdx_hot::holders::Tally::default();
     let mut w = RangeWriter::create(
         &ctx.segdir,
         &ctx.etl,
@@ -779,6 +781,9 @@ fn build_and_commit(
             for r in &ib.txs {
                 chains.add(r);
             }
+            for x in &ib.idx {
+                holders.add_postings(&x.postings, x.key);
+            }
             w.push(&ib)?;
             prev.insert(c, (h, hd.hash));
         }
@@ -828,9 +833,14 @@ fn build_and_commit(
     let first = manifest.entries.first().map_or(entry.start, |e| e.start);
     if first > 0 {
         kdx_hot::chaincount::clear_ready(&mut txn)?;
+        // Nor holders from block 0.
+        kdx_hot::holders::clear_ready(&mut txn)?;
     }
     // The totals and the frontier they reach, in one commit (review I-2).
     kdx_hot::chaincount::stamp_txnum(&mut txn)?;
+    // The holders follow backfill from block 0. A range built again (its MDBX commit landed,
+    // its manifest commit did not) adds the same first transfers: `touch` keeps the smallest.
+    kdx_hot::holders::add_tally(&mut txn, &holders)?;
     txn.set_meta(&dict::lens_key(entry.end), &dict::encode_lens(&dict))?;
     let tc = Instant::now();
     txn.commit()?;

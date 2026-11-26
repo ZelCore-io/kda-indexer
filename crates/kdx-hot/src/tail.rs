@@ -10,6 +10,7 @@ use crate::chaincount;
 use crate::checkpoint::{clear_checkpoint, set_checkpoint, Stage};
 use crate::dict::HotDict;
 use crate::env::{RwTxn, Txn};
+use crate::holders;
 use crate::nft;
 use crate::prices;
 use crate::rowcount;
@@ -59,6 +60,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     // PR #48 review round 2 N-1: a tip an older build moved must not be stamped over below.
     rowcount::guard(txn)?;
     chaincount::guard(txn)?;
+    holders::guard(txn)?;
     let mut ops = Vec::new();
     dict.persist(txn)?;
     let coin = balances::coin_module(txn)?;
@@ -109,6 +111,11 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             // B-3: balances this block may change are re-read from the node.
             if marking {
                 balances::mark_posting(txn, f as u8, e, r.key, coin, true)?;
+            }
+            // A module's holders: every TRANSFER side, from its first transfer (no undo op;
+            // the posting's undo removes it, `holders.rs`).
+            if let Some((a, m)) = holders::xfer_sides(f as u8, e) {
+                holders::touch(txn, a, m, r.key)?;
             }
         }
         // Ruling R-P5P9-192: credits no TRANSFER names, marked like postings (no hourly lag).
@@ -176,6 +183,7 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     // PR #48 review I-1: the counts now follow this tip.
     rowcount::stamp(txn, chain)?;
     chaincount::stamp(txn, chain)?;
+    holders::stamp(txn, chain)?;
     Ok(())
 }
 
@@ -341,6 +349,9 @@ fn undo_op(
             key,
         } => {
             txn.del(Table::TailPostings, &posting_key(*family, *entity, *key))?;
+            if let Some((a, m)) = holders::xfer_sides(*family, *entity) {
+                holders::untouch(txn, a, m, *key)?;
+            }
             // B-3: no balance undo ops; the row is marked dirty and re-read.
             if balances::marking() {
                 balances::mark_posting(txn, *family, *entity, *key, coin, false)?;
@@ -385,6 +396,7 @@ pub fn unwind_to_with(
     // so check it here, in this txn, before the counts move and the new tip is stamped.
     rowcount::guard(txn)?;
     chaincount::guard(txn)?;
+    holders::guard(txn)?;
     let from = match height.checked_add(1) {
         Some(h) => block_key(chain, h),
         None => return Ok(0),
@@ -416,6 +428,7 @@ pub fn unwind_to_with(
     // PR #48 review I-1: the counts follow the new tip (or no tip).
     rowcount::stamp(txn, chain)?;
     chaincount::stamp(txn, chain)?;
+    holders::stamp(txn, chain)?;
     Ok(n)
 }
 

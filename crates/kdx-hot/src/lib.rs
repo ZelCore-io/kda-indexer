@@ -12,6 +12,7 @@ pub mod checkpoint;
 pub mod dex;
 pub mod dict;
 pub mod env;
+pub mod holders;
 pub mod nft;
 pub mod prices;
 pub mod rowcount;

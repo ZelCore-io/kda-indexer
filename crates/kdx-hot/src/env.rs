@@ -117,6 +117,9 @@ impl HotStore {
                 // keeps them so from block 0 (`chaincount.rs`).
                 put(crate::chaincount::READY, &0u64.to_be_bytes())?;
                 put(crate::chaincount::TXNUM_AT, &0u64.to_be_bytes())?;
+                // An empty store: the (empty) holders table is exact, and every writer keeps it
+                // from block 0 (`holders.rs`).
+                put(crate::holders::READY, &0u64.to_be_bytes())?;
             }
             Some(v) => {
                 let v = be_u64(&v).context("Meta format_version")?;

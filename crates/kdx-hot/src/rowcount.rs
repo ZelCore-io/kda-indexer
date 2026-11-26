@@ -99,7 +99,7 @@ pub fn stamp_all(txn: &mut RwTxn<'_>) -> Result<()> {
     Ok(())
 }
 
-fn tips(txn: &impl Txn) -> Result<BTreeMap<u8, Vec<u8>>> {
+pub(crate) fn tips(txn: &impl Txn) -> Result<BTreeMap<u8, Vec<u8>>> {
     let p = Stage::Tail as u8;
     Ok(txn
         .scan(Table::StageCheckpoint, &[p], |k| k.first() == Some(&p))?

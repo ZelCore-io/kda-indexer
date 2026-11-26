@@ -215,6 +215,8 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
     // of range 2 (`FIRST_RANGE_END`), and one cursor bounds at `FRONTIER`.
     let mut m = Manifest::new("mainnet01");
     let mut first_txnum = 0;
+    // The frozen ranges' holders, as backfill adds them in each range's commit.
+    let mut holders = kdx_hot::holders::Tally::default();
     for (start, end) in [(0, FIRST_RANGE_END), (FIRST_RANGE_END, FRONTIER)] {
         let mut w = RangeWriter::create(
             &segdir,
@@ -228,7 +230,11 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         )
         .unwrap();
         for &(c, h, shapes) in BLOCKS.iter().filter(|b| (start..end).contains(&b.1)) {
-            w.push(&index(c, h, shapes, &mut dict)).unwrap();
+            let ib = index(c, h, shapes, &mut dict);
+            for x in &ib.idx {
+                holders.add_postings(&x.postings, x.key);
+            }
+            w.push(&ib).unwrap();
         }
         let entry = w.finish().unwrap();
         first_txnum = entry.end_txnum();
@@ -236,6 +242,7 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
     }
     m.commit(&segdir).unwrap();
     t.set_frozen_frontier(FRONTIER).unwrap();
+    kdx_hot::holders::add_tally(&mut t, &holders).unwrap();
     t.set_next_txnum(first_txnum).unwrap();
     for &(c, h, shapes) in BLOCKS.iter().filter(|b| b.1 >= FRONTIER) {
         let ib = index(c, h, shapes, &mut dict);
@@ -3510,4 +3517,243 @@ mod stored_count {
             );
         }
     }
+}
+
+// --- Module holders: `balance(module:)` without `accountName` (stock's holders mode) ---
+
+/// `(accountName, chainId, balance)` of a holders page, and the response.
+async fn holder_rows(s: &KdxSchema, args: &str) -> (Vec<(String, String, String)>, Value) {
+    let v = run(
+        s,
+        &format!(
+            "{{ balance({args}) {{ edges {{ cursor node {{ accountName chainId balance module }} }} \
+             pageInfo {{ hasNextPage hasPreviousPage startCursor endCursor }} }} }}"
+        ),
+    )
+    .await;
+    let rows = v["balance"]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let n = &e["node"];
+            (
+                n["accountName"].as_str().unwrap().to_owned(),
+                n["chainId"].as_str().unwrap().to_owned(),
+                n["balance"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    (rows, v)
+}
+
+fn sorted<T: Ord + Clone>(v: &[T]) -> Vec<T> {
+    let mut v = v.to_vec();
+    v.sort();
+    v
+}
+
+/// Stock's holders mode: every `(account, chain)` a coin TRANSFER named, zero balances
+/// included, newest first transfer first; the stored balance, "0" without a stored row; the
+/// module on every node; `chainIds` filters; an unknown module is an empty page.
+#[tokio::test]
+async fn holders_list_every_transfer_side_newest_first() {
+    let fx = fixture();
+    let (rows, v) = holder_rows(&fx.schema, "module: \"coin\"").await;
+    assert_eq!(rows.len(), 6, "{v}");
+    // Chain 1's rows first appear at height 6 (one tx), chain 0's at height 4 (Carol in the
+    // second tx, Alice and Bob in the first): ties are ordered by AccountId, newest first.
+    let c1: Vec<_> = rows[..3]
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str()))
+        .collect();
+    assert_eq!(sorted(&c1), [(ALICE, "1"), (BOB, "1"), (CAROL, "1")], "{v}");
+    assert_eq!(rows[3], (CAROL.into(), "0".into(), "0".into()), "{v}");
+    let c0: Vec<_> = rows[4..]
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str()))
+        .collect();
+    assert_eq!(sorted(&c0), [(ALICE, "0"), (BOB, "0")], "{v}");
+    let bal = |a: &str, c: &str| {
+        rows.iter()
+            .find(|r| r.0 == a && r.1 == c)
+            .map(|r| r.2.clone())
+            .unwrap()
+    };
+    // Stored rows (Alice 1.0, Carol 2.0 on chain 1; Bob and Carol at 0 on chain 0) and no
+    // stored row (Bob on chain 1): "0", as stock's failed node read.
+    assert_eq!(bal(ALICE, "0"), "1");
+    assert_eq!(bal(ALICE, "1"), "1");
+    assert_eq!(bal(BOB, "0"), "0");
+    assert_eq!(bal(BOB, "1"), "0");
+    assert_eq!(bal(CAROL, "0"), "0");
+    assert_eq!(bal(CAROL, "1"), "2");
+    for e in v["balance"]["edges"].as_array().unwrap() {
+        assert_eq!(e["node"]["module"], "coin");
+    }
+    assert_eq!(v["balance"]["pageInfo"]["hasNextPage"], false);
+    assert_eq!(v["balance"]["pageInfo"]["hasPreviousPage"], false);
+    // A token: only its own transfer sides.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"kaddex.kdx\"").await;
+    assert_eq!(
+        sorted(&rows),
+        [
+            (ALICE.into(), "0".into(), "0".into()),
+            (ALICE.into(), "1".into(), "0".into()),
+            (CAROL.into(), "0".into(), "0".into()),
+            (CAROL.into(), "1".into(), "0".into()),
+        ],
+        "{v}"
+    );
+    // `chainIds`.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"coin\", chainIds: [\"0\"]").await;
+    assert_eq!(rows.len(), 3, "{v}");
+    assert!(rows.iter().all(|r| r.1 == "0"), "{v}");
+    let (rows, _) = holder_rows(&fx.schema, "module: \"coin\", chainIds: [\"5\"]").await;
+    assert!(rows.is_empty());
+    // Unknown module: empty, as stock.
+    let (rows, v) = holder_rows(&fx.schema, "module: \"free.nothing\"").await;
+    assert!(rows.is_empty(), "{v}");
+    // An empty accountName counts as absent (stock's `!accountName`).
+    let (rows, _) = holder_rows(&fx.schema, "accountName: \"\", module: \"coin\"").await;
+    assert_eq!(rows.len(), 6);
+}
+
+/// Pages forward (`first`/`after`) and backward (`last`/`before`) at every size join to the
+/// whole list, in its order, none repeated or skipped; a `last` page is served newest first
+/// (stock reverses its ascending read), and the flags follow stock's connection rules.
+#[tokio::test]
+async fn holders_pages_join_to_the_whole_list() {
+    let fx = fixture();
+    let (all, _) = holder_rows(&fx.schema, "module: \"coin\", first: 100").await;
+    for size in 1..=7usize {
+        for (dir, cur_arg) in [("first", "after"), ("last", "before")] {
+            let mut seen: Vec<(String, String, String)> = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let args = match &cursor {
+                    None => format!("module: \"coin\", {dir}: {size}"),
+                    Some(c) => format!("module: \"coin\", {dir}: {size}, {cur_arg}: \"{c}\""),
+                };
+                let (rows, v) = holder_rows(&fx.schema, &args).await;
+                let info = &v["balance"]["pageInfo"];
+                let (more, back) = if dir == "first" {
+                    (info["hasNextPage"].clone(), info["hasPreviousPage"].clone())
+                } else {
+                    (info["hasPreviousPage"].clone(), info["hasNextPage"].clone())
+                };
+                assert_eq!(back, json!(cursor.is_some()), "{dir} {size}: {v}");
+                if dir == "first" {
+                    seen.extend(rows.iter().cloned());
+                } else {
+                    let mut r = rows.clone();
+                    r.extend(seen);
+                    seen = r;
+                }
+                if more != json!(true) {
+                    break;
+                }
+                cursor = if dir == "first" {
+                    info["endCursor"].as_str().map(str::to_owned)
+                } else {
+                    info["startCursor"].as_str().map(str::to_owned)
+                };
+            }
+            assert_eq!(seen, all, "{dir} size {size}");
+        }
+    }
+    // `last: 2`: the two oldest, newest first.
+    let (rows, _) = holder_rows(&fx.schema, "module: \"coin\", last: 2").await;
+    assert_eq!(rows, all[4..].to_vec());
+    // A bad cursor is refused.
+    let r = fx
+        .schema
+        .execute("{ balance(module: \"coin\", after: \"bal1\") { edges { cursor } } }")
+        .await;
+    assert_eq!(r.errors[0].message, "invalid cursor");
+}
+
+/// Stock's argument rule and message; our page cap, deadline and readiness rules.
+#[tokio::test]
+async fn holders_refusals_follow_stock_and_our_limits() {
+    let fx = fixture();
+    for q in [
+        "{ balance { edges { cursor } } }",
+        "{ balance(accountName: \"\", module: \"\") { edges { cursor } } }",
+        "{ balance(chainIds: [\"0\"], first: 5) { edges { cursor } } }",
+    ] {
+        let r = fx.schema.execute(q).await;
+        let e = serde_json::to_value(&r.errors).unwrap();
+        assert_eq!(
+            e[0]["message"], "Either accountName or module must be provided.",
+            "{q}: {e}"
+        );
+        assert_eq!(e[0]["extensions"]["code"], "INTERNAL_SERVER_ERROR", "{e}");
+    }
+    // Stock lets `first: 100000` through and reads the node per row; ours refuses it before
+    // any read: the operation's complexity, and a page over the 1000-row cap.
+    let r = fx
+        .schema
+        .execute("{ balance(module: \"coin\", first: 100000) { edges { node { balance } } } }")
+        .await;
+    let e = serde_json::to_value(&r.errors).unwrap();
+    assert_eq!(e[0]["extensions"]["limit"], "complexity", "{e}");
+    let r = fx
+        .schema
+        .execute("{ balance(module: \"coin\", first: 1001) { edges { cursor } } }")
+        .await;
+    let e = serde_json::to_value(&r.errors).unwrap();
+    assert_eq!(e[0]["extensions"]["code"], "LIMIT", "{e}");
+    assert_eq!(e[0]["extensions"]["limit"], "page", "{e}");
+    // A passed request deadline stops the walk.
+    let req =
+        async_graphql::Request::new("{ balance(module: \"coin\", first: 5) { edges { cursor } } }")
+            .data(kdx_graphql::ReqCtx {
+                deadline: Instant::now() - Duration::from_secs(1),
+            });
+    let r = fx.schema.execute(req).await;
+    assert!(!r.errors.is_empty(), "a passed deadline answers an error");
+    // Not ready (a store built before the table): NOT_AVAILABLE, never a partial list.
+    {
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::holders::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+    }
+    let r = fx
+        .schema
+        .execute("{ balance(module: \"coin\") { edges { cursor } } }")
+        .await;
+    let e = serde_json::to_value(&r.errors).unwrap();
+    assert_eq!(e[0]["extensions"]["code"], "NOT_AVAILABLE", "{e}");
+    // The account path does not depend on it.
+    let (rows, _) = balance_rows(&fx.schema, CAROL, "").await;
+    assert!(!rows.is_empty());
+}
+
+/// Backfill equals ingest: the rebuild walk over the records (frozen and hot) gives exactly
+/// the table that backfill's per-range tallies and the tail's apply built; a rebuild from an
+/// emptied table gives it back and sets the marker.
+#[tokio::test]
+async fn the_holders_rebuild_walk_equals_ingest() {
+    use kdx_ingest::holders_fill;
+    let fx = fixture();
+    let want = kdx_hot::holders::read_all(&fx.store.hot.ro().unwrap()).unwrap();
+    assert!(!want.is_empty());
+    let rep = holders_fill::reconcile(&fx.store.segdir, &fx.store.hot, 2, true, &|| false).unwrap();
+    assert_eq!(rep.differing, Some(0), "{rep:?}");
+    assert!(rep.ready);
+    {
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::holders::clear_table(&mut t).unwrap();
+        kdx_hot::holders::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+    }
+    let rep =
+        holders_fill::reconcile(&fx.store.segdir, &fx.store.hot, 3, false, &|| false).unwrap();
+    assert!(rep.ready, "{rep:?}");
+    let ro = fx.store.hot.ro().unwrap();
+    assert_eq!(kdx_hot::holders::read_all(&ro).unwrap(), want);
+    assert!(kdx_hot::holders::ready(&ro).unwrap());
+    let (rows, _) = holder_rows(&fx.schema, "module: \"coin\"").await;
+    assert_eq!(rows.len(), 6);
 }

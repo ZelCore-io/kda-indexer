@@ -214,6 +214,18 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Build the module holders table behind `balance(module:)` without `accountName` from
+    /// every record and mark it ready (a store built before the table; idempotent; takes the
+    /// data dir lock, so the service is stopped). `--check` only compares (read-only).
+    ReconcileHolders {
+        /// Worker threads (default `[balances] history_walk_threads`, else the cores less 2).
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Balances (B-2…B-5): rerun the seed, mark every row dirty, or print the reconcile
     /// status. `run` seeds and reconciles by itself; `--seed` and `--all` take the data dir
     /// lock (service stopped), `--status` only reads.
@@ -702,6 +714,16 @@ async fn main() -> anyhow::Result<()> {
             check,
             data_dir,
         } => kda_indexer::cmd::counts::run(
+            &cfg,
+            data_dir.as_deref().unwrap_or(&cfg.data_dir),
+            threads,
+            check,
+        ),
+        Command::ReconcileHolders {
+            threads,
+            check,
+            data_dir,
+        } => kda_indexer::cmd::counts::run_holders(
             &cfg,
             data_dir.as_deref().unwrap_or(&cfg.data_dir),
             threads,
