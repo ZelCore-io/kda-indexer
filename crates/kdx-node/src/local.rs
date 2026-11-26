@@ -134,6 +134,10 @@ pub fn is_no_table_message(msg: &str) -> bool {
         && msg.ends_with(" was not found.")
 }
 
+/// Longest no-table message kept whole: its fixed text plus a module and a table name of
+/// [`MAX_NAME_LEN`] bytes each.
+const MAX_NO_TABLE_MESSAGE: usize = 128 + 2 * MAX_NAME_LEN;
+
 /// The failure message means "no such row" (Pact 5 `No value found in table …`, Pact 4
 /// `with-read: row not found …`) or "no such keyset".
 pub fn is_absent_message(msg: &str) -> bool {
@@ -374,6 +378,10 @@ fn classify(r: &Value) -> LocalResult<Value> {
                 .unwrap_or("");
             if is_absent_message(msg) {
                 Ok(Local::Absent)
+            } else if is_no_table_message(msg) && msg.len() <= MAX_NO_TABLE_MESSAGE {
+                // N-09: kept whole, so `table_keys` still sees the end of a message whose
+                // table name is longer than the 200 characters any other failure keeps.
+                Err(LocalError::Failure(msg.to_owned()))
             } else {
                 let cut: String = msg.chars().take(200).collect();
                 Err(LocalError::Failure(cut))
@@ -1093,6 +1101,31 @@ mod tests {
             "Error during database operation: Table access failed because table x was locked"
         ));
         assert!(!is_no_table_message("Module admin necessary for operation"));
+    }
+
+    /// N-09: a long `{module}_{table}` (a principal namespace is 42 bytes) pushes the message
+    /// past the 200 characters a failure keeps; the no-table check must still see its end.
+    #[test]
+    fn a_long_missing_table_name_still_reads_as_no_table() {
+        let module = format!("n_{}.{}", "ab".repeat(20), "m".repeat(60));
+        let msg = format!(
+            "Error during database operation: Table access failed because table \
+             {module}_{} was not found.",
+            "t".repeat(60)
+        );
+        assert!(msg.chars().count() > 200);
+        let r = json!({"result": {"status": "failure", "error": {"message": msg}}});
+        match classify(&r) {
+            Err(LocalError::Failure(m)) => assert!(is_no_table_message(&m), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Any other failure is still cut to 200 characters.
+        let long = json!({"result": {"status": "failure",
+            "error": {"message": "x".repeat(5000)}}});
+        match classify(&long) {
+            Err(LocalError::Failure(m)) => assert_eq!(m.chars().count(), 200),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The table name goes into the code as text: identifier characters only.
