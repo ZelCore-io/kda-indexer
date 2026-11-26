@@ -1,0 +1,903 @@
+//! Sushi DEX ledger (stock-gap B2): the store side of stock's DEX fields (`pools`, `pool`,
+//! `poolTransactions`, `liquidityPositions`, `dexMetrics`, `tokenPrice(s)`, `tokens`).
+//!
+//! Stock (indexer-kadena `90a4be1`, `services/pair.ts`, `pair-service.ts`) indexes one DEX:
+//! Sushi on Kadena, module [`SUSHI_EXCHANGE`] and its LP token module [`SUSHI_TOKENS`], on
+//! chain [`SUSHI_CHAIN`] from height [`SUSHI_DEPLOY_HEIGHT`]. It reads these events (params as
+//! stock destructures them):
+//!
+//! | Event | Params |
+//! |---|---|
+//! | `CREATE_PAIR` | `[token0 ref, token1 ref, key, account]` |
+//! | `UPDATE` | `[key, reserve0, reserve1]` |
+//! | `SWAP` | `[sender, receiver, in, token-in ref, out, token-out ref]` |
+//! | `ADD_LIQUIDITY`, `REMOVE_LIQUIDITY` | `[sender, to, token0 ref, token1 ref, amount0, amount1, liquidity]` |
+//! | `MINT_EVENT`, `BURN_EVENT` (tokens module) | `[key, account, amount]` |
+//! | `TRANSFER_EVENT` (tokens module) | `[key, sender, receiver, amount]` |
+//!
+//! **Trust.** Only an event whose `EventName` is exactly one of [`EVENT_NAMES`] *and* whose
+//! `Module` is the matching Sushi module is read (Pact lets only a module emit events under its
+//! own name; the `n_` principal namespace cannot be squatted). Amounts come from these events
+//! only, never from the tx's `result` or its args (both are the sender's). A failed or coinbase
+//! tx, another chain, or a height below the deploy height is skipped before any decoding.
+//!
+//! **Pairs.** A pair is named by its two token names sorted bytewise and joined by `:` (stock's
+//! `createOrFindPair` key; Pact names hold no `:`). `token0` is the smaller name. Every event is
+//! oriented to that order on its own (an `UPDATE`/LP key `x:y` is split and re-sorted; a swap or
+//! liquidity event names its tokens), so no event depends on another being stored first: the
+//! stored state is a pure function of the *set* of events stored. That makes ingest, unwind and
+//! the history fill (in any order, beside the live tail) give the same bytes.
+//!
+//! **Amounts** are exact decimals ([`Amount`]): at most [`SCALE`] fractional digits, at most
+//! [`MAX_AMOUNT_TEXT`] bytes of text, exponent within ±[`MAX_EXP`], never negative. An event with
+//! an amount outside that is not stored (counted in [`ApplyStats::rejected`]). Sums are
+//! arbitrary precision, so they never overflow. No division happens at ingest: a price in KDA is
+//! `coin leg / token leg` of a swap, taken by the reader (which must treat a zero leg as no
+//! price).
+//!
+//! **Tables** (additive, rule A-1; integers big-endian; `pair` = `token0:token1` utf-8;
+//! `ev` = `TxKey u64 ‖ event index u16`, the event's place in its tx):
+//!
+//! | Table | Key | Value |
+//! |---|---|---|
+//! | `DexPairs` | pair, 0x00, ev | empty (one row per `CREATE_PAIR`) |
+//! | `DexEvents` | pair, 0x00, kind u8, ev | kind u8, block time u64 (µs), then varint-length fields ([`StoredEvent`]) |
+//! | `DexByTx` | ev | kind u8, pair (where the event's row is; unwind and idempotence index) |
+//! | `DexLp` | pair, 0x00, account | LP balance, decimal text (row absent when zero) |
+//! | `DexAgg` | 0x01, pair | LP total supply, decimal text (Σ mint − Σ burn; absent when zero) |
+//! | `DexAgg` | 0x02, pair, 0x00, hour u32 | [`Bucket`]: swap/add/remove counts and swap in/out sums per side |
+//! | `DexUsd` | hour u32 | USD per KDA, decimal text: reserved for the serving part's DIA feed; ingest never writes it |
+//!
+//! `DexEvents` fields per kind (amounts oriented to the pair, as decimal text):
+//! `CREATE_PAIR` `[sushi key, account]`; `UPDATE` `[reserve0, reserve1]`; `SWAP` `[maker,
+//! receiver, amount0In, amount1In, amount0Out, amount1Out]`; `ADD_LIQUIDITY` /
+//! `REMOVE_LIQUIDITY` `[sender, to, amount0, amount1, liquidity]`; `MINT_EVENT` / `BURN_EVENT`
+//! `[account, amount]`; `TRANSFER_EVENT` `[sender, receiver, amount]`.
+//! The hour is `block creationTime / 3600 s` (the block's, not the sender's `meta.creationTime`).
+//! Fees are not stored: Sushi's fee is 0.3 % of the input, so a bucket's fee per side is
+//! `in × 3 / 997` (stock's `in × FEE / (1 − FEE)`), exact from the stored sums.
+//!
+//! **Reorgs.** A block's rows are found through `DexByTx` (its keys are the block's TxKeys, one
+//! contiguous range): [`undo_block`] reverses each row's effect and deletes it. No undo log is
+//! needed, and rows the history fill wrote are unwound the same way.
+//!
+//! **Bounds.** At most [`MAX_EVENTS_PER_TX`] Sushi events are read per tx; each writes at most
+//! 4 rows of at most a few hundred bytes (names ≤ 256 bytes, amounts ≤ [`MAX_AMOUNT_TEXT`]).
+
+use anyhow::{bail, Context, Result};
+use kdx_types::record::TxRecord;
+use kdx_types::varint::{get_bytes, put_bytes};
+use kdx_types::{value, Dict, DictKind, TxKey};
+use serde_json::Value;
+
+use crate::env::{RwTxn, Txn};
+use crate::prices::valid_token;
+use crate::tables::Table;
+
+/// Sushi's exchange module.
+pub const SUSHI_EXCHANGE: &str = "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange";
+/// Sushi's LP token module.
+pub const SUSHI_TOKENS: &str = "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-tokens";
+/// The only chain Sushi is deployed on.
+pub const SUSHI_CHAIN: u8 = 2;
+/// The height of Sushi's deploy on chain 2 (no Sushi event exists below it).
+pub const SUSHI_DEPLOY_HEIGHT: u32 = 6_277_684;
+/// Fractional digits an amount may have.
+pub const SCALE: usize = 24;
+/// Longest amount text accepted (bytes).
+pub const MAX_AMOUNT_TEXT: usize = 96;
+/// Largest exponent magnitude accepted in an amount (`1e40`).
+pub const MAX_EXP: i64 = 64;
+/// Sushi events read per tx; the rest are not stored.
+pub const MAX_EVENTS_PER_TX: usize = 64;
+/// Longest account name stored (Pact accounts are at most 256 characters).
+pub const MAX_ACCOUNT_LEN: usize = 256;
+
+/// Sushi event kinds (stored as the `kind` byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Kind {
+    CreatePair = 0,
+    Update = 1,
+    Swap = 2,
+    AddLiquidity = 3,
+    RemoveLiquidity = 4,
+    Mint = 5,
+    Burn = 6,
+    Transfer = 7,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 8] = [
+        Kind::CreatePair,
+        Kind::Update,
+        Kind::Swap,
+        Kind::AddLiquidity,
+        Kind::RemoveLiquidity,
+        Kind::Mint,
+        Kind::Burn,
+        Kind::Transfer,
+    ];
+
+    pub fn from_u8(b: u8) -> Option<Kind> {
+        Kind::ALL.get(usize::from(b)).copied()
+    }
+
+    /// The emitting module and the event's name.
+    pub fn module_and_name(self) -> (&'static str, &'static str) {
+        match self {
+            Kind::CreatePair => (SUSHI_EXCHANGE, "CREATE_PAIR"),
+            Kind::Update => (SUSHI_EXCHANGE, "UPDATE"),
+            Kind::Swap => (SUSHI_EXCHANGE, "SWAP"),
+            Kind::AddLiquidity => (SUSHI_EXCHANGE, "ADD_LIQUIDITY"),
+            Kind::RemoveLiquidity => (SUSHI_EXCHANGE, "REMOVE_LIQUIDITY"),
+            Kind::Mint => (SUSHI_TOKENS, "MINT_EVENT"),
+            Kind::Burn => (SUSHI_TOKENS, "BURN_EVENT"),
+            Kind::Transfer => (SUSHI_TOKENS, "TRANSFER_EVENT"),
+        }
+    }
+
+    /// Fields a stored event of this kind carries.
+    fn fields(self) -> usize {
+        match self {
+            Kind::CreatePair | Kind::Update | Kind::Mint | Kind::Burn => 2,
+            Kind::Transfer => 3,
+            Kind::AddLiquidity | Kind::RemoveLiquidity => 5,
+            Kind::Swap => 6,
+        }
+    }
+}
+
+/// The qualified event names read (`<module>.<NAME>`), in [`Kind`] order.
+pub const EVENT_NAMES: [&str; 8] = [
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.CREATE_PAIR",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.UPDATE",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.SWAP",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.ADD_LIQUIDITY",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange.REMOVE_LIQUIDITY",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-tokens.MINT_EVENT",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-tokens.BURN_EVENT",
+    "n_bd19ba92f0449d4422e620740759c9e94cacdb37.sushi-exchange-tokens.TRANSFER_EVENT",
+];
+
+/// The kind of a qualified event name, when it is one of [`EVENT_NAMES`].
+pub fn kind_of_name(name: &str) -> Option<Kind> {
+    EVENT_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .and_then(|i| Kind::from_u8(i as u8))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact decimals.
+
+/// Limb base of [`Amount`] magnitudes.
+const BASE: u64 = 1_000_000_000;
+
+/// An exact signed decimal: `mag × 10^-SCALE`, `mag` in base-10⁹ limbs, least significant
+/// first, no high zero limbs (zero is empty and never negative).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Amount {
+    neg: bool,
+    mag: Vec<u32>,
+}
+
+impl Amount {
+    pub fn zero() -> Amount {
+        Amount::default()
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.mag.is_empty()
+    }
+
+    pub fn is_negative(&self) -> bool {
+        self.neg
+    }
+
+    /// Parse `-?digits(.digits)?([eE][+-]?digits)?`; `None` when longer than
+    /// [`MAX_AMOUNT_TEXT`], with an exponent beyond ±[`MAX_EXP`], or with a non-zero digit past
+    /// [`SCALE`] fractional places (it would not be exact).
+    pub fn parse(s: &str) -> Option<Amount> {
+        if s.is_empty() || s.len() > MAX_AMOUNT_TEXT {
+            return None;
+        }
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (num, exp) = match s.find(['e', 'E']) {
+            Some(i) => {
+                let e = &s[i + 1..];
+                let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+                if digits.is_empty()
+                    || digits.len() > 4
+                    || !digits.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return None;
+                }
+                let v: i64 = e.parse().ok()?;
+                if v.abs() > MAX_EXP {
+                    return None;
+                }
+                (&s[..i], v)
+            }
+            None => (s, 0),
+        };
+        let (int, frac) = match num.split_once('.') {
+            Some((a, b)) => (a, b),
+            None => (num, ""),
+        };
+        if int.is_empty() && frac.is_empty() {
+            return None;
+        }
+        if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // value = digits × 10^(exp − frac.len()); stored as digits × 10^(SCALE + exp − frac.len()).
+        let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+        let shift = SCALE as i64 + exp - frac.len() as i64;
+        if shift >= 0 {
+            digits.extend(std::iter::repeat_n(0, shift as usize));
+        } else {
+            let cut = (-shift) as usize;
+            if cut > digits.len() {
+                if digits.iter().any(|d| *d != 0) {
+                    return None;
+                }
+                digits.clear();
+            } else {
+                let tail = digits.split_off(digits.len() - cut);
+                if tail.iter().any(|d| *d != 0) {
+                    return None;
+                }
+            }
+        }
+        let mut a = Amount {
+            neg,
+            mag: limbs_of_digits(&digits),
+        };
+        a.norm();
+        Some(a)
+    }
+
+    /// Canonical text: `-`, integer digits, and `.` plus fractional digits without trailing
+    /// zeros (`0` for zero).
+    pub fn to_text(&self) -> String {
+        if self.is_zero() {
+            return "0".to_owned();
+        }
+        let mut d = String::new();
+        for (i, l) in self.mag.iter().rev().enumerate() {
+            if i == 0 {
+                d.push_str(&l.to_string());
+            } else {
+                d.push_str(&format!("{l:09}"));
+            }
+        }
+        if d.len() <= SCALE {
+            d = format!("{}{d}", "0".repeat(SCALE + 1 - d.len()));
+        }
+        let (int, frac) = d.split_at(d.len() - SCALE);
+        let frac = frac.trim_end_matches('0');
+        let sign = if self.neg { "-" } else { "" };
+        if frac.is_empty() {
+            format!("{sign}{int}")
+        } else {
+            format!("{sign}{int}.{frac}")
+        }
+    }
+
+    /// `self + other` (`sub`: `self − other`), exact.
+    pub fn add(&self, other: &Amount, sub: bool) -> Amount {
+        let oneg = other.neg != sub;
+        let mut r = if self.neg == oneg {
+            Amount {
+                neg: self.neg,
+                mag: add_mag(&self.mag, &other.mag),
+            }
+        } else if cmp_mag(&self.mag, &other.mag) != std::cmp::Ordering::Less {
+            Amount {
+                neg: self.neg,
+                mag: sub_mag(&self.mag, &other.mag),
+            }
+        } else {
+            Amount {
+                neg: oneg,
+                mag: sub_mag(&other.mag, &self.mag),
+            }
+        };
+        r.norm();
+        r
+    }
+
+    fn norm(&mut self) {
+        while self.mag.last() == Some(&0) {
+            self.mag.pop();
+        }
+        if self.mag.is_empty() {
+            self.neg = false;
+        }
+    }
+}
+
+fn limbs_of_digits(d: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(d.len() / 9 + 1);
+    let mut end = d.len();
+    while end > 0 {
+        let start = end.saturating_sub(9);
+        let mut v = 0u32;
+        for x in &d[start..end] {
+            v = v * 10 + u32::from(*x);
+        }
+        out.push(v);
+        end = start;
+    }
+    out
+}
+
+fn cmp_mag(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+}
+
+fn add_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry = 0u64;
+    for i in 0..a.len().max(b.len()) {
+        let s = u64::from(*a.get(i).unwrap_or(&0)) + u64::from(*b.get(i).unwrap_or(&0)) + carry;
+        out.push((s % BASE) as u32);
+        carry = s / BASE;
+    }
+    if carry > 0 {
+        out.push(carry as u32);
+    }
+    out
+}
+
+/// `a − b` with `a ≥ b`.
+fn sub_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow = 0i64;
+    for (i, x) in a.iter().enumerate() {
+        let mut d = i64::from(*x) - i64::from(*b.get(i).unwrap_or(&0)) - borrow;
+        if d < 0 {
+            d += BASE as i64;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push(d as u32);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decoding.
+
+/// A Pact amount as stock reads it (`typeof a === 'number' ? a : a.decimal`; we also take
+/// `{"int": n}`), non-negative and exact.
+pub fn amount_of(v: &Value) -> Option<Amount> {
+    let text = match v {
+        Value::Number(n) => n.to_string(),
+        Value::Object(o) => match o.get("decimal").or_else(|| o.get("int"))? {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Amount::parse(&text).filter(|a| !a.is_negative())
+}
+
+/// The qualified name of a Pact module reference (`{"refName":{"namespace","name"}}`).
+pub fn module_ref(v: &Value) -> Option<String> {
+    let r = v.get("refName")?;
+    let name = r.get("name")?.as_str()?;
+    let q = match r.get("namespace") {
+        Some(Value::String(ns)) => format!("{ns}.{name}"),
+        None | Some(Value::Null) => name.to_owned(),
+        _ => return None,
+    };
+    valid_token(&q).then_some(q)
+}
+
+fn account_of(v: &Value) -> Option<String> {
+    v.as_str()
+        .filter(|s| !s.is_empty() && s.len() <= MAX_ACCOUNT_LEN)
+        .map(str::to_owned)
+}
+
+/// The pair of two distinct token names: `(pair, flipped)`, `flipped` when `a` is not token0.
+pub fn pair_of(a: &str, b: &str) -> Option<(String, bool)> {
+    if a == b || !valid_token(a) || !valid_token(b) {
+        return None;
+    }
+    Some(if a < b {
+        (format!("{a}:{b}"), false)
+    } else {
+        (format!("{b}:{a}"), true)
+    })
+}
+
+/// The pair of a Sushi key `x:y` (`UPDATE`, LP events).
+pub fn pair_of_key(key: &str) -> Option<(String, bool)> {
+    let (a, b) = key.split_once(':')?;
+    pair_of(a, b)
+}
+
+/// One decoded Sushi event, oriented to its pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DexEvent {
+    pub kind: Kind,
+    pub pair: String,
+    /// The fields stored for the kind (module doc), amounts as canonical text.
+    pub fields: Vec<String>,
+}
+
+/// Decode a Sushi event's params. `None` when they do not have the layout stock reads, or an
+/// amount, name or account is out of bounds.
+pub fn decode_event(kind: Kind, params: &Value) -> Option<DexEvent> {
+    let p = params.as_array()?;
+    let amt = |i: usize| amount_of(p.get(i)?);
+    let (pair, fields) = match kind {
+        Kind::CreatePair => {
+            if p.len() < 3 {
+                return None;
+            }
+            let (pair, _) = pair_of(&module_ref(&p[0])?, &module_ref(&p[1])?)?;
+            let key = p[2].as_str().filter(|k| k.len() <= 2 * 256 + 1)?;
+            // The key must name the same two tokens.
+            if pair_of_key(key)?.0 != pair {
+                return None;
+            }
+            let account = match p.get(3) {
+                Some(v) => account_of(v)?,
+                None => String::new(),
+            };
+            (pair, vec![key.to_owned(), account])
+        }
+        Kind::Update => {
+            let (pair, flip) = pair_of_key(p.first()?.as_str()?)?;
+            let (r0, r1) = (amt(1)?, amt(2)?);
+            let (r0, r1) = if flip { (r1, r0) } else { (r0, r1) };
+            (pair, vec![r0.to_text(), r1.to_text()])
+        }
+        Kind::Swap => {
+            if p.len() != 6 {
+                return None;
+            }
+            let (maker, receiver) = (account_of(&p[0])?, account_of(&p[1])?);
+            let (ain, aout) = (amt(2)?, amt(4)?);
+            let (tin, tout) = (module_ref(&p[3])?, module_ref(&p[5])?);
+            let (pair, flip) = pair_of(&tin, &tout)?;
+            let z = Amount::zero();
+            // token-in is token0 unless flipped.
+            let (a0i, a1i, a0o, a1o) = if flip {
+                (z.clone(), ain, aout, z)
+            } else {
+                (ain, z.clone(), z, aout)
+            };
+            (
+                pair,
+                vec![
+                    maker,
+                    receiver,
+                    a0i.to_text(),
+                    a1i.to_text(),
+                    a0o.to_text(),
+                    a1o.to_text(),
+                ],
+            )
+        }
+        Kind::AddLiquidity | Kind::RemoveLiquidity => {
+            if p.len() != 7 {
+                return None;
+            }
+            let (sender, to) = (account_of(&p[0])?, account_of(&p[1])?);
+            let (pair, flip) = pair_of(&module_ref(&p[2])?, &module_ref(&p[3])?)?;
+            let (a0, a1, liq) = (amt(4)?, amt(5)?, amt(6)?);
+            let (a0, a1) = if flip { (a1, a0) } else { (a0, a1) };
+            (
+                pair,
+                vec![sender, to, a0.to_text(), a1.to_text(), liq.to_text()],
+            )
+        }
+        Kind::Mint | Kind::Burn => {
+            if p.len() != 3 {
+                return None;
+            }
+            let (pair, _) = pair_of_key(p[0].as_str()?)?;
+            (pair, vec![account_of(&p[1])?, amt(2)?.to_text()])
+        }
+        Kind::Transfer => {
+            if p.len() != 4 {
+                return None;
+            }
+            let (pair, _) = pair_of_key(p[0].as_str()?)?;
+            (
+                pair,
+                vec![account_of(&p[1])?, account_of(&p[2])?, amt(3)?.to_text()],
+            )
+        }
+    };
+    Some(DexEvent { kind, pair, fields })
+}
+
+/// The kind of a tx event when it is a trusted Sushi event: its name is one of
+/// [`EVENT_NAMES`] and its module is the matching Sushi module.
+pub fn trusted_kind(dict: &dyn Dict, e: &kdx_types::record::EventRec) -> Option<Kind> {
+    let kind = kind_of_name(dict.name(DictKind::EventName, e.name)?)?;
+    let module = dict.name(DictKind::Module, e.module)?;
+    (module == kind.module_and_name().0).then_some(kind)
+}
+
+/// Whether a tx can hold Sushi events at all (checked before any decoding).
+pub fn in_scope(r: &TxRecord) -> bool {
+    r.status_ok
+        && !r.key.is_coinbase()
+        && r.key.chain() == SUSHI_CHAIN
+        && r.key.height() >= SUSHI_DEPLOY_HEIGHT
+        && !r.events.is_empty()
+}
+
+/// The trusted, well-formed Sushi events of a tx: `(event index, event)`, at most
+/// [`MAX_EVENTS_PER_TX`] trusted events read. Also returns how many trusted events were not
+/// usable (malformed, out of bounds, or past the cap).
+pub fn events_of_tx(dict: &dyn Dict, r: &TxRecord) -> (Vec<(u16, DexEvent)>, u64) {
+    let mut out = Vec::new();
+    let mut rejected = 0u64;
+    if !in_scope(r) {
+        return (out, 0);
+    }
+    let mut seen = 0usize;
+    for (i, e) in r.events.iter().enumerate() {
+        let Some(kind) = trusted_kind(dict, e) else {
+            continue;
+        };
+        seen += 1;
+        let Ok(idx) = u16::try_from(i) else {
+            rejected += 1;
+            continue;
+        };
+        if seen > MAX_EVENTS_PER_TX {
+            rejected += 1;
+            continue;
+        }
+        match value::from_slice(&e.params, dict)
+            .ok()
+            .and_then(|p| decode_event(kind, &p))
+        {
+            Some(ev) => out.push((idx, ev)),
+            None => rejected += 1,
+        }
+    }
+    (out, rejected)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rows.
+
+/// `ev` = TxKey ‖ event index.
+pub fn ev_key(key: TxKey, idx: u16) -> [u8; 10] {
+    let mut k = [0u8; 10];
+    k[..8].copy_from_slice(&key.to_be_bytes());
+    k[8..].copy_from_slice(&idx.to_be_bytes());
+    k
+}
+
+/// `DexPairs` key.
+pub fn pair_row_key(pair: &str, key: TxKey, idx: u16) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 11);
+    k.extend_from_slice(pair.as_bytes());
+    k.push(0);
+    k.extend_from_slice(&ev_key(key, idx));
+    k
+}
+
+/// `DexEvents` key prefix of one pair and kind.
+pub fn event_prefix(pair: &str, kind: Kind) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 12);
+    k.extend_from_slice(pair.as_bytes());
+    k.push(0);
+    k.push(kind as u8);
+    k
+}
+
+/// `DexEvents` key.
+pub fn event_key(pair: &str, kind: Kind, key: TxKey, idx: u16) -> Vec<u8> {
+    let mut k = event_prefix(pair, kind);
+    k.extend_from_slice(&ev_key(key, idx));
+    k
+}
+
+/// `DexLp` key.
+pub fn lp_key(pair: &str, account: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + account.len() + 1);
+    k.extend_from_slice(pair.as_bytes());
+    k.push(0);
+    k.extend_from_slice(account.as_bytes());
+    k
+}
+
+/// `DexAgg` key of a pair's LP supply.
+pub fn supply_key(pair: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 1);
+    k.push(1);
+    k.extend_from_slice(pair.as_bytes());
+    k
+}
+
+/// `DexAgg` key of a pair's hour bucket.
+pub fn bucket_key(pair: &str, hour: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(pair.len() + 6);
+    k.push(2);
+    k.extend_from_slice(pair.as_bytes());
+    k.push(0);
+    k.extend_from_slice(&hour.to_be_bytes());
+    k
+}
+
+/// The hour bucket of a block creation time (µs).
+pub fn hour_of(block_time_us: u64) -> u32 {
+    u32::try_from(block_time_us / 3_600_000_000).unwrap_or(u32::MAX)
+}
+
+/// A `DexEvents` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub kind: Kind,
+    /// Block creation time, µs.
+    pub time: u64,
+    pub fields: Vec<String>,
+}
+
+impl StoredEvent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![self.kind as u8];
+        out.extend_from_slice(&self.time.to_be_bytes());
+        for f in &self.fields {
+            put_bytes(&mut out, f.as_bytes());
+        }
+        out
+    }
+
+    pub fn decode(v: &[u8]) -> Result<StoredEvent> {
+        let kind = Kind::from_u8(*v.first().context("empty dex event")?).context("dex kind")?;
+        let time = u64::from_be_bytes(v.get(1..9).context("dex time")?.try_into()?);
+        let mut b = &v[9..];
+        let mut fields = Vec::with_capacity(kind.fields());
+        while !b.is_empty() {
+            fields.push(String::from_utf8(get_bytes(&mut b)?.to_vec()).context("dex field")?);
+        }
+        if fields.len() != kind.fields() {
+            bail!("dex event {kind:?} has {} fields", fields.len());
+        }
+        Ok(StoredEvent { kind, time, fields })
+    }
+
+    fn amount(&self, i: usize) -> Result<Amount> {
+        Amount::parse(&self.fields[i]).context("stored dex amount")
+    }
+}
+
+/// A pair's hour bucket (`DexAgg` 0x02).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bucket {
+    pub swaps: i64,
+    pub adds: i64,
+    pub removes: i64,
+    /// Swap inputs and outputs per side: `[in0, in1, out0, out1]`.
+    pub sums: [Amount; 4],
+}
+
+impl Bucket {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        for n in [self.swaps, self.adds, self.removes] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        for a in &self.sums {
+            put_bytes(&mut out, a.to_text().as_bytes());
+        }
+        out
+    }
+
+    pub fn decode(v: &[u8]) -> Result<Bucket> {
+        let n = |i: usize| -> Result<i64> {
+            Ok(i64::from_be_bytes(
+                v.get(i * 8..i * 8 + 8)
+                    .context("bucket count")?
+                    .try_into()?,
+            ))
+        };
+        let mut b = v.get(24..).context("bucket")?;
+        let mut sums: [Amount; 4] = Default::default();
+        for s in &mut sums {
+            let t = std::str::from_utf8(get_bytes(&mut b)?).context("bucket sum")?;
+            *s = Amount::parse(t).context("bucket sum")?;
+        }
+        Ok(Bucket {
+            swaps: n(0)?,
+            adds: n(1)?,
+            removes: n(2)?,
+            sums,
+        })
+    }
+}
+
+/// What [`apply_tx`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyStats {
+    /// Events stored.
+    pub stored: u64,
+    /// Trusted events left out (malformed, out of bounds or past the per-tx cap).
+    pub rejected: u64,
+    /// Events already stored (a replay).
+    pub present: u64,
+}
+
+fn add_amount_row(txn: &mut RwTxn<'_>, t: Table, k: &[u8], d: &Amount, sub: bool) -> Result<()> {
+    let cur = match txn.get(t, k)? {
+        Some(v) => Amount::parse(std::str::from_utf8(&v)?).context("stored dex amount")?,
+        None => Amount::zero(),
+    };
+    let new = cur.add(d, sub);
+    if new.is_zero() {
+        txn.del(t, k)?;
+    } else {
+        txn.put(t, k, new.to_text().as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Add (`sub` false) or remove (`sub` true) one stored event's effect on the aggregates.
+fn effect(txn: &mut RwTxn<'_>, pair: &str, e: &StoredEvent, sub: bool) -> Result<()> {
+    match e.kind {
+        Kind::CreatePair | Kind::Update => {}
+        Kind::Swap | Kind::AddLiquidity | Kind::RemoveLiquidity => {
+            let k = bucket_key(pair, hour_of(e.time));
+            let mut b = match txn.get(Table::DexAgg, &k)? {
+                Some(v) => Bucket::decode(&v)?,
+                None => Bucket::default(),
+            };
+            let d = if sub { -1 } else { 1 };
+            match e.kind {
+                Kind::Swap => {
+                    b.swaps += d;
+                    for i in 0..4 {
+                        b.sums[i] = b.sums[i].add(&e.amount(2 + i)?, sub);
+                    }
+                }
+                Kind::AddLiquidity => b.adds += d,
+                _ => b.removes += d,
+            }
+            if b.swaps == 0 && b.adds == 0 && b.removes == 0 {
+                txn.del(Table::DexAgg, &k)?;
+            } else {
+                txn.put(Table::DexAgg, &k, &b.encode())?;
+            }
+        }
+        Kind::Mint | Kind::Burn => {
+            let amt = e.amount(1)?;
+            let burn = e.kind == Kind::Burn;
+            add_amount_row(txn, Table::DexAgg, &supply_key(pair), &amt, sub != burn)?;
+            add_amount_row(
+                txn,
+                Table::DexLp,
+                &lp_key(pair, &e.fields[0]),
+                &amt,
+                sub != burn,
+            )?;
+        }
+        Kind::Transfer => {
+            let amt = e.amount(2)?;
+            add_amount_row(txn, Table::DexLp, &lp_key(pair, &e.fields[0]), &amt, !sub)?;
+            add_amount_row(txn, Table::DexLp, &lp_key(pair, &e.fields[1]), &amt, sub)?;
+        }
+    }
+    Ok(())
+}
+
+/// Store one decoded event of the tx at `key` (block time `time`, µs), once: a replay of a
+/// stored event changes nothing. Returns whether it was stored.
+pub fn store_event(
+    txn: &mut RwTxn<'_>,
+    key: TxKey,
+    idx: u16,
+    time: u64,
+    ev: &DexEvent,
+) -> Result<bool> {
+    let mut by = vec![ev.kind as u8];
+    by.extend_from_slice(ev.pair.as_bytes());
+    if !txn.insert(Table::DexByTx, &ev_key(key, idx), &by)? {
+        return Ok(false);
+    }
+    let row = StoredEvent {
+        kind: ev.kind,
+        time,
+        fields: ev.fields.clone(),
+    };
+    txn.put(
+        Table::DexEvents,
+        &event_key(&ev.pair, ev.kind, key, idx),
+        &row.encode(),
+    )?;
+    if ev.kind == Kind::CreatePair {
+        txn.put(Table::DexPairs, &pair_row_key(&ev.pair, key, idx), &[])?;
+    }
+    effect(txn, &ev.pair, &row, false)?;
+    Ok(true)
+}
+
+/// Store the trusted Sushi events of a tx in block time `time` (µs). Idempotent.
+pub fn apply_tx(
+    txn: &mut RwTxn<'_>,
+    dict: &dyn Dict,
+    r: &TxRecord,
+    time: u64,
+) -> Result<ApplyStats> {
+    let mut st = ApplyStats::default();
+    let (evs, rejected) = events_of_tx(dict, r);
+    st.rejected = rejected;
+    for (idx, ev) in &evs {
+        if store_event(txn, r.key, *idx, time, ev)? {
+            st.stored += 1;
+        } else {
+            st.present += 1;
+        }
+    }
+    Ok(st)
+}
+
+/// Remove every Sushi event stored for the block at `(chain, height)` and reverse its effect,
+/// newest first. Returns the events removed.
+pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
+    if !txn.has_table(Table::DexByTx) {
+        return Ok(0);
+    }
+    let mut prefix = [0u8; 5];
+    prefix[..4].copy_from_slice(&height.to_be_bytes());
+    prefix[4] = chain;
+    let rows = txn.scan(Table::DexByTx, &prefix, |k| k.starts_with(&prefix))?;
+    let mut n = 0;
+    for (k, v) in rows.iter().rev() {
+        let key = TxKey::from_be_bytes(k.get(..8).context("DexByTx key")?.try_into()?);
+        let idx = u16::from_be_bytes(k.get(8..10).context("DexByTx key")?.try_into()?);
+        let kind = Kind::from_u8(*v.first().context("DexByTx value")?).context("dex kind")?;
+        let pair = std::str::from_utf8(&v[1..]).context("DexByTx pair")?;
+        let ek = event_key(pair, kind, key, idx);
+        let row = txn
+            .get(Table::DexEvents, &ek)?
+            .with_context(|| format!("DexEvents row of {key:?}/{idx} missing"))?;
+        let row = StoredEvent::decode(&row)?;
+        effect(txn, pair, &row, true)?;
+        txn.del(Table::DexEvents, &ek)?;
+        if kind == Kind::CreatePair {
+            txn.del(Table::DexPairs, &pair_row_key(pair, key, idx))?;
+        }
+        txn.del(Table::DexByTx, k)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Tables this module writes (the serving part also reads `DexUsd`).
+pub const TABLES: [Table; 5] = [
+    Table::DexPairs,
+    Table::DexEvents,
+    Table::DexByTx,
+    Table::DexLp,
+    Table::DexAgg,
+];
+
+pub mod meta {
+    /// Set when the history fill finished (u32: the highest tail height then).
+    pub const DEX_FILLED: &str = "dex_filled";
+    /// The fill's resume point: the last segment TxNum done (u64).
+    pub const DEX_FILL_CURSOR: &str = "dex_fill_txnum";
+}
+
+#[cfg(test)]
+mod tests;

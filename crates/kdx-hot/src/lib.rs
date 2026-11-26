@@ -9,6 +9,7 @@
 pub mod balances;
 pub mod chaincount;
 pub mod checkpoint;
+pub mod dex;
 pub mod dict;
 pub mod env;
 pub mod nft;

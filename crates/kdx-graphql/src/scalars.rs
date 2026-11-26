@@ -126,13 +126,114 @@ impl DateTime {
 #[Scalar(name = "DateTime")]
 impl ScalarType for DateTime {
     fn parse(value: Value) -> InputValueResult<Self> {
-        // No argument of the schema takes a DateTime.
-        Err(InputValueError::expected_type(value))
+        // Only `dexMetrics(startDate, endDate)` takes one (stock's graphql-scalars DateTime:
+        // an RFC 3339 date-time string).
+        match &value {
+            Value::String(s) => {
+                parse_rfc3339(s).ok_or_else(|| InputValueError::expected_type(value))
+            }
+            _ => Err(InputValueError::expected_type(value)),
+        }
     }
 
     fn to_value(&self) -> Value {
         Value::String(self.text())
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` (RFC 3339; `t`/`z` and a space separator
+/// accepted) as µs since the epoch; at most 9 fraction digits, years 0000–9999.
+fn parse_rfc3339(s: &str) -> Option<DateTime> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b.len() > 35 || !s.is_ascii() {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let t = s.get(r)?;
+        t.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| t.parse().ok())?
+    };
+    let sep_ok = b[4] == b'-'
+        && b[7] == b'-'
+        && matches!(b[10], b'T' | b't' | b' ')
+        && b[13] == b':'
+        && b[16] == b':';
+    if !sep_ok {
+        return None;
+    }
+    let (y, mo, d, h, mi, se) = (
+        num(0..4)?,
+        num(5..7)?,
+        num(8..10)?,
+        num(11..13)?,
+        num(14..16)?,
+        num(17..19)?,
+    );
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=12).contains(&mo)
+        || d < 1
+        || d > mdays[(mo - 1) as usize]
+        || h > 23
+        || mi > 59
+        || se > 60
+    {
+        return None;
+    }
+    let mut i = 19;
+    let mut micros = 0i64;
+    if b.get(i) == Some(&b'.') {
+        let start = i + 1;
+        i = start;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let frac = &s[start..i];
+        if frac.is_empty() || frac.len() > 9 {
+            return None;
+        }
+        micros = format!("{frac:0<6}")[..6].parse().ok()?;
+    }
+    let offset = match &s[i..] {
+        "Z" | "z" => 0,
+        t if t.len() == 6 && matches!(t.as_bytes()[0], b'+' | b'-') && t.as_bytes()[3] == b':' => {
+            let (oh, om) = (num(i + 1..i + 3)?, num(i + 4..i + 6)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let o = oh * 3600 + om * 60;
+            if t.starts_with('-') {
+                -o
+            } else {
+                o
+            }
+        }
+        _ => return None,
+    };
+    // Days from civil (Howard Hinnant).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + se - offset;
+    Some(DateTime(secs * 1_000_000 + micros))
 }
 
 /// Largest exponent magnitude a decimal text may carry, and the longest plain expansion
@@ -529,5 +630,22 @@ mod tests {
         for t in ["abc", "1e", "1e999999999999", "--1", ".5", "1.2.3"] {
             assert_eq!(js_number(t), t, "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::{parse_rfc3339, DateTime};
+
+    #[test]
+    fn parses_rfc3339() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(DateTime(0)));
+        let t = parse_rfc3339("2026-11-01T00:00:00.5Z").unwrap();
+        assert_eq!(t.text(), "2026-11-01T00:00:00.500Z");
+        assert_eq!(
+            parse_rfc3339("2026-11-01T02:00:00+02:00"),
+            parse_rfc3339("2026-11-01T00:00:00Z")
+        );
+        assert_eq!(parse_rfc3339("2026-11-31T00:00:00Z"), None);
     }
 }

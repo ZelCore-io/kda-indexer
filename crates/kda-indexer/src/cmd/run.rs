@@ -443,6 +443,31 @@ async fn follow(
             }
         });
     }
+    // Sushi DEX ledger (stock-gap B2): the one-off history fill from the Sushi deploy
+    // (resumable; new blocks store their own events). Its errors are logged; ingest goes on.
+    {
+        let (c, s) = (ctx.clone(), price_stop.clone());
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                if kdx_ingest::dex_fill::filled(&c.hot.ro()?)? {
+                    return Ok(());
+                }
+                tracing::info!("dex: Sushi history fill");
+                let rep = kdx_ingest::dex_fill::run(&c.hot, &c.segdir, &|| s.is_cancelled())?;
+                tracing::info!(report = %serde_json::to_string(&rep)?, "dex: fill pass ended");
+                Ok(())
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!(
+                    error = format!("{e:#}"),
+                    "dex: fill failed; restart resumes it"
+                ),
+                Err(e) => tracing::error!(error = %e, "dex: fill task"),
+            }
+        });
+    }
     // Stage 8: balance seed (when absent) and `/local` reconciler (B-5). Its errors are
     // logged; ingest goes on without it.
     let bal_stop = token.child_token();

@@ -8,6 +8,7 @@ use crate::connection::{PageInfo, Total};
 
 pub mod account;
 pub mod block;
+pub mod dex;
 pub mod event;
 pub mod guard;
 pub mod network;
@@ -91,6 +92,7 @@ pub enum Node {
     NonFungibleAccount(NonFungibleAccount),
     NonFungibleChainAccount(NonFungibleChainAccount),
     NonFungibleTokenBalance(NonFungibleTokenBalance),
+    Pool(Box<dex::Pool>),
     Signer(Signer),
     Transaction(Transaction),
     Transfer(Transfer),

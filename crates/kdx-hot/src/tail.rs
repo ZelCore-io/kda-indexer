@@ -125,6 +125,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
             if let Some(s) = prices::swap_of_tx(&*dict, r) {
                 prices::upsert(txn, chain, &s, Some(&mut price_undo))?;
             }
+            // Sushi DEX ledger (`dex.rs`): unwound through its own `DexByTx` index.
+            crate::dex::apply_tx(txn, &*dict, r, br.creation_time)?;
         }
     }
 
@@ -399,6 +401,7 @@ pub fn unwind_to_with(
         txn.del(Table::Undo, k)?;
         undo_d3(txn, chain, h, coin)?;
         prices::undo_block(txn, chain, h)?;
+        crate::dex::undo_block(txn, chain, h)?;
         n += 1;
     }
     match txn.get(Table::Headers, &block_key(chain, height))? {

@@ -1,4 +1,10 @@
 # ZelCore extensions to Kadena's schema (R-P5P9-16), one normalised parity line each.
+arg Pool.charts(timeFrame): TimeFrame! = -
+arg Pool.transactions(after): String = -
+arg Pool.transactions(before): String = -
+arg Pool.transactions(first): Int = -
+arg Pool.transactions(last): Int = -
+arg Pool.transactions(type): PoolTransactionType = -
 arg Query.balance(accountName): String = -
 arg Query.balance(after): String = -
 arg Query.balance(before): String = -
@@ -6,9 +12,44 @@ arg Query.balance(chainIds): [String!] = -
 arg Query.balance(first): Int = -
 arg Query.balance(last): Int = -
 arg Query.balance(module): String = -
+arg Query.dexMetrics(endDate): DateTime = -
+arg Query.dexMetrics(protocolAddress): String = -
+arg Query.dexMetrics(startDate): DateTime = -
 arg Query.events(moduleName): String = -
 arg Query.events(qualifiedEventName): String = -
 arg Query.lastTokenPriceInKda(moduleName): String! = -
+arg Query.liquidityPositions(after): String = -
+arg Query.liquidityPositions(before): String = -
+arg Query.liquidityPositions(first): Int = -
+arg Query.liquidityPositions(last): Int = -
+arg Query.liquidityPositions(orderBy): LiquidityPositionOrderBy = VALUE_USD_DESC
+arg Query.liquidityPositions(walletAddress): String! = -
+arg Query.pool(after): String = -
+arg Query.pool(before): String = -
+arg Query.pool(first): Int = -
+arg Query.pool(id): ID! = -
+arg Query.pool(last): Int = -
+arg Query.pool(timeFrame): TimeFrame = -
+arg Query.pool(type): PoolTransactionType = -
+arg Query.poolTransactions(after): String = -
+arg Query.poolTransactions(before): String = -
+arg Query.poolTransactions(first): Int = -
+arg Query.poolTransactions(last): Int = -
+arg Query.poolTransactions(pairId): String! = -
+arg Query.poolTransactions(type): PoolTransactionType = -
+arg Query.pools(after): String = -
+arg Query.pools(before): String = -
+arg Query.pools(first): Int = -
+arg Query.pools(last): Int = -
+arg Query.pools(orderBy): PoolOrderBy = TVL_USD_DESC
+arg Query.pools(protocolAddress): String = -
+arg Query.tokenPrice(protocolAddress): String = -
+arg Query.tokenPrice(tokenAddress): String! = -
+arg Query.tokenPrices(protocolAddress): String = -
+arg Query.tokens(after): String = -
+arg Query.tokens(before): String = -
+arg Query.tokens(first): Int = -
+arg Query.tokens(last): Int = -
 arg Query.transactions(isCoinbase): Boolean = -
 arg Query.transactionsByPactCode(after): String = -
 arg Query.transactionsByPactCode(before): String = -
@@ -18,30 +59,150 @@ arg Query.transactionsByPactCode(pactCode): String! = -
 arg Query.transfers(isNFT): Boolean = -
 arg Subscription.newBlocks(quantity): Int = -
 arg Subscription.transactions(quantity): Int = 20
+enum LiquidityPositionOrderBy.APR_ASC
+enum LiquidityPositionOrderBy.APR_DESC
+enum LiquidityPositionOrderBy.LIQUIDITY_ASC
+enum LiquidityPositionOrderBy.LIQUIDITY_DESC
+enum LiquidityPositionOrderBy.VALUE_USD_ASC
+enum LiquidityPositionOrderBy.VALUE_USD_DESC
+enum PoolOrderBy.APR_24H_ASC
+enum PoolOrderBy.APR_24H_DESC
+enum PoolOrderBy.TRANSACTION_COUNT_24H_ASC
+enum PoolOrderBy.TRANSACTION_COUNT_24H_DESC
+enum PoolOrderBy.TVL_USD_ASC
+enum PoolOrderBy.TVL_USD_DESC
+enum PoolOrderBy.VOLUME_24H_ASC
+enum PoolOrderBy.VOLUME_24H_DESC
+enum PoolOrderBy.VOLUME_7D_ASC
+enum PoolOrderBy.VOLUME_7D_DESC
+enum PoolTransactionType.ADD_LIQUIDITY
+enum PoolTransactionType.REMOVE_LIQUIDITY
+enum PoolTransactionType.SWAP
+enum TimeFrame.ALL
+enum TimeFrame.DAY
+enum TimeFrame.MONTH
+enum TimeFrame.WEEK
+enum TimeFrame.YEAR
 field BalanceNode.accountName: String!
 field BalanceNode.balance: String!
 field BalanceNode.chainId: String!
 field BalanceNode.module: String!
 field Block.canonical: Boolean!
 field Block.coinbase: String!
+field ChartDataPoint.timestamp: DateTime!
+field ChartDataPoint.value: Decimal!
 field CountersOfEachChain.blocksCount: Int!
 field CountersOfEachChain.chainId: String!
 field CountersOfEachChain.totalGasUsedInKda: String
 field CountersOfEachChain.transactionCount: Int
+field DexMetrics.currentTvlUsd: Decimal!
+field DexMetrics.totalPools: Int!
+field DexMetrics.totalVolumeUsd: Decimal!
+field DexMetrics.tvlHistory: [ChartDataPoint!]!
+field DexMetrics.volumeHistory: [ChartDataPoint!]!
+field LiquidityBalance.createdAt: DateTime!
+field LiquidityBalance.id: Int!
+field LiquidityBalance.liquidity: String!
+field LiquidityBalance.pair: Pool!
+field LiquidityBalance.pairId: String!
+field LiquidityBalance.updatedAt: DateTime!
+field LiquidityBalance.walletAddress: String!
+field LiquidityPosition.apr24h: Decimal!
+field LiquidityPosition.createdAt: DateTime!
+field LiquidityPosition.id: ID!
+field LiquidityPosition.liquidity: String!
+field LiquidityPosition.pair: Pool!
+field LiquidityPosition.pairId: String!
+field LiquidityPosition.updatedAt: DateTime!
+field LiquidityPosition.valueUsd: Decimal!
+field LiquidityPosition.walletAddress: String!
+field LiquidityPositionEdge.cursor: String!
+field LiquidityPositionEdge.node: LiquidityPosition!
+field LiquidityPositionsConnection.edges: [LiquidityPositionEdge!]!
+field LiquidityPositionsConnection.pageInfo: PageInfo!
+field LiquidityPositionsConnection.totalCount: Int!
 field NetworkInfo.countersOfEachChain: [CountersOfEachChain!]!
+field Pool.address: String!
+field Pool.apr24h: Float!
+field Pool.charts: PoolCharts!
+field Pool.createdAt: DateTime!
+field Pool.fees24hUsd: Float!
+field Pool.feesChange24h: Float!
+field Pool.id: ID!
+field Pool.key: String!
+field Pool.reserve0: String!
+field Pool.reserve1: String!
+field Pool.token0: Token!
+field Pool.token1: Token!
+field Pool.totalSupply: String!
+field Pool.transactionCount24h: Int!
+field Pool.transactionCountChange24h: Float!
+field Pool.transactions: PoolTransactionsConnection
+field Pool.tvlChange24h: Float!
+field Pool.tvlUsd: Float!
+field Pool.updatedAt: DateTime!
+field Pool.volume24hUsd: Float!
+field Pool.volume7dUsd: Float!
+field Pool.volumeChange24h: Float!
+field PoolCharts.fees: [ChartDataPoint!]!
+field PoolCharts.tvl: [ChartDataPoint!]!
+field PoolCharts.volume: [ChartDataPoint!]!
+field PoolTransaction.amount0In: Decimal!
+field PoolTransaction.amount0Out: Decimal!
+field PoolTransaction.amount1In: Decimal!
+field PoolTransaction.amount1Out: Decimal!
+field PoolTransaction.amountUsd: Decimal!
+field PoolTransaction.id: ID!
+field PoolTransaction.maker: String!
+field PoolTransaction.requestkey: String!
+field PoolTransaction.timestamp: DateTime!
+field PoolTransaction.transactionId: Int
+field PoolTransaction.transactionType: PoolTransactionType!
+field PoolTransactionEdge.cursor: String!
+field PoolTransactionEdge.node: PoolTransaction!
+field PoolTransactionsConnection.edges: [PoolTransactionEdge!]
+field PoolTransactionsConnection.pageInfo: PageInfo
+field PoolTransactionsConnection.totalCount: Int
 field Query.balance: QueryBalanceConnection!
+field Query.dexMetrics: DexMetrics!
 field Query.lastTokenPriceInKda: Decimal
+field Query.liquidityPositions: LiquidityPositionsConnection!
+field Query.pool: Pool
+field Query.poolTransactions: PoolTransactionsConnection
+field Query.pools: QueryPoolsConnection!
+field Query.tokenPrice: TokenPrice
+field Query.tokenPrices: [TokenPrice!]!
+field Query.tokens: QueryTokensConnection!
 field Query.transactionsByPactCode: QueryTransactionsByPactCodeConnection!
 field QueryBalanceConnection.edges: [QueryBalanceConnectionEdge!]!
 field QueryBalanceConnection.pageInfo: PageInfo!
 field QueryBalanceConnectionEdge.cursor: String!
 field QueryBalanceConnectionEdge.node: BalanceNode!
 field QueryBlocksFromDepthConnection.totalCount: Int!
+field QueryPoolsConnection.edges: [QueryPoolsConnectionEdge!]!
+field QueryPoolsConnection.pageInfo: PageInfo!
+field QueryPoolsConnection.totalCount: Int!
+field QueryPoolsConnectionEdge.cursor: String!
+field QueryPoolsConnectionEdge.node: Pool!
+field QueryTokensConnection.edges: [QueryTokensEdge!]!
+field QueryTokensConnection.pageInfo: PageInfo!
+field QueryTokensEdge.cursor: String!
+field QueryTokensEdge.node: Token!
 field QueryTransactionsByPactCodeConnection.edges: [QueryTransactionsByPactCodeConnectionEdge!]!
 field QueryTransactionsByPactCodeConnection.pageInfo: PageInfo!
 field QueryTransactionsByPactCodeConnectionEdge.cursor: String!
 field QueryTransactionsByPactCodeConnectionEdge.node: TransactionSummary!
 field Subscription.transactions: [Transaction!]
+field Token.address: String
+field Token.chainId: String!
+field Token.id: ID!
+field Token.name: String!
+field TokenPrice.id: ID!
+field TokenPrice.priceInKda: Decimal!
+field TokenPrice.priceInUsd: Decimal!
+field TokenPrice.protocolAddress: String!
+field TokenPrice.token: Token!
+field TokenPrice.updatedAt: DateTime!
 field Transaction.orphanedTransactions: [Transaction]
 field TransactionResultTransfersConnection.totalCount: Int!
 field TransactionSummary.badResult: String
@@ -57,9 +218,26 @@ field TransactionSummary.requestKey: String!
 field TransactionSummary.sender: String!
 field Transfer.tokenId: String
 type BalanceNode implements []
+type ChartDataPoint implements []
 type CountersOfEachChain implements []
+type DexMetrics implements []
+type LiquidityBalance implements []
+type LiquidityPosition implements []
+type LiquidityPositionEdge implements []
+type LiquidityPositionsConnection implements []
+type Pool implements [Node]
+type PoolCharts implements []
+type PoolTransaction implements []
+type PoolTransactionEdge implements []
+type PoolTransactionsConnection implements []
 type QueryBalanceConnection implements []
 type QueryBalanceConnectionEdge implements []
+type QueryPoolsConnection implements []
+type QueryPoolsConnectionEdge implements []
+type QueryTokensConnection implements []
+type QueryTokensEdge implements []
 type QueryTransactionsByPactCodeConnection implements []
 type QueryTransactionsByPactCodeConnectionEdge implements []
+type Token implements []
+type TokenPrice implements []
 type TransactionSummary implements []

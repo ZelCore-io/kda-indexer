@@ -1848,6 +1848,7 @@ dependencies = [
  "kdx-decode",
  "kdx-metrics",
  "kdx-types",
+ "proptest",
  "reth-libmdbx",
  "serde",
  "serde_json",

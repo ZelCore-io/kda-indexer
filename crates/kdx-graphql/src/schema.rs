@@ -55,7 +55,7 @@ pub struct GasLimitEstimation {
     pub used_signature_verification: bool,
 }
 
-#[Object]
+#[Object(name = "KadenaQuery")]
 #[allow(unused_variables, clippy::too_many_arguments)]
 impl Query {
     async fn block(&self, ctx: &Context<'_>, hash: String) -> Result<Option<Block>> {
