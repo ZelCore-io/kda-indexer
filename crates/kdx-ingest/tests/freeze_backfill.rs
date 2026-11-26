@@ -892,3 +892,80 @@ async fn a_backfill_from_mid_chain_is_not_served_as_exact() {
         "row counts equal the stored records"
     );
 }
+
+/// The `TokenChains` table is ready and equal to what `Holders` gives.
+fn token_chains_are_exact(c: &kdx_ingest::Ctx) {
+    let ro = c.hot.ro().unwrap();
+    assert!(
+        kdx_hot::token_chains::ready(&ro).unwrap(),
+        "token chains ready"
+    );
+    let want = kdx_hot::token_chains::derive(&kdx_hot::holders::read_all(&ro).unwrap());
+    assert!(!want.is_empty());
+    assert_eq!(kdx_hot::token_chains::read_all(&ro, || true).unwrap(), want);
+}
+
+/// The DEX and price fill markers.
+fn fills_done(c: &kdx_ingest::Ctx) -> (bool, bool) {
+    let ro = c.hot.ro().unwrap();
+    (
+        kdx_ingest::dex_fill::filled(&ro).unwrap(),
+        kdx_hot::prices::ready(&ro).unwrap(),
+    )
+}
+
+/// Final review I-4 (#54 park, "real-path ready-survives test"): a from-scratch backfill,
+/// then the tail on top of it (linear blocks, a reorg that unwinds one, the freezer), keeps
+/// every creation-time marker set (row counts, chain counters, holders, token chains) and
+/// every table exact against a fresh tally; the DEX and price fills done on the backfilled
+/// store stay done. A stamp one side misses would clear a marker at the first tail block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backfilled_store_stays_ready_under_the_tail() {
+    let pool = pool();
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let chain = branch(&all, 0, 0, 0);
+    let base = fake_node(&pool, &[(0, chain.clone())]);
+    let db = tempfile::tempdir().unwrap();
+    let c = Arc::new(ctx_with_node(db.path(), 2, 2, 2, &base));
+    kdx_ingest::backfill::run(c.clone(), 0, 15, kdx_ingest::HeaderMode::Cut)
+        .await
+        .unwrap();
+    every_derived_table_is_exact(&c);
+    token_chains_are_exact(&c);
+    // The fills `run` starts once the backfill is done.
+    let rep = kdx_ingest::dex_fill::run(&c.hot, &c.segdir, &|| false).unwrap();
+    assert!(!rep.stopped, "{rep:?}");
+    let rep = kdx_ingest::price_fill::run(&c.hot, &c.segdir, &|| false).unwrap();
+    assert!(!rep.stopped, "{rep:?}");
+    assert_eq!(fills_done(&c), (true, true));
+    let rows_before = kdx_hot::rowcount::read_all(&c.hot.ro().unwrap()).unwrap();
+
+    // Tail: heights 16..=21 on the backfilled chain, one block per commit.
+    apply_linear(&c, &pool, &chain[16..22], 1);
+    every_derived_table_is_exact(&c);
+    token_chains_are_exact(&c);
+    assert_ne!(
+        kdx_hot::rowcount::read_all(&c.hot.ro().unwrap()).unwrap(),
+        rows_before,
+        "the tail blocks are counted"
+    );
+    // A reorg: unwind 21, apply 21..=23 of another branch.
+    let fork = branch(&[21, 22, 23], 21, 1, 0);
+    apply_fork(&c, &pool, 20, 1, &fork);
+    assert!(kdx_hot::holders::ready(&c.hot.ro().unwrap()).unwrap());
+    every_derived_table_is_exact(&c);
+    token_chains_are_exact(&c);
+    // The freezer takes the finalized tail blocks (16..=19) into segments.
+    let mut ticks = 0;
+    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {
+        ticks += 1;
+    }
+    assert!(ticks >= 2, "the freezer froze the tail steps: {ticks}");
+    assert_eq!(
+        kdx_hot::Txn::frozen_frontier(&c.hot.ro().unwrap()).unwrap(),
+        20
+    );
+    every_derived_table_is_exact(&c);
+    token_chains_are_exact(&c);
+    assert_eq!(fills_done(&c), (true, true));
+}

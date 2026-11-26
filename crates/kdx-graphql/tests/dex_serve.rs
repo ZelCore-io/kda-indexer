@@ -1024,3 +1024,43 @@ async fn a_spent_price_search_is_no_path() {
     );
     assert!(!b.prices_partial);
 }
+
+/// A price search that reaches the token cap (`MAX_PRICE_TOKENS`) answers no path (price 0)
+/// and flags it (`extensions.dexPricesPartial`), as a spent budget does (final review m-1).
+#[tokio::test]
+async fn the_token_cap_flags_the_price() {
+    assert_eq!(dexserve::MAX_PRICE_TOKENS, 2_048);
+    assert_eq!(dexserve::MAX_NEIGHBORS, 256);
+    let d = tempfile::tempdir().unwrap();
+    let (hot, _st) = state(&d);
+    let mut w = W {
+        txn: hot.rw().unwrap(),
+        pos: 0,
+    };
+    let t0 = now() - DAY;
+    // `free.x` -> 256 hubs -> 9 leaves each: 1 + 256 + 2,304 tokens, no `coin` pair anywhere.
+    for i in 0..256 {
+        w.pair(&format!("free.h{i:03}:free.x"), t0, "10", "10");
+        for j in 0..9 {
+            w.pair(&format!("free.h{i:03}:free.l{i:03}{j}"), t0, "10", "10");
+        }
+    }
+    kdx_hot::dex_usd::put(
+        &mut w.txn,
+        (now() / 3600) as u32,
+        &Amount::parse("0.005").unwrap(),
+    )
+    .unwrap();
+    mark_filled(&mut w.txn);
+    w.txn.commit().unwrap();
+    let ro = hot.ro().unwrap();
+    let mut b = Budget::new(Instant::now() + Duration::from_secs(60));
+    let p = dexserve::token_price(&ro, now(), "free.x", dexserve::DEFAULT_PROTOCOL, &mut b)
+        .unwrap()
+        .unwrap();
+    assert!(
+        format!("{:?}", p.price_in_kda).contains("text: \"0\""),
+        "{p:?}"
+    );
+    assert!(b.prices_partial, "the cut search is flagged");
+}

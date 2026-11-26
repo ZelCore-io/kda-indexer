@@ -87,7 +87,7 @@ Errors carry `extensions.code`:
 | `TIMEOUT` | the request deadline passed |
 | `COUNT_TIMEOUT` | `totalCount` could not be counted exactly before the request deadline; the field answers no number (see `totalCount`) |
 | `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
-| `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, or the node had no usable answer. The rest of the item answers |
+| `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, a fill or readiness wait, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
 | `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable is missing or its value does not coerce to its type. Such a request answers HTTP 500 with no `data` key, as stock answers it; in a batch the status stays 200. Also `transaction(minimumDepth:)` outside 1..=100, with stock's message (`[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.` or `… higher than 100.`), `transaction: null` and HTTP 200 |
 | `GRAPHQL_PARSE_FAILED` | the document does not parse: HTTP 400 with no `data` key, as stock (Apollo Server 4) answers it. The message is ours (async-graphql's parser), not graphql-js's |
@@ -105,6 +105,19 @@ of the failed roots set to `null` (`{"data":{"block":null},"errors":[…]}`, HTT
 answers, unless a failed root is non-null. Each error keeps its `path`; stock strips `path` and
 `locations` from errors that carry `extensions` (see
 [comparison.md](comparison.md#intended-differences)).
+
+One exception keeps the rest of the page: an error this indexer raises itself, which stock
+never raises, nulls a non-null field in place (the field answers `null`, the error is kept) and
+does not bubble. These are the `extensions.code`s `COUNT_TIMEOUT` (a cut `totalCount`), `LIMIT`
+(the `transactionsByPactCode` search slot, page and item caps, DEX budgets), `TIMEOUT` (the
+request deadline, including the DEX one) and `NOT_AVAILABLE` (data still being built: a fill
+or readiness wait), `NOT_SUPPORTED` (a field not served, such as `Block.minerAccount`, or a
+search left off) and `UNSUPPORTED_FILTER` (an `events` filter form not served), plus the `pactQuery`/`gasLimitEstimate` caps, which carry stock's
+`INTERNAL_SERVER_ERROR` code and name the cap in `extensions.limit` (`pact_items`,
+`pact_rate`, `pact_busy`). A strict client sees `null` in a non-null slot for these; blanking
+the whole page would lose the fields that did answer. Every other error, async-graphql's own
+included, bubbles as above. The list lives in one place (`IN_PLACE_CODES` in
+`crates/kdx-graphql/src/error.rs`).
 
 ## Limits
 
@@ -575,9 +588,9 @@ the oracle puts them.
   is computed only when selected: from the stored per-key counts where they hold the list
   (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s).
   A walk the deadline cuts answers a `COUNT_TIMEOUT` error at
-  `totalCount` (the error has the field's path; `totalCount` is `Int!` and the connections
-  are non-null, so the error nulls the nearest nullable parent, `data` itself for a root
-  list, as stock's graphql-js answers); it never answers a
+  `totalCount` (the error has the field's path; `totalCount` is `Int!`, but this indexer's
+  own errors null the field in place and keep the page: `totalCount` answers `null` next to
+  the edges and the other root fields, see "A field that fails" above); it never answers a
   partial number and sets no response flag. A block's or a request key's list counts with
   its page, under the same rule (audit F-50). There is no `totalCountLowerBound` flag and no
   `count_budget_ms` setting any more (an old config file that sets it still loads; it is
@@ -967,7 +980,8 @@ is checked first at each token; with zero reserves it prices at 0, as stock), re
 1,024 pairs per token (the oldest `CREATE_PAIR`s: a token with more pairs than that has its
 newer ones left out; `kdx_dex_ranked_neighbors_capped_total` counts it), ranked by that token's
 own reserve (a coin pair never funded is not read), expanding the top 256 and visiting at most
-2,048 tokens. A search that spends the field's row budget or deadline answers no path (price 0,
+2,048 tokens. A search that spends the field's row budget or deadline, or reaches the 2,048-token
+cap, answers no path (price 0,
 stock's answer with no path) and the response carries
 `"extensions": {"dexPricesPartial": true}`: a 0 in such a response may be a price that was not
 searched. `tokenPrices` gives its price searches a row budget of their own (250,000 more rows;

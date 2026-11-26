@@ -389,6 +389,13 @@ pub fn merge(ctx: &Ctx) -> Result<Option<RangeEntry>> {
     if m.entries[i..=j].iter().any(|e| e.kind != RangeKind::Step) {
         return Ok(None);
     }
+    // One step that already spans the range (`range_heights == step_heights`, which the
+    // config allows): its files have the range's names, so a merge would write over them
+    // and then delete them as the replaced step's files, leaving the manifest pointing at
+    // nothing. The step is kept as it is.
+    if i == j {
+        return Ok(None);
+    }
     disk::ensure_free(&ctx.segdir, o.min_free_gb)?;
     let t0 = std::time::Instant::now();
     let olds: Vec<RangeEntry> = m.entries[i..=j].to_vec();
