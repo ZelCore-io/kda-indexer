@@ -68,6 +68,9 @@ fn row_json(
 /// Keys one `/accounts/{a}/balances` page reads at most (listed or not).
 const MAX_BALANCE_WALK: usize = 10_000;
 
+/// Smallest per-table key batch of the balances walk.
+const BALANCE_BATCH: usize = 64;
+
 fn pending_json(module: &str, c: u8, r: Option<&BalanceRow>) -> Value {
     json!({
         "module": module,
@@ -145,11 +148,14 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
         // hidden module) never make a page short while it carries a cursor (review minor 1).
         // The walk stops after `MAX_BALANCE_WALK` keys; that page carries a cursor at the
         // last key read.
-        let n = limit as usize + 1;
+        // Keys per table scan: at least `BALANCE_BATCH`, so a small `limit` over many
+        // left-out rows does not take three scans per handful of keys (N-13).
+        let n = (limit as usize + 1).max(BALANCE_BATCH);
         let mut hidden: HashMap<u32, bool> = HashMap::new();
         let mut items = Vec::new();
         let mut last = None;
         let mut more = false;
+        let mut at_cap = false;
         let mut walked = 0usize;
         'walk: loop {
             // The first `n` keys of each table: their union holds the first `n` keys of the
@@ -174,6 +180,7 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
                 view.check_deadline()?;
                 if walked >= MAX_BALANCE_WALK {
                     more = true;
+                    at_cap = true;
                     break 'walk;
                 }
                 walked += 1;
@@ -214,8 +221,9 @@ pub async fn account_balances(st: St, path: PathS, q: QueryQ) -> Response {
                 break;
             }
         }
-        // At the walk cap with fewer than `limit` items, resume after the last key read.
-        if more && items.len() < limit as usize {
+        // At the walk cap, resume after the last key read, whether or not the page is full:
+        // every key up to it was listed on this page or left out (N-13).
+        if at_cap {
             last = balances::parse_bal_key(&from[..from.len() - 1]).map(|(_, m, c)| (m, c));
         }
         let next = more
@@ -630,6 +638,71 @@ mod key_accounts_tests {
             .await;
         let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    /// N-13: a full page that stops at the walk cap carries a cursor at the last key read,
+    /// not at its last item: the next page does not re-walk the skipped keys.
+    #[tokio::test]
+    async fn a_full_page_at_the_walk_cap_keeps_its_progress() {
+        let (_d, st) = fixture();
+        let hot = Arc::clone(&st.store.hot);
+        {
+            let mut w = hot.rw().unwrap();
+            let mut dict = HotDict::load(&w).unwrap();
+            let erin = dict.intern(DictKind::Account, "erin");
+            let coin = dict.intern(DictKind::Module, "coin");
+            dict.persist(&mut w).unwrap();
+            let row = |absent: bool, bal: &str| BalanceRow {
+                absent,
+                balance: bal.into(),
+                guard: [0; 16],
+                as_of: 1,
+                reconciled_at: 1,
+                unverified: false,
+            };
+            // One listed row, then more absent rows than the walk cap, then a listed one.
+            w.put(
+                Table::Balances,
+                &bal_key(erin, coin, 0),
+                &row(false, "1").encode(),
+            )
+            .unwrap();
+            let base = 1_000_000u32;
+            let gap = super::MAX_BALANCE_WALK as u32 + 500;
+            for m in base..base + gap {
+                w.put(
+                    Table::Balances,
+                    &bal_key(erin, m, 0),
+                    &row(true, "").encode(),
+                )
+                .unwrap();
+            }
+            w.put(
+                Table::Balances,
+                &bal_key(erin, base + gap, 0),
+                &row(false, "2").encode(),
+            )
+            .unwrap();
+            w.commit().unwrap();
+        }
+        let q = |cursor: Option<String>| super::Q {
+            limit: Some(1),
+            cursor,
+            ..super::Q::default()
+        };
+        let v = balances(&st, "erin", q(None)).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        let c = v["next_cursor"].as_str().unwrap().to_owned();
+        let (m, _) = super::parse_bal_cursor(&c).unwrap();
+        assert!(
+            m >= 1_000_000 + 9_000,
+            "cursor {c} kept the walk's progress"
+        );
+        // The next page lists the last row.
+        let v = balances(&st, "erin", q(Some(c))).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["items"][0]["balance"], json!("2"), "{v}");
+        assert!(v["next_cursor"].is_null(), "{v}");
     }
 
     /// Rows at 0 page like any other: every page before the last is full and the walk
