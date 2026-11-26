@@ -16,8 +16,9 @@
 //!   tail (blocks applied by a binary without this table) keeps its swap until a newer one.
 //! - **Beside the live tail (N-14):** a hot tx is read in the write txn that stores its swap,
 //!   so an unwind cannot fall between the two; and where a tail block applied during the fill
-//!   holds a newer row, the fill's row goes into that block's undo log
-//!   (`kdx_hot::prices::upsert_fill`), so unwinding the block leaves it, not no price.
+//!   holds a newer row, or an older one the fill's row replaces, the fill's row goes into that
+//!   block's undo log (`kdx_hot::prices::upsert_fill`), so unwinding the block leaves it, not
+//!   no price. A tail tx the fill re-reads leaves its own block's log as it is.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -348,5 +349,42 @@ mod tests {
         apply_hot(&hot, &dict, &keys, &mut rep).unwrap();
         assert_eq!((rep.hot_txs, rep.rows), (0, 0));
         assert_eq!(prices::lookup(&hot.ro().unwrap(), "free.t").unwrap(), None);
+    }
+
+    /// I-1 / m-5 (hot pass over blocks with their own logs): a resumed fill re-reads two
+    /// tail blocks the live tail applied (10, then a newer swap at 20). A reorg that unwinds
+    /// both must leave no price (stock drops both swaps), not block 10's orphaned row.
+    #[test]
+    fn a_resumed_hot_pass_over_applied_blocks_keeps_their_unwind() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(&d.path().join("hot"), kdx_hot::Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let txs = [swap_tx(&mut dict, 10, 1.0), swap_tx(&mut dict, 20, 4.0)];
+        dict.persist(&mut txn).unwrap();
+        // The live tail applies blocks 10 and 20 (as `tail::apply` does).
+        for tx in &txs {
+            let mut b = Vec::new();
+            kdx_types::record::encode_tx(tx, &mut b);
+            txn.put(Table::TailTxs, &tx.key.to_be_bytes(), &b).unwrap();
+            let mut undo = Vec::new();
+            let s = prices::swap_of_tx(&dict, tx).unwrap();
+            prices::upsert(&mut txn, 1, &s, Some(&mut undo)).unwrap();
+            txn.set_meta(&prices::undo_key(1, tx.key.height()), &undo)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let mut rep = FillReport::default();
+        apply_hot(&hot, &dict, &[txs[0].key, txs[1].key], &mut rep).unwrap();
+        assert_eq!((rep.hot_txs, rep.swaps, rep.rows), (2, 2, 0));
+        // The reorg unwinds 20 then 10.
+        let mut txn = hot.rw().unwrap();
+        prices::undo_block(&mut txn, 1, 20).unwrap();
+        assert_eq!(
+            prices::lookup(&txn, "free.t").unwrap().map(|r| r.key),
+            Some(TxKey::new(10, 1, 1))
+        );
+        prices::undo_block(&mut txn, 1, 10).unwrap();
+        assert_eq!(prices::lookup(&txn, "free.t").unwrap(), None);
     }
 }

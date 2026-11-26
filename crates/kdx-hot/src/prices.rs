@@ -359,10 +359,12 @@ pub fn upsert(
 const MAX_UNDO_HOPS: usize = 64;
 
 /// [`upsert`] for the one-time history fill, which runs beside the live tail (N-14), without
-/// an undo log of its own. Where the stored row is newer, the fill's row is not written, but
-/// the tail block that wrote the stored row may have logged an older row (or none) as what
-/// its unwind restores; that entry is pointed at the fill's row instead, so an unwind leaves
-/// the newest swap the fill found rather than an older one or no price at all.
+/// an undo log of its own. The tail block that wrote the stored row may have logged an older
+/// row (or none) as what its unwind restores. Where the stored row is newer, the fill's row
+/// is not written, and the first such entry under it is pointed at the fill's row instead;
+/// where the fill's row is newer (a sender can backdate creationTime, PR #49 m-1), it
+/// replaces the stored row and that block's entry is pointed at it the same way. Either way
+/// an unwind leaves the newest swap the fill found rather than an older one or no price.
 pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
     let rows =
         (swap.tokens.iter().map(|t| (t, &swap.row))).chain(swap.routed.iter().map(|(t, r)| (t, r)));
@@ -374,12 +376,16 @@ pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
             .as_deref()
             .and_then(SwapRow::decode);
         match prev {
-            Some(p) if p.order() >= row.order() => {
-                if p.order() > row.order() {
-                    fill_under(txn, chain, &k, p, row)?;
+            // The fill's row itself (a re-read tail tx): already where it belongs.
+            Some(p) if p.order() == row.order() => {}
+            Some(p) => {
+                if p.order() < row.order() {
+                    txn.put(Table::TokenSwaps, &k, &row.encode())?;
+                    n += 1;
                 }
+                fill_under(txn, chain, &k, p, row)?;
             }
-            _ => {
+            None => {
                 txn.put(Table::TokenSwaps, &k, &row.encode())?;
                 n += 1;
             }
@@ -388,9 +394,13 @@ pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
     Ok(n)
 }
 
-/// Walk back from `newer` (stored under `k`) through the undo logs of the tail blocks that
-/// wrote it and the rows they replaced, and make the first entry that would restore a row
-/// older than `row` (or none) restore `row`.
+/// Walk back from `newer` (the row stored under `k`, or the one the fill just replaced)
+/// through the undo logs of the tail blocks that wrote it and the rows they replaced, and
+/// make the first entry that would restore a row older than `row` (or none) restore `row`.
+///
+/// Only a block above `row`'s height may take it: unwinding a block drops every block from
+/// it up, so a row of that height or above is orphaned too and must not come back (I-1). An
+/// entry that already holds `row` (a re-read tail tx) is left alone.
 fn fill_under(
     txn: &mut RwTxn<'_>,
     chain: u8,
@@ -399,6 +409,9 @@ fn fill_under(
     row: &SwapRow,
 ) -> Result<()> {
     for _ in 0..MAX_UNDO_HOPS {
+        if newer.key.height() <= row.key.height() {
+            return Ok(()); // this block and every one below it keep `row`'s block
+        }
         let uk = undo_key(chain, newer.key.height());
         let Some(v) = txn.meta(&uk)? else {
             return Ok(()); // not a tail block's row: no unwind restores under it
@@ -409,7 +422,8 @@ fn fill_under(
             return Ok(());
         };
         match e.1.as_deref().and_then(SwapRow::decode) {
-            Some(p) if p.order() >= row.order() => newer = p,
+            Some(p) if p.order() == row.order() => return Ok(()),
+            Some(p) if p.order() > row.order() => newer = p,
             _ => {
                 e.1 = Some(row.encode());
                 txn.set_meta(&uk, &undo_encode(&entries))?;
@@ -1556,6 +1570,89 @@ mod tests {
         assert!(lookup(&txn, "free.new").unwrap().is_some());
         undo_block(&mut txn, 5, 30).unwrap();
         assert_eq!(lookup(&txn, "free.new").unwrap(), None);
+    }
+
+    /// A tail block at `h` (chain 0) applying a `free.t` swap with its undo log.
+    fn tail_block(txn: &mut RwTxn<'_>, s: &Swap) {
+        let mut log = Vec::new();
+        upsert(txn, 0, s, Some(&mut log)).unwrap();
+        if !log.is_empty() {
+            txn.set_meta(&undo_key(0, s.row.key.height()), &log)
+                .unwrap();
+        }
+    }
+
+    fn t_swap(ctime: u64, h: u32, amt: &str) -> Swap {
+        Swap {
+            row: row(ctime, TxKey::new(h, 0, 1), ("coin", amt), ("free.t", "1")),
+            tokens: vec!["free.t".into()],
+            routed: vec![],
+        }
+    }
+
+    /// I-1 (PR #49 review): a resumed hot pass re-reads a tail block the tail already applied
+    /// (H1), and a newer swap above it (H2) logged H1's row as what its unwind restores. The
+    /// fill must not point H1's own entry at H1's row: unwinding H2 and H1 leaves no price,
+    /// as stock drops both orphaned swaps.
+    #[test]
+    fn a_fill_of_a_tail_blocks_own_row_leaves_its_log_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let (s1, s2) = (t_swap(100, 10, "1"), t_swap(200, 20, "2"));
+        tail_block(&mut txn, &s1);
+        tail_block(&mut txn, &s2);
+        assert_eq!(upsert_fill(&mut txn, 0, &s1).unwrap(), 0);
+        undo_block(&mut txn, 0, 20).unwrap();
+        assert_eq!(
+            lookup(&txn, "free.t").unwrap().map(|r| r.key.height()),
+            Some(10)
+        );
+        undo_block(&mut txn, 0, 10).unwrap();
+        assert_eq!(lookup(&txn, "free.t").unwrap(), None);
+
+        // A fill row from a block at or above the block whose entry would take it is gone
+        // with that block too: block 5 (newest by ctime) logged no row before; the fill
+        // re-reads block 12's older swap (not stored: block 5's is newer). Unwinding to 5
+        // must leave no price, not block 12's orphaned swap.
+        let s5 = t_swap(500, 5, "5");
+        tail_block(&mut txn, &s5);
+        let s12 = t_swap(120, 12, "9");
+        tail_block(&mut txn, &s12); // writes nothing: block 5's row is newer
+        assert_eq!(upsert_fill(&mut txn, 0, &s12).unwrap(), 0);
+        undo_block(&mut txn, 0, 12).unwrap();
+        undo_block(&mut txn, 0, 5).unwrap();
+        assert_eq!(lookup(&txn, "free.t").unwrap(), None);
+    }
+
+    /// m-1 (PR #49 review): a sender can backdate creationTime, so a tail block's row can be
+    /// older than a history row the fill finds later. The fill overwrites it; the block's
+    /// undo entry must then restore the fill's row, not the "no row" it logged.
+    #[test]
+    fn a_fill_row_newer_than_a_tail_row_survives_the_tail_blocks_unwind() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        // Tail block 20, backdated (ctime 100): first row of the token, logged as none.
+        tail_block(&mut txn, &t_swap(100, 20, "2"));
+        // The fill's history swap at height 10 is newer by ctime: it is stored.
+        assert_eq!(upsert_fill(&mut txn, 0, &t_swap(150, 10, "1")).unwrap(), 1);
+        assert_eq!(
+            lookup(&txn, "free.t").unwrap().map(|r| r.key.height()),
+            Some(10)
+        );
+        undo_block(&mut txn, 0, 20).unwrap();
+        let got = lookup(&txn, "free.t").unwrap().unwrap();
+        assert_eq!((got.ctime, got.key), (150, TxKey::new(10, 0, 1)));
+        // Same with a row before the block: block 30 replaced the fill's older row (ctime
+        // 50); a fill row between them (ctime 120, height 11) goes into block 30's entry.
+        txn.del(Table::TokenSwaps, &row_key(0, "free.t")).unwrap();
+        assert_eq!(upsert_fill(&mut txn, 0, &t_swap(50, 9, "0")).unwrap(), 1);
+        tail_block(&mut txn, &t_swap(60, 30, "3"));
+        assert_eq!(upsert_fill(&mut txn, 0, &t_swap(120, 11, "1")).unwrap(), 1);
+        undo_block(&mut txn, 0, 30).unwrap();
+        let got = lookup(&txn, "free.t").unwrap().unwrap();
+        assert_eq!((got.ctime, got.key.height()), (120, 11));
     }
 
     /// N-05: an exponent of `i64::MIN` has no `abs()`; it must be refused, not panic (debug)
