@@ -17,7 +17,10 @@
 //! failed nullable field with `null` in place, and a failed non-null field by nulling its
 //! nearest nullable parent (an object, a list item, or `data` itself). The walk does both,
 //! only for a member that is in the collected set *and* has an error at exactly its path, so
-//! it never invents a key and never nulls a value no error points at. An object async-graphql
+//! it never invents a key and never nulls a value no error points at. One exception: an error
+//! this indexer raises itself (a code in [`crate::error::IN_PLACE_CODES`], or a Pact cap; see
+//! [`crate::error::nulls_in_place`]) nulls a non-null field in place and keeps the rest of the
+//! page, as before #60; stock never raises these. An object async-graphql
 //! answered `null` because every member failed is rebuilt when an error points below it.
 //! `data` itself is rebuilt only when every error has a path and an `extensions.code` (all
 //! resolver errors do, through [`crate::error::err`]); a request that never ran (a missing
@@ -121,10 +124,14 @@ pub fn reorder_response(
     };
     let mut failed = HashSet::new();
     let mut under = HashSet::new();
+    let mut bubbling = HashSet::new();
     for e in r.errors.iter().filter(|e| !e.path.is_empty()) {
         let p = seg_path(&e.path);
         for n in 0..p.len() {
             under.insert(p[..n].to_vec());
+        }
+        if !crate::error::nulls_in_place(e.extensions.as_ref()) {
+            bubbling.insert(p.clone());
         }
         failed.insert(p);
     }
@@ -138,6 +145,7 @@ pub fn reorder_response(
         plans: Vec::new(),
         failed,
         under,
+        bubbling,
         path: Vec::new(),
         last_object: None,
     };
@@ -246,6 +254,9 @@ struct Walker<'a> {
     failed: HashSet<Vec<Seg>>,
     /// Every strict prefix of an error path.
     under: HashSet<Vec<Seg>>,
+    /// The error paths whose error bubbles on a non-null field; the others are this
+    /// indexer's own errors, nulled in place ([`crate::error::nulls_in_place`]).
+    bubbling: HashSet<Vec<Seg>>,
     /// Where the walk is in the response (kept only when there are errors).
     path: Vec<Seg>,
     /// The last named type found to be an object type (saves a registry lookup per row).
@@ -334,8 +345,8 @@ impl<'a> Walker<'a> {
                 _ => map.get_index_of(&e.key),
             };
             let Some(idx) = at else {
-                if self.failed_here(&e.key) && e.ty.is_some() {
-                    if !nullable(e.ty) {
+                if let Some(bubbles) = self.failed_here(&e.key).filter(|_| e.ty.is_some()) {
+                    if bubbles && !nullable(e.ty) {
                         return true;
                     }
                     nulls.push(n);
@@ -380,13 +391,18 @@ impl<'a> Walker<'a> {
         false
     }
 
-    /// Whether an error sits at exactly `self.path` + `key`.
-    fn failed_here(&mut self, key: &Name) -> bool {
+    /// Whether an error sits at exactly `self.path` + `key`: `Some(bubbles)`, where `bubbles`
+    /// says whether a non-null field there nulls its parent (an error this indexer raises
+    /// itself does not; see [`crate::error::IN_PLACE_CODES`]).
+    fn failed_here(&mut self, key: &Name) -> Option<bool> {
         if self.failed.is_empty() {
-            return false;
+            return None;
         }
         self.path.push(Seg::Field(key.clone()));
-        let hit = self.failed.contains(&self.path);
+        let hit = self
+            .failed
+            .contains(&self.path)
+            .then(|| self.bubbling.contains(&self.path));
         self.path.pop();
         hit
     }
@@ -639,6 +655,21 @@ mod tests {
         }
     }
 
+    /// A connection whose `totalCount: Int!` the deadline cut (`COUNT_TIMEOUT`).
+    struct Conn;
+    #[Object]
+    impl Conn {
+        async fn total_count(&self) -> async_graphql::Result<i32> {
+            Err(crate::error::err(
+                crate::error::Code::CountTimeout,
+                "count cut",
+            ))
+        }
+        async fn edges(&self) -> Vec<i32> {
+            vec![1, 2]
+        }
+    }
+
     struct Q;
     #[Object]
     impl Q {
@@ -663,6 +694,30 @@ mod tests {
         }
         async fn bang(&self) -> async_graphql::Result<i32> {
             Err(coded("bang"))
+        }
+        /// Non-null fields failing with this indexer's own errors (I-1).
+        async fn conn(&self) -> Conn {
+            Conn
+        }
+        async fn dex(&self) -> async_graphql::Result<Vec<i32>> {
+            Err(crate::error::err(
+                crate::error::Code::NotAvailable,
+                "being filled",
+            ))
+        }
+        /// A Pact cap: stock's code, with the indexer's `limit` name.
+        async fn pact(&self) -> async_graphql::Result<Vec<i32>> {
+            use async_graphql::ErrorExtensions;
+            Err(async_graphql::Error::new("cap").extend_with(|_, e| {
+                e.set("code", crate::error::INTERNAL_SERVER_ERROR);
+                e.set("limit", "pact_items");
+            }))
+        }
+        /// Stock's code without a limit name: a plain resolver failure.
+        async fn thrown(&self) -> async_graphql::Result<i32> {
+            use async_graphql::ErrorExtensions;
+            Err(async_graphql::Error::new("thrown")
+                .extend_with(|_, e| e.set("code", crate::error::INTERNAL_SERVER_ERROR)))
         }
         async fn nul(&self) -> Option<Bad> {
             Some(Bad)
@@ -834,6 +889,47 @@ mod tests {
                 data(&s, "{ a: nul { q } b: nul { ok } }").await,
                 json!({"a": null, "b": {"ok": 1}})
             );
+        }
+    }
+
+    /// I-1: errors this indexer raises itself (count timeout, caps, deadlines, readiness) on a
+    /// non-null field null that field in place and keep the rest of the page; every other
+    /// error still bubbles to the nearest nullable parent.
+    #[tokio::test]
+    async fn indexer_raised_errors_null_in_place() {
+        use serde_json::json;
+        let s = schema(true);
+        for _ in 0..5 {
+            // A cut `totalCount` keeps the edges and the other root fields.
+            assert_eq!(
+                data(&s, "{ conn { totalCount edges } fast }").await,
+                json!({"conn": {"totalCount": null, "edges": [1, 2]}, "fast": 3})
+            );
+            // `NOT_AVAILABLE` on a non-null root does not null `data`.
+            assert_eq!(
+                data(&s, "{ dex fast }").await,
+                json!({"dex": null, "fast": 3})
+            );
+            assert_eq!(data(&s, "{ dex }").await, json!({"dex": null}));
+            assert_eq!(
+                data(&s, "{ pact fast }").await,
+                json!({"pact": null, "fast": 3})
+            );
+            // Not exempt: a resolver's own error still bubbles.
+            assert_eq!(data(&s, "{ thrown fast }").await, serde_json::Value::Null);
+            assert_eq!(data(&s, "{ bang fast }").await, serde_json::Value::Null);
+            assert_eq!(
+                data(&s, "{ nul { ok q } fast }").await,
+                json!({"nul": null, "fast": 3})
+            );
+            // An exempt error does not shield a sibling's bubbling error.
+            assert_eq!(
+                data(&s, "{ conn { totalCount } nul { q } }").await,
+                json!({"conn": {"totalCount": null}, "nul": null})
+            );
+            // The error is kept.
+            let r = s.execute("{ dex fast }").await;
+            assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         }
     }
 

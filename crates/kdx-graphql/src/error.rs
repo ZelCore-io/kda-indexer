@@ -111,6 +111,39 @@ pub fn codeless_request_error(r: &async_graphql::Response) -> bool {
             .any(|e| e.extensions.as_ref().and_then(|x| x.get("code")).is_none())
 }
 
+/// `extensions.code`s of the errors this indexer raises itself on a field: a cut
+/// `totalCount` (`COUNT_TIMEOUT`), a cap or a busy slot (`LIMIT`: the search slot, page and
+/// item caps, DEX budgets), a passed deadline (`TIMEOUT`) and data still being built
+/// (`NOT_AVAILABLE`: a fill or readiness wait), and a field or filter this indexer does not
+/// serve (`NOT_SUPPORTED`, `UNSUPPORTED_FILTER`). Stock never raises these, so on a non-null
+/// field they null that field in place and keep the rest of the page (the behaviour before
+/// #60) instead of bubbling to the nearest nullable parent ([`crate::order`]). Every other
+/// error, async-graphql's own included, bubbles as the spec says.
+pub const IN_PLACE_CODES: [&str; 6] = [
+    "COUNT_TIMEOUT",
+    "LIMIT",
+    "TIMEOUT",
+    "NOT_AVAILABLE",
+    "NOT_SUPPORTED",
+    "UNSUPPORTED_FILTER",
+];
+
+/// Whether an error with these extensions is nulled in place rather than bubbled: its code
+/// is in [`IN_PLACE_CODES`], or it is one of the Pact passthrough's caps, which carry stock's
+/// `INTERNAL_SERVER_ERROR` code and name the cap in `extensions.limit`.
+pub fn nulls_in_place(x: Option<&async_graphql::ErrorExtensionValues>) -> bool {
+    let Some(x) = x else {
+        return false;
+    };
+    match x.get("code") {
+        Some(async_graphql::Value::String(c)) => {
+            IN_PLACE_CODES.contains(&c.as_str())
+                || (c == INTERNAL_SERVER_ERROR && x.get("limit").is_some())
+        }
+        _ => false,
+    }
+}
+
 /// A resolver error with `extensions.code`.
 pub fn err(code: Code, msg: impl Into<String>) -> async_graphql::Error {
     async_graphql::Error::new(msg).extend_with(|_, e| e.set("code", code.as_str()))
@@ -255,5 +288,34 @@ mod tests {
         ];
         let v: serde_json::Value = serde_json::from_slice(&wire_json(&batch).unwrap()).unwrap();
         assert!(v[0].get("data").is_none() && v[1]["data"] == 1, "{v}");
+    }
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    fn ext(code: &str) -> async_graphql::ErrorExtensionValues {
+        let mut x = async_graphql::ErrorExtensionValues::default();
+        x.set("code", code);
+        x
+    }
+
+    /// PR #62 review I-a: an unserved field (`minerAccount`, a search left off) or filter
+    /// keeps the rest of the page like the other indexer-raised codes.
+    #[test]
+    fn unserved_fields_and_filters_null_in_place() {
+        for c in [
+            "NOT_SUPPORTED",
+            "UNSUPPORTED_FILTER",
+            "COUNT_TIMEOUT",
+            "NOT_AVAILABLE",
+        ] {
+            assert!(nulls_in_place(Some(&ext(c))), "{c}");
+        }
+        for c in ["BAD_USER_INPUT", "INTERNAL", INTERNAL_SERVER_ERROR] {
+            assert!(!nulls_in_place(Some(&ext(c))), "{c}");
+        }
+        assert!(!nulls_in_place(None));
     }
 }
