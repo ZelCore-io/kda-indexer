@@ -133,7 +133,7 @@ pub fn type_registry() -> &'static Registry {
     static REG: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
     REG.get_or_init(|| {
         let mut r = Registry::default();
-        <crate::schema::Query as async_graphql::OutputType>::create_type_info(&mut r);
+        <crate::types::dex::QueryRoot as async_graphql::OutputType>::create_type_info(&mut r);
         <crate::types::subscription::Subscription as async_graphql::SubscriptionType>::create_type_info(&mut r);
         r
     })

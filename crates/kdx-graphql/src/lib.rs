@@ -38,7 +38,8 @@ pub use feed::BlockFeed;
 pub use http::router;
 
 /// The executable schema.
-pub type KdxSchema = Schema<schema::Query, EmptyMutation, types::subscription::Subscription>;
+pub type KdxSchema =
+    Schema<types::dex::QueryRoot, EmptyMutation, types::subscription::Subscription>;
 
 /// `[graphql]` settings (plan GQ-9; the config file maps onto this).
 #[derive(Debug, Clone)]
@@ -263,10 +264,12 @@ fn build(
 ) -> KdxSchema {
     let introspection = settings.introspection;
     let mut b = Schema::build(
-        schema::Query,
+        types::dex::QueryRoot(schema::Query, types::dex::DexQuery),
         EmptyMutation,
         types::subscription::Subscription,
     )
+    // Stock declares `LiquidityBalance` though no field returns it (DEX extension).
+    .register_output_type::<types::dex::LiquidityBalance>()
     .data(Gql {
         state,
         ws: ws::WsState::new(&settings),
