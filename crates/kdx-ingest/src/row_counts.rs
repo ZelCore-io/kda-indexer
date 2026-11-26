@@ -14,7 +14,8 @@
 //!   hot records and, for `--check`, the stored table: both sides of the compare come from
 //!   it, so `differing` is 0 on a healthy store even beside the running service.
 //! - Memory: the tally keeps one map per kind; the write and the compare turn one kind at a
-//!   time into a sorted run, and the compare streams the stored table in chunks.
+//!   time into a sorted run (that kind's map and run coexist: the peak is per kind), and the
+//!   compare streams the stored table in chunks inside one hot read txn.
 //! - A record whose output does not render is counted nowhere and leaves the marker unset
 //!   (the walk fails on that tx too; stored counts would hide it).
 

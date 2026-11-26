@@ -248,15 +248,20 @@ systemctl start kda-indexer-<network>
   table, so both sides of the compare come from the same state. It compares one kind at a
   time against the table read in chunks, so it needs no more memory than a full run. Mind
   the memory below next to the service's own.
+- `--check` keeps that one hot read transaction open beside the service for the whole
+  second phase, the streamed compare included (minutes on mainnet). While it is open MDBX
+  cannot reuse the pages the tail and the freezer free, so the hot `mdbx.dat` can grow by
+  what they write meanwhile. Run it when the store has room, and not in a loop.
 - Time: measured at about 80,000 records a second per thread and 256,000 on 6 threads
   (mainnet-like synthetic records, release build, warm cache). Mainnet holds about 371
   million records, so plan on 25 minutes at that rate, up to about 50 minutes on slower
   cores or a cold disk.
 - Memory: one map per kind of every (key, chain), 44-55 bytes a key measured (2-3 million
   synthetic keys, release build), up to about 75 depending on how full the hash tables
-  are. Writing (or comparing) turns one kind at a time into a sorted list, so the peak is
-  the maps plus the largest kind's list: 54-64 bytes a key measured, up to about 90. At 30-60
-  million keys plan on 2-5.5 GB.
+  are. Writing (or comparing) turns one kind at a time into a sorted list. That kind's map
+  and its list are alive together until the list is built (per kind, not chunked), so the
+  peak is the maps plus the largest kind's list: 54-64 bytes a key measured, up to about 90.
+  At 30-60 million keys plan on 2-5.5 GB.
 - Hot store: the table holds one row per (kind, key, chain), about 40-60 bytes each in the
   B-tree, so the hot store grows from about 0.85 GB to about 3-4 GB on mainnet. The default
   `storage.mdbx_max_gb = 64` covers it; check that a config that lowers it leaves room.
