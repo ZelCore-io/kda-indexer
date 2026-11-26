@@ -2231,6 +2231,23 @@ pub(crate) mod tests {
         assert!(retries.is_empty(), "{retries:?}");
         let t = balances::token_row(&txn, tok).unwrap().unwrap();
         assert_ne!(t.kind, KIND_NOT_FUNGIBLE);
+        drop(txn);
+
+        // PR #49 m-3: a park is not final. A new tx of a parked key marks it again (the
+        // tail's one mark path), so the next batch reads it.
+        let parked = balances::parked_invalid(&hot.ro().unwrap()).unwrap();
+        let k = parked[0];
+        let (a, m, c) = balances::parse_bal_key(&k).unwrap();
+        let mut txn = hot.rw().unwrap();
+        assert!(txn.get(Table::BalanceDirty, &k).unwrap().is_none());
+        assert!(balances::mark_row(&mut txn, a, m, c, 20, None).unwrap());
+        txn.commit().unwrap();
+        assert_eq!(balances::dirty_count(&hot.ro().unwrap()).unwrap(), 37);
+        let keys = refill(&hot, 64, 64).unwrap();
+        assert!(
+            keys.iter().any(|d| d.key == k && !d.seed),
+            "re-marked key is queued"
+        );
     }
 
     /// H-1: a key whose answer stays unusable while its module answers for others is parked

@@ -99,8 +99,14 @@ pub enum LocalError {
 
 pub type LocalResult<T> = std::result::Result<Local<T>, LocalError>;
 
-/// The B-1 module name check: `name` or `namespace.name`, identifier characters only.
+/// The B-1 module name check: `name` or `namespace.name`, identifier characters only, at
+/// most [`MAX_NAME_LEN`] bytes, the cap of every other name sent (PR #49 m-4: with the table
+/// name's cap, a no-table message always fits `MAX_NO_TABLE_MESSAGE`; real module names are
+/// far shorter).
 pub fn valid_module(m: &str) -> bool {
+    if m.len() > MAX_NAME_LEN {
+        return false;
+    }
     let mut parts = m.splitn(2, '.');
     let first = parts.next().unwrap_or("");
     valid_ident(first) && parts.next().is_none_or(valid_ident)
@@ -868,6 +874,30 @@ mod tests {
         ] {
             assert!(!valid_module(bad), "{bad}");
         }
+    }
+
+    /// PR #49 m-4: a module name is at most [`MAX_NAME_LEN`] bytes, so a no-table message
+    /// (`{module}_{table}`, both capped) always fits [`MAX_NO_TABLE_MESSAGE`] and is never
+    /// cut before the table check reads its end.
+    #[test]
+    fn module_names_are_capped() {
+        let at = format!("n_x.{}", "m".repeat(MAX_NAME_LEN - 4));
+        assert_eq!(at.len(), MAX_NAME_LEN);
+        assert!(valid_module(&at));
+        assert!(!valid_module(&format!("{at}m")));
+        assert!(!valid_module(&"m".repeat(MAX_NAME_LEN + 1)));
+        assert!(matches!(
+            check_module(&format!("{at}m")),
+            Err(LocalError::Skipped(_))
+        ));
+        // The longest message both caps allow is kept whole.
+        let msg = format!(
+            "Error during database operation: Table access failed because table \
+             {at}_{} was not found.",
+            "t".repeat(MAX_NAME_LEN)
+        );
+        assert!(msg.len() <= MAX_NO_TABLE_MESSAGE);
+        assert!(is_no_table_message(&msg));
     }
 
     /// B-1: a hostile account is data; the code is the fixed form.
