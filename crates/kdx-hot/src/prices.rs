@@ -205,10 +205,10 @@ fn hop_of(params: &Value) -> Option<Hop> {
     let p = params.as_array().filter(|p| p.len() == 6)?;
     Some(Hop {
         amount_in: amount_of(&p[2])?,
-        raw_in: p[2].to_string(),
+        raw_in: amount_text(&p[2])?,
         token_in: module_ref_name(&p[3])?,
         amount_out: amount_of(&p[4])?,
-        raw_out: p[4].to_string(),
+        raw_out: amount_text(&p[4])?,
         token_out: module_ref_name(&p[5])?,
     })
 }
@@ -259,8 +259,8 @@ pub fn swap_of(key: TxKey, ctime: u64, data: &Value, swap_events: &[Value]) -> O
         ctime,
         key,
         legs: [
-            (t0.to_owned(), a0.to_string()),
-            (t1.to_owned(), a1.to_string()),
+            (t0.to_owned(), amount_text(a0)?),
+            (t1.to_owned(), amount_text(a1)?),
         ],
     };
     let main = if t0 == COIN { t1 } else { t0 };
@@ -580,7 +580,7 @@ impl Dec {
                 s[i + 1..]
                     .parse::<i64>()
                     .ok()
-                    .filter(|e| e.abs() <= 4 * MAX_EXP)?,
+                    .filter(|e| e.unsigned_abs() <= 4 * MAX_EXP.unsigned_abs())?,
             ),
             None => (s, 0),
         };
@@ -598,7 +598,8 @@ impl Dec {
             exp: e.checked_sub(frac.len() as i64)?,
         };
         d.normalize();
-        (d.digits.len() <= MAX_SIG_DIGITS && d.exp.abs() <= MAX_EXP).then_some(d)
+        (d.digits.len() <= MAX_SIG_DIGITS && d.exp.unsigned_abs() <= MAX_EXP.unsigned_abs())
+            .then_some(d)
     }
 
     fn normalize(&mut self) {
@@ -781,18 +782,32 @@ fn same_amount(a: &Dec, b: &Dec) -> bool {
     (a.is_zero() && b.is_zero()) || a == b
 }
 
-/// [`amount_dec`] of a parsed JSON value.
-fn amount_of(a: &Value) -> Option<Dec> {
+/// The part of an amount the stock resolver reads: `amount.decimal ?? amount.integer ??
+/// amount`. Other keys of an amount object are never looked at, so they are not stored
+/// (N-04: a result is the sender's, and could pad a genuine amount with kilobytes of JSON).
+fn amount_pick(a: &Value) -> &Value {
     fn pick<'a>(o: &'a serde_json::Map<String, Value>, f: &str) -> Option<&'a Value> {
         o.get(f).filter(|v| !v.is_null())
     }
-    let v = match a {
+    match a {
         Value::Object(o) => pick(o, "decimal")
             .or_else(|| pick(o, "integer"))
             .unwrap_or(a),
         _ => a,
-    };
-    match v {
+    }
+}
+
+/// The stored text of an amount: the JSON of its [`amount_pick`], when that reads as a number
+/// (so at most [`MAX_AMOUNT_TEXT`] bytes of string, or a JSON number). It reads back through
+/// [`amount_dec`] as the same number, sign of a zero included.
+fn amount_text(a: &Value) -> Option<String> {
+    amount_of(a)?;
+    Some(amount_pick(a).to_string())
+}
+
+/// [`amount_dec`] of a parsed JSON value.
+fn amount_of(a: &Value) -> Option<Dec> {
+    match amount_pick(a) {
         Value::Number(n) => {
             let f: f64 = n.to_string().parse().ok()?;
             f.is_finite().then(|| Dec::parse(&format!("{f}")))?
@@ -1446,5 +1461,57 @@ mod tests {
         assert!(lookup(&txn, "free.new").unwrap().is_some());
         undo_block(&mut txn, 5, 30).unwrap();
         assert_eq!(lookup(&txn, "free.new").unwrap(), None);
+    }
+
+    /// N-05: an exponent of `i64::MIN` has no `abs()`; it must be refused, not panic (debug)
+    /// or wrap past the bound (release).
+    #[test]
+    fn an_i64_min_exponent_is_refused() {
+        assert_eq!(Dec::parse("1e-9223372036854775808"), None);
+        assert_eq!(Dec::parse("1e9223372036854775807"), None);
+        assert_eq!(
+            amount_of(&json!({"decimal": "1e-9223372036854775808"})),
+            None
+        );
+        assert!(Dec::parse("1e-4000").is_none());
+        assert!(Dec::parse("1e-1000").is_some());
+    }
+
+    /// N-04: a result leg may carry extra keys beside its amount; only the amount stock reads
+    /// (`decimal ?? integer ?? amount`) is stored, so padding never reaches `TokenSwaps`, and
+    /// the price stays stock's.
+    #[test]
+    fn padding_beside_a_result_amount_is_not_stored() {
+        let k = TxKey::new(1, 2, 1);
+        let genuine = [ev(
+            "coin",
+            json!({"decimal": "0.0001"}),
+            "kaddex.kdx",
+            json!(3.0),
+        )];
+        let pad = "x".repeat(50_000);
+        let data = json!([
+            {"token": "coin", "amount": {"decimal": "0.0001", "pad": pad}},
+            {"token": "kaddex.kdx", "amount": {"integer": 3, "pad": pad}}
+        ]);
+        let s = swap_of(k, 0, &data, &genuine).unwrap();
+        assert_eq!(
+            s.row.legs,
+            [
+                ("coin".to_owned(), "\"0.0001\"".to_owned()),
+                ("kaddex.kdx".to_owned(), "3".to_owned())
+            ]
+        );
+        // The price is the one stock computes from the padded result.
+        assert_eq!(price_text(&s.row).as_deref(), Some("0.000033333333"));
+        // A negative zero keeps its sign, as stock reads it.
+        let z = [ev("coin", json!(1), "free.t", json!(0))];
+        let data = json!([
+            {"token": "coin", "amount": 1},
+            {"token": "free.t", "amount": {"decimal": "-0", "pad": "y"}}
+        ]);
+        let s = swap_of(k, 0, &data, &z).unwrap();
+        assert_eq!(s.row.legs[1].1, "\"-0\"");
+        assert_eq!(price_text(&s.row).as_deref(), Some("-Infinity"));
     }
 }
