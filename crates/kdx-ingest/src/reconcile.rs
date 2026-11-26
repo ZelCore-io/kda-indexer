@@ -986,11 +986,18 @@ pub async fn reconcile_batch(
                 }
             }
             Outcome::Invalid => {
-                // To the back of the queue, like a node error but without a backoff: the
-                // answer came, only this build cannot use it. The mark is not dropped here;
-                // [`MAX_KEY_RETRIES`] invalid answers in a row park the key (H-1), and a module
-                // whose every answer is unusable counts as failing (R-P5P9-8 #2).
-                let m = balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                // The answer came, only this build cannot use it. The mark is not dropped
+                // here; [`MAX_KEY_RETRIES`] invalid answers in a row park the key (H-1), and a
+                // module whose every answer is unusable counts as failing (R-P5P9-8 #2).
+                // N-03: a tail mark keeps its place (it is not moved to the back), so the next
+                // batches read the same keys and park them; moved to the back, a module with
+                // more unusable keys than the retry map tracks would rotate them forever,
+                // none reaching a second strike. A seed mark becomes a tail mark once.
+                let m = if it.d.seed {
+                    balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?
+                } else {
+                    it.d.mark
+                };
                 st.invalid += 1;
                 st.invalid_keys.push((it.d.key, m));
                 if Some(it.module) != coin {
@@ -2019,8 +2026,8 @@ pub(crate) mod tests {
         assert!(rows[0].2.positive());
     }
 
-    /// One key whose answer is unusable is counted as `invalid` and stays queued (moved to the
-    /// back, never dropped: D3 gap group 2 lost 364 rows that way); the other keys of the batch
+    /// One key whose answer is unusable is counted as `invalid` and stays queued (its mark
+    /// kept, never dropped: D3 gap group 2 lost 364 rows that way); the other keys of the batch
     /// reconcile, the batch does not back off and the module is not counted as failing.
     #[tokio::test]
     async fn one_invalid_answer_does_not_stall_the_batch() {
@@ -2182,6 +2189,42 @@ pub(crate) mod tests {
             .get(Table::Balances, &balances::bal_key(ids[0], coin, 0))
             .unwrap()
             .is_some());
+    }
+
+    /// N-03: unusable keys of a module that passed the fungible check (so it is never marked
+    /// not fungible) keep their place in the queue, so the same keys come back and are parked
+    /// after [`MAX_KEY_RETRIES`] batches. Moved to the back, a module with more such keys than
+    /// the retry map tracks would rotate them forever, none ever reaching a second strike.
+    #[tokio::test]
+    async fn unusable_keys_of_a_fungible_module_are_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, _, _) = setup(dir.path(), &[]);
+        let tok = intern(&hot, DictKind::Module, &["free.tok"])[0];
+        let mut txn = hot.rw().unwrap();
+        balances::update_token(&mut txn, tok, |t| t.fungible_chains = 1).unwrap();
+        txn.commit().unwrap();
+        let names: Vec<String> = (0..40).map(|i| format!("bad{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        for a in intern(&hot, DictKind::Account, &refs) {
+            mark(&hot, a, tok, 0, 10);
+        }
+        let (ctx, local) = client(dir.path(), &hot);
+        let (mut fails, mut retries) = (HashMap::new(), HashMap::new());
+        for i in 0..MAX_KEY_RETRIES {
+            let keys = refill(&hot, 8, 4).unwrap();
+            assert_eq!(keys.len(), 4, "batch {i}");
+            let st = reconcile_batch(&ctx, &local, &keys, &Caps::default())
+                .await
+                .unwrap();
+            assert_eq!(st.invalid, 4, "batch {i}: {st:?}");
+            after_batch(&hot, &mut fails, &mut retries, &keys, &st).unwrap();
+        }
+        let txn = hot.ro().unwrap();
+        assert_eq!(balances::dirty_count(&txn).unwrap(), 36);
+        assert_eq!(balances::parked_invalid(&txn).unwrap().len(), 4);
+        assert!(retries.is_empty(), "{retries:?}");
+        let t = balances::token_row(&txn, tok).unwrap().unwrap();
+        assert_ne!(t.kind, KIND_NOT_FUNGIBLE);
     }
 
     /// H-1: a key whose answer stays unusable while its module answers for others is parked
