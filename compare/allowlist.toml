@@ -828,3 +828,25 @@ reason = "R-P5P9-88 (G, on R-P5P9-86 G): a nested transactions list without a ke
 status = "PROPOSED"
 ruling = "R-P5P9-88 (G); R-P5P9-86 G."
 owner_note = "PROPOSED (ruling R-P5P9-88 concern 4): new in FVH-E3; CG-5 class G (#70, #91, #147)."
+
+[[entry]]
+id = "graphql-pact-timeout-status"
+route = "other"
+json_path_glob = "/data/pactQuery/*/status"
+condition = "changed"
+request_contains = "pactQuery"
+reason = "B1: each side runs pactQuery on its own node with a 10 s per-item timeout. A node that answers slower than that on one side gives that side's item status timeout while the other answers. The compared code is state-stable, so any other status difference stays a diff."
+status = "PROPOSED"
+ruling = "B1 fix round 1 (PR #52 review I4)."
+owner_note = "PROPOSED: new with the pactQuery compare; expected to stay unhit."
+
+[[entry]]
+id = "graphql-pact-timeout-error"
+route = "other"
+json_path_glob = "/data/pactQuery/*/error"
+condition = "changed"
+request_contains = "pactQuery"
+reason = "B1: the error text that goes with graphql-pact-timeout-status. A timed-out item carries stock's fixed timeout message, and the other side carries the node's answer or none."
+status = "PROPOSED"
+ruling = "B1 fix round 1 (PR #52 review I4)."
+owner_note = "PROPOSED: new with the pactQuery compare; expected to stay unhit."
