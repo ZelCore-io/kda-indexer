@@ -14,6 +14,10 @@
 //! - New tail blocks update the table themselves (`kdx_hot::tail::apply`), with an undo log.
 //!   Rows the fill writes from hot blocks carry none: a reorg of a block the fill read from the
 //!   tail (blocks applied by a binary without this table) keeps its swap until a newer one.
+//! - **Beside the live tail (N-14):** a hot tx is read in the write txn that stores its swap,
+//!   so an unwind cannot fall between the two; and where a tail block applied during the fill
+//!   holds a newer row, the fill's row goes into that block's undo log
+//!   (`kdx_hot::prices::upsert_fill`), so unwinding the block leaves it, not no price.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -75,11 +79,30 @@ fn apply_batch(
     for (k, r) in recs {
         if let Some(s) = prices::swap_of_tx(dict, r) {
             rep.swaps += 1;
-            rep.rows += u64::from(prices::upsert(&mut txn, k.chain(), &s, None)?);
+            rep.rows += u64::from(prices::upsert_fill(&mut txn, k.chain(), &s)?);
         }
     }
     if let Some(c) = cursor {
         txn.set_meta_u64(meta::PRICE_FILL_CURSOR, c)?;
+    }
+    txn.commit()
+}
+
+/// The hot pass's batch: each tail tx is read inside the write txn that stores its swap
+/// (N-14). Write txns are serialized, so a tail unwind runs wholly before or after: a tx it
+/// removed is not read, and one still there cannot be removed before its row is written.
+fn apply_hot(hot: &HotStore, dict: &dyn Dict, keys: &[TxKey], rep: &mut FillReport) -> Result<()> {
+    let mut txn = hot.rw()?;
+    for k in keys {
+        let Some(b) = txn.get(Table::TailTxs, &k.to_be_bytes())? else {
+            continue;
+        };
+        let r = decode_tx(&b).context("hot tx record")?;
+        rep.hot_txs += 1;
+        if let Some(s) = prices::swap_of_tx(dict, &r) {
+            rep.swaps += 1;
+            rep.rows += u64::from(prices::upsert_fill(&mut txn, k.chain(), &s)?);
+        }
     }
     txn.commit()
 }
@@ -111,18 +134,7 @@ pub fn run(hot: &HotStore, segdir: &Path, stop: &dyn Fn() -> bool) -> Result<Fil
     }
     let keys: Vec<TxKey> = keys.into_iter().collect();
     for chunk in keys.chunks(BATCH) {
-        let recs = {
-            let txn = hot.ro()?;
-            let mut v = Vec::with_capacity(chunk.len());
-            for k in chunk {
-                if let Some(b) = txn.get(Table::TailTxs, &k.to_be_bytes())? {
-                    v.push((*k, decode_tx(&b).context("hot tx record")?));
-                }
-            }
-            v
-        };
-        rep.hot_txs += recs.len() as u64;
-        apply_batch(hot, &*dict, &recs, None, &mut rep)?;
+        apply_hot(hot, &*dict, chunk, &mut rep)?;
         if stop() {
             return stopped(rep);
         }
@@ -249,5 +261,92 @@ mod tests {
         // Again: nothing new is written.
         let rep = run(&hot, &segdir, &|| false).unwrap();
         assert_eq!((rep.swaps, rep.rows), (2, 0));
+    }
+
+    /// A `kaddex.exchange.SWAP` tx at `h` on chain 1: `amt` KDA for 2 `free.t`.
+    fn swap_tx(dict: &mut HotDict, h: u32, amt: f64) -> TxRecord {
+        let ev = dict.intern(DictKind::EventName, "kaddex.exchange.SWAP");
+        let module = dict.intern(DictKind::Module, "kaddex.exchange");
+        let data = serde_json::json!([
+            {"amount": amt, "token": "coin"}, {"amount": 2.0, "token": "free.t"}
+        ]);
+        TxRecord {
+            key: TxKey::new(h, 1, 1),
+            status_ok: true,
+            cmd: Some(format!(r#"{{"meta":{{"creationTime":{h}}}}}"#).into_bytes()),
+            result: value::to_vec(&data, &*dict),
+            events: vec![EventRec {
+                module,
+                name: ev,
+                module_hash: 0,
+                params: value::to_vec(
+                    &serde_json::json!([
+                        "pool", "k:user", amt,
+                        {"refName": {"namespace": null, "name": "coin"}},
+                        2.0,
+                        {"refName": {"namespace": "free", "name": "t"}}
+                    ]),
+                    &*dict,
+                ),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// N-14 (segment pass): a tail block applied during the fill stored the first row of a
+    /// token, logging "no row before". The fill's older swap of the token is not stored (the
+    /// tail's is newer), but unwinding that block must leave the fill's swap, not delete the
+    /// token's price.
+    #[test]
+    fn an_unwind_during_the_fill_keeps_the_filled_swap() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(&d.path().join("hot"), kdx_hot::Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let (old, tip) = (swap_tx(&mut dict, 10, 1.0), swap_tx(&mut dict, 50, 4.0));
+        dict.persist(&mut txn).unwrap();
+        // The live tail applies block 50 (as `tail::apply` does).
+        let mut undo = Vec::new();
+        let s = prices::swap_of_tx(&dict, &tip).unwrap();
+        prices::upsert(&mut txn, 1, &s, Some(&mut undo)).unwrap();
+        txn.set_meta(&prices::undo_key(1, 50), &undo).unwrap();
+        txn.commit().unwrap();
+        // The fill's segment batch holds the swap at height 10.
+        let mut rep = FillReport::default();
+        apply_batch(&hot, &dict, &[(old.key, old)], Some(1), &mut rep).unwrap();
+        assert_eq!(rep.rows, 0, "the tail's row is newer");
+        let mut txn = hot.rw().unwrap();
+        prices::undo_block(&mut txn, 1, 50).unwrap();
+        txn.commit().unwrap();
+        let row = prices::lookup(&hot.ro().unwrap(), "free.t").unwrap();
+        assert_eq!(
+            row.map(|r| r.key),
+            Some(TxKey::new(10, 1, 1)),
+            "the filled swap is what the unwind restores"
+        );
+    }
+
+    /// N-14 (hot pass): a tail tx unwound between the fill's read and its write is not stored.
+    #[test]
+    fn a_hot_tx_unwound_before_the_write_is_not_stored() {
+        let d = tempfile::tempdir().unwrap();
+        let hot = HotStore::open(&d.path().join("hot"), kdx_hot::Geometry::default()).unwrap();
+        let mut txn = hot.rw().unwrap();
+        let mut dict = HotDict::load(&txn).unwrap();
+        let tx = swap_tx(&mut dict, 10, 1.0);
+        dict.persist(&mut txn).unwrap();
+        let mut b = Vec::new();
+        kdx_types::record::encode_tx(&tx, &mut b);
+        txn.put(Table::TailTxs, &tx.key.to_be_bytes(), &b).unwrap();
+        txn.commit().unwrap();
+        let keys = [tx.key];
+        // The unwind removes the block's txs before the fill writes.
+        let mut txn = hot.rw().unwrap();
+        txn.del(Table::TailTxs, &tx.key.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+        let mut rep = FillReport::default();
+        apply_hot(&hot, &dict, &keys, &mut rep).unwrap();
+        assert_eq!((rep.hot_txs, rep.rows), (0, 0));
+        assert_eq!(prices::lookup(&hot.ro().unwrap(), "free.t").unwrap(), None);
     }
 }

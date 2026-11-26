@@ -355,14 +355,74 @@ pub fn upsert(
     Ok(n)
 }
 
-/// Reverse the rows a tail block wrote (its `price_undo` log), newest first, and drop the log.
-pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
-    let k = undo_key(chain, height);
-    let Some(v) = txn.meta(&k)? else {
-        return Ok(0);
-    };
+/// Most tail blocks [`upsert_fill`] follows back through their undo logs for one row.
+const MAX_UNDO_HOPS: usize = 64;
+
+/// [`upsert`] for the one-time history fill, which runs beside the live tail (N-14), without
+/// an undo log of its own. Where the stored row is newer, the fill's row is not written, but
+/// the tail block that wrote the stored row may have logged an older row (or none) as what
+/// its unwind restores; that entry is pointed at the fill's row instead, so an unwind leaves
+/// the newest swap the fill found rather than an older one or no price at all.
+pub fn upsert_fill(txn: &mut RwTxn<'_>, chain: u8, swap: &Swap) -> Result<u32> {
+    let rows =
+        (swap.tokens.iter().map(|t| (t, &swap.row))).chain(swap.routed.iter().map(|(t, r)| (t, r)));
+    let mut n = 0;
+    for (t, row) in rows {
+        let k = row_key(chain, t);
+        let prev = txn
+            .get(Table::TokenSwaps, &k)?
+            .as_deref()
+            .and_then(SwapRow::decode);
+        match prev {
+            Some(p) if p.order() >= row.order() => {
+                if p.order() > row.order() {
+                    fill_under(txn, chain, &k, p, row)?;
+                }
+            }
+            _ => {
+                txn.put(Table::TokenSwaps, &k, &row.encode())?;
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Walk back from `newer` (stored under `k`) through the undo logs of the tail blocks that
+/// wrote it and the rows they replaced, and make the first entry that would restore a row
+/// older than `row` (or none) restore `row`.
+fn fill_under(
+    txn: &mut RwTxn<'_>,
+    chain: u8,
+    k: &[u8],
+    mut newer: SwapRow,
+    row: &SwapRow,
+) -> Result<()> {
+    for _ in 0..MAX_UNDO_HOPS {
+        let uk = undo_key(chain, newer.key.height());
+        let Some(v) = txn.meta(&uk)? else {
+            return Ok(()); // not a tail block's row: no unwind restores under it
+        };
+        let mut entries = undo_entries(&v)?;
+        // A block's first entry for the key holds what was there before the block.
+        let Some(e) = entries.iter_mut().find(|(key, _)| key == k) else {
+            return Ok(());
+        };
+        match e.1.as_deref().and_then(SwapRow::decode) {
+            Some(p) if p.order() >= row.order() => newer = p,
+            _ => {
+                e.1 = Some(row.encode());
+                txn.set_meta(&uk, &undo_encode(&entries))?;
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn undo_entries(v: &[u8]) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
     let mut entries = Vec::new();
-    let mut b = v.as_slice();
+    let mut b = v;
     while !b.is_empty() {
         let key = get_bytes(&mut b).context("price undo key")?.to_vec();
         let prev = match get_u8(&mut b).context("price undo flag")? {
@@ -371,6 +431,31 @@ pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
         };
         entries.push((key, prev));
     }
+    Ok(entries)
+}
+
+fn undo_encode(entries: &[(Vec<u8>, Option<Vec<u8>>)]) -> Vec<u8> {
+    let mut u = Vec::new();
+    for (key, prev) in entries {
+        put_bytes(&mut u, key);
+        match prev {
+            Some(p) => {
+                u.push(1);
+                put_bytes(&mut u, p);
+            }
+            None => u.push(0),
+        }
+    }
+    u
+}
+
+/// Reverse the rows a tail block wrote (its `price_undo` log), newest first, and drop the log.
+pub fn undo_block(txn: &mut RwTxn<'_>, chain: u8, height: u32) -> Result<u32> {
+    let k = undo_key(chain, height);
+    let Some(v) = txn.meta(&k)? else {
+        return Ok(0);
+    };
+    let entries = undo_entries(&v)?;
     let n = entries.len() as u32;
     for (key, prev) in entries.into_iter().rev() {
         match prev {
