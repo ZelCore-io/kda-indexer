@@ -1164,28 +1164,50 @@ pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<u64> {
     let mut blocks = Blocks::default();
     let decode = rows.needs_record();
     let mut n = 0u64;
-    // A decoded record costs ~1 ms cold, so the clock is read before each one; a key-only
-    // walk reads it every `CHECK_EVERY` keys.
-    let every = if decode { 1 } else { CHECK_EVERY };
+    // The key walk reads the clock every `CHECK_EVERY` keys; a decoding walk also reads it
+    // before each record it decodes.
+    let every = CHECK_EVERY;
     let b = Bounds {
         until: Some(until),
         ..Bounds::default()
     };
+    // A decoding walk reads its frozen records ahead in batches of `COUNT_PREFETCH` keys:
+    // the cold record reads overlap instead of faulting in one by one.
+    let mut batch: Vec<(TxKey, Option<TxRecord>)> = Vec::new();
+    let flush =
+        |batch: &mut Vec<(TxKey, Option<TxRecord>)>, blocks: &mut Blocks| -> ApiResult<u64> {
+            view.prefetch(batch.iter().filter(|(_, r)| r.is_none()).map(|(k, _)| *k))?;
+            let mut m = 0u64;
+            for (k, rec) in batch.drain(..) {
+                if Instant::now() >= until {
+                    return Err(ApiError::Deadline);
+                }
+                if let Some(d) = load(view, k, rec, blocks)? {
+                    m += rows.rows(&d).len() as u64;
+                }
+            }
+            Ok(m)
+        };
     for (i, kr) in keys(view, &src, spec.filter, &caps, b)?.enumerate() {
         if i % every == every - 1 && Instant::now() >= until {
             return Err(ApiError::Deadline);
         }
         let (k, rec) = kr?;
         if decode {
-            if let Some(d) = load(view, k, rec, &mut blocks)? {
-                n += rows.rows(&d).len() as u64;
+            batch.push((k, rec));
+            if batch.len() == COUNT_PREFETCH {
+                n += flush(&mut batch, &mut blocks)?;
             }
         } else {
             n += 1;
         }
     }
+    n += flush(&mut batch, &mut blocks)?;
     Ok(n)
 }
+
+/// Keys a decoding count walk reads ahead at once ([`count`]).
+const COUNT_PREFETCH: usize = 256;
 
 /// The error of a count the deadline cut (`COUNT_TIMEOUT`): `totalCount` is exact or absent.
 pub fn count_error(e: ApiError) -> async_graphql::Error {
