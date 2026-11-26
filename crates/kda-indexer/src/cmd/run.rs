@@ -74,6 +74,9 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
         &kdx_ingest::ctx::hot_dir(&data_dir),
         o.geometry,
     )?);
+    // PR #48 review I-1: clear the stored-counts marker before serving when a build without
+    // stored counts moved the tips (logged with the chain and heights).
+    kdx_ingest::row_counts::startup_guard(&hot)?;
     let ctx = Arc::new(Ctx::open_with(o, node, hot.clone()).await?);
     // The API binds before backfill: admin and status answer while it runs, data routes
     // serve what is committed. It stops with the process (token).

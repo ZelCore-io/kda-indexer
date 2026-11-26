@@ -105,6 +105,13 @@ fn pair(t: &Path) -> (PathBuf, PathBuf) {
     (a, b)
 }
 
+fn set_count_marker(d: &Path) {
+    let h = hot(d);
+    let mut t = h.rw().unwrap();
+    kdx_hot::rowcount::set_ready(&mut t, 0).unwrap();
+    t.commit().unwrap();
+}
+
 #[test]
 fn add_index_gives_the_writers_bytes_and_backfills_the_hot_store() {
     let t = tempfile::tempdir().unwrap();
@@ -118,9 +125,12 @@ fn add_index_gives_the_writers_bytes_and_backfills_the_hot_store() {
     assert_ne!(hot_digest(&a), hot_digest(&b));
     check_deep(&b, "legacy store");
     assert!(!ready(&b));
+    set_count_marker(&b);
 
     let rep = add_index::run(&b.join("segments"), &hot(&b), opts(2, false)).unwrap();
     assert!(rep.ok(), "{rep:?}");
+    // PR #48: segment files written outside the freezer clear the stored-counts marker.
+    assert!(!kdx_hot::rowcount::marker_set(&hot(&b).ro().unwrap()).unwrap());
     let m = kdx_segment::Manifest::load(&b.join("segments"))
         .unwrap()
         .unwrap();

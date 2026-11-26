@@ -52,6 +52,8 @@ enum Shape {
     /// One `coin.NOTE` event whose only param is Carol's name: not a principal and not a
     /// transfer side, so the tx has no `acct` posting of Carol's (audit F-27).
     Note,
+    /// One coin transfer from Alice to herself (only in a reorg fork, never in [`BLOCKS`]).
+    SelfXfer,
 }
 
 /// The fixture's blocks: `(chain, height, user txs)`. Heights below [`FRONTIER`] are frozen.
@@ -103,6 +105,7 @@ fn events(s: Shape) -> Vec<Value> {
         ],
         Shape::One => vec![coin(json!([ALICE, BOB, 1.5]))],
         Shape::Note => vec![ev(None, "coin", "NOTE", json!([CAROL]))],
+        Shape::SelfXfer => vec![coin(json!([ALICE, ALICE, 3.0]))],
     }
 }
 
@@ -773,7 +776,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
         want(|s| match s {
             Shape::Many => &[0, 1, 3, 4, 5],
             Shape::Nft => &[0, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::SelfXfer => &[0],
             Shape::Note => &[],
         })
     );
@@ -789,7 +792,7 @@ async fn big_page_order_is_height_then_node_order_then_sub_row() {
         want(|s| match s {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::SelfXfer => &[0],
             Shape::Note => &[],
         })
     );
@@ -1720,14 +1723,14 @@ async fn one_block_lists_are_in_node_order() {
         match s {
             Shape::Many => &[0, 1, 2, 3, 4, 5],
             Shape::Nft => &[0, 1, 2, 3, 4],
-            Shape::One | Shape::Note => &[0],
+            Shape::One | Shape::Note | Shape::SelfXfer => &[0],
         }
     }
     fn coin_transfers(s: Shape) -> &'static [u32] {
         match s {
             Shape::Many => &[0, 1, 4, 5],
             Shape::Nft => &[0, 4],
-            Shape::One => &[0],
+            Shape::One | Shape::SelfXfer => &[0],
             Shape::Note => &[],
         }
     }
@@ -2760,6 +2763,7 @@ async fn last_pages_of_other_sources_keep_the_key_cap() {
 mod stored_count {
     use super::*;
     use kdx_hot::rowcount::{self, Tally};
+    use kdx_hot::Txn;
     use kdx_ingest::row_counts;
 
     /// Lists the stored counts answer (no filter, `chainId`, `isCoinbase`), over several kinds,
@@ -2866,10 +2870,10 @@ mod stored_count {
     fn backfill_equals_ingest() {
         let fx = fixture();
         let built = recount(&fx);
-        assert!(built.0.len() > 20, "a real fixture: {}", built.0.len());
-        let kinds: HashSet<u8> = built.0.keys().map(|k| k.0 as u8).collect();
+        assert!(built.len() > 20, "a real fixture: {}", built.len());
+        let kinds: HashSet<u8> = built.iter().map(|(k, _)| k.0 as u8).collect();
         assert_eq!(kinds.len(), 7, "every kind is exercised: {kinds:?}");
-        let chains: HashSet<u8> = built.0.keys().map(|k| k.2).collect();
+        let chains: HashSet<u8> = built.iter().map(|(k, _)| k.2).collect();
         assert_eq!(chains, HashSet::from([0, 1]));
 
         let d = tempfile::tempdir().unwrap();
@@ -2979,6 +2983,18 @@ mod stored_count {
             None,
             "no marker: the walk is cut"
         );
+        // Review M-5: the cut `totalCount` is left out of its connection, which is `null`
+        // when that was its only field (async-graphql does no null propagation).
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let r = fx
+            .schema
+            .execute(async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+                deadline: Instant::now(),
+            }))
+            .await;
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        let d = serde_json::to_value(&r.data).unwrap();
+        assert_eq!(d.get(field(l)), Some(&Value::Null), "{d}");
         reconcile(&fx);
         assert_eq!(total_spent(&fx.schema, l).await, Some(walked));
         let e = "events(qualifiedEventName: \"coin.TRANSFER\", ARGS)";
@@ -2990,6 +3006,219 @@ mod stored_count {
         // gives no number.
         for l in WALKED {
             assert_eq!(total_spent(&fx.schema, l).await, None, "{l}");
+        }
+    }
+
+    /// Unwind chain `chain` to `to` and apply `fork` (another block hash) in one txn.
+    fn reorg(fx: &Fx, chain: u8, to: u32, fork: &[(u32, &[Shape])]) {
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        assert!(kdx_hot::tail::unwind_to(&mut t, chain, to).unwrap() > 0);
+        for &(h, shapes) in fork {
+            let (mut b, _) = decoded(chain, h, shapes);
+            b.header.hash = kdx_types::Hash32(hash_of(0xC0, chain, h));
+            let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+            kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        }
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+    }
+
+    fn marker_set(fx: &Fx) -> bool {
+        rowcount::marker_set(&fx.store.hot.ro().unwrap()).unwrap()
+    }
+
+    fn check(fx: &Fx) -> u64 {
+        let r = row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, true, &|| false).unwrap();
+        r.differing.unwrap()
+    }
+
+    /// Review I-1, the rollback guard: a build without stored counts moves a chain's tip
+    /// (here: the `Tail` checkpoint written directly, as its `apply` does) or unwinds blocks
+    /// without the counts' `row_counts_at` following. The marker stays set but `ready` is
+    /// false, so lists walk; the startup check clears the marker and says why.
+    #[tokio::test]
+    async fn an_old_build_moving_the_tips_unsets_ready() {
+        let fx = fixture();
+        reconcile(&fx);
+        assert!(ready(&fx));
+        let l = "transfers(accountName: \"k:alice\", ARGS)";
+        assert!(total_spent(&fx.schema, l).await.is_some());
+        // Normal path: nothing to clear at startup.
+        assert_eq!(row_counts::startup_guard(&fx.store.hot).unwrap(), None);
+
+        // An old build applies a block on chain 0.
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::set_checkpoint(
+            &mut t,
+            kdx_hot::Stage::Tail,
+            0,
+            13,
+            kdx_types::Hash32(hash_of(0xD0, 0, 13)),
+        )
+        .unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx) && !ready(&fx));
+        assert_eq!(total_spent(&fx.schema, l).await, None, "the walk answers");
+        check_lists(&fx).await;
+        let why = row_counts::startup_guard(&fx.store.hot).unwrap().unwrap();
+        assert!(why.contains("chain 0"), "{why}");
+        assert!(!marker_set(&fx), "startup cleared the marker");
+        assert_eq!(row_counts::startup_guard(&fx.store.hot).unwrap(), None);
+
+        // An old build unwinds a block on chain 0: the counts move, their stamp does not.
+        reconcile(&fx);
+        assert!(ready(&fx));
+        let key = rowcount::at_key(0);
+        let old = fx.store.hot.ro().unwrap().meta(&key).unwrap().unwrap();
+        let mut t = fx.store.hot.rw().unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.set_meta(&key, &old).unwrap();
+        t.commit().unwrap();
+        assert!(marker_set(&fx), "marker");
+        assert!(!ready(&fx), "ready");
+        check_lists(&fx).await;
+        assert!(row_counts::startup_guard(&fx.store.hot).unwrap().is_some());
+        assert!(!marker_set(&fx));
+    }
+
+    /// The new build's own apply and unwind keep `row_counts_at` on the tips: a reorg, a
+    /// whole chain unwound to below its hot blocks and re-applied, all stay ready.
+    #[tokio::test]
+    async fn the_tails_own_apply_and_unwind_stay_ready() {
+        let fx = fixture();
+        reconcile(&fx);
+        reorg(&fx, 0, 11, &[(12, &[Shape::One]), (13, &[Shape::Many])]);
+        reorg(&fx, 1, 11, &[(12, &[Shape::Note])]);
+        assert!(ready(&fx));
+        assert_eq!(row_counts::startup_guard(&fx.store.hot).unwrap(), None);
+        assert!(marker_set(&fx));
+        // Unwound below every hot block: the `Tail` checkpoint and the stamp both go.
+        let mut t = fx.store.hot.rw().unwrap();
+        assert!(kdx_hot::tail::unwind_to(&mut t, 1, FRONTIER - 1).unwrap() > 0);
+        t.commit().unwrap();
+        assert!(ready(&fx));
+        assert_eq!(stored(&fx), recount(&fx));
+        assert_eq!(check(&fx), 0);
+    }
+
+    /// Review M-1: an undo whose tx record is missing cannot subtract its counts: the marker
+    /// is cleared.
+    #[test]
+    fn an_undo_without_its_record_clears_the_marker() {
+        let fx = fixture();
+        reconcile(&fx);
+        let mut t = fx.store.hot.rw().unwrap();
+        let from = kdx_types::TxKey::new(12, 0, 0).to_be_bytes();
+        let recs = t.scan(kdx_hot::Table::TailTxs, &from, |_| true).unwrap();
+        let (k, _) = recs
+            .iter()
+            .find(|(_, v)| kdx_types::record::decode_tx(v).unwrap().key.chain() == 0)
+            .unwrap();
+        t.del(kdx_hot::Table::TailTxs, k).unwrap();
+        assert_eq!(kdx_hot::tail::unwind_to(&mut t, 0, 11).unwrap(), 1);
+        t.commit().unwrap();
+        assert!(!marker_set(&fx));
+    }
+
+    /// Review I-2: `--check` reads both sides in one snapshot and merges against the table:
+    /// 0 on a healthy store (also after reorgs), and each missing, extra or wrong row counts.
+    #[test]
+    fn check_is_zero_on_a_healthy_store_and_counts_each_bad_row() {
+        let fx = fixture();
+        reconcile(&fx);
+        assert_eq!(check(&fx), 0);
+        reorg(&fx, 0, FRONTIER, &[(11, &[Shape::Many, Shape::Nft])]);
+        assert_eq!(check(&fx), 0, "the tail keeps the table exact");
+        let rows = fx
+            .store
+            .hot
+            .ro()
+            .unwrap()
+            .scan(kdx_hot::Table::RowCounts, &[], |_| true)
+            .unwrap();
+        let mut t = fx.store.hot.rw().unwrap();
+        t.del(kdx_hot::Table::RowCounts, &rows[0].0).unwrap();
+        t.put(
+            kdx_hot::Table::RowCounts,
+            &rows[1].0,
+            &rowcount::encode_val((999, 0)),
+        )
+        .unwrap();
+        let extra = rowcount::key(kdx_decode::rowcount::CountKind::Pk, 1 << 40, 3);
+        t.put(
+            kdx_hot::Table::RowCounts,
+            &extra,
+            &rowcount::encode_val((1, 0)),
+        )
+        .unwrap();
+        t.put(
+            kdx_hot::Table::RowCounts,
+            &[9u8; 10],
+            &rowcount::encode_val((1, 0)),
+        )
+        .unwrap();
+        t.commit().unwrap();
+        assert_eq!(check(&fx), 4);
+    }
+
+    /// Review M-4: `reconcile-counts` clears the marker before it counts, so a run stopped
+    /// while counting leaves it cleared.
+    #[test]
+    fn a_run_stopped_while_counting_leaves_the_marker_cleared() {
+        let fx = fixture();
+        reconcile(&fx);
+        assert!(marker_set(&fx));
+        let r = row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, false, &|| true);
+        assert!(r.is_err());
+        assert!(!marker_set(&fx));
+    }
+
+    /// Review M-10: a transfer from an account to itself counts once, like the walk.
+    #[tokio::test]
+    async fn a_self_transfer_counts_once() {
+        let fx = fixture();
+        reconcile(&fx);
+        reorg(&fx, 0, 11, &[(12, &[Shape::SelfXfer, Shape::One])]);
+        assert!(ready(&fx));
+        assert_eq!(stored(&fx), recount(&fx));
+        check_lists(&fx).await;
+        for l in STORED {
+            assert_eq!(
+                total_spent(&fx.schema, l).await,
+                Some(walk(&fx.schema, l).await),
+                "{l}"
+            );
+        }
+    }
+
+    /// Review M-10: `transactionsByPublicKey` has no `chainId` argument (as stock); the stored
+    /// sum for one chain is that chain's rows, and the chains add up to the all-chain sum.
+    #[test]
+    fn public_key_counts_per_chain_add_up() {
+        let fx = fixture();
+        reconcile(&fx);
+        let built = recount(&fx);
+        let ro = fx.store.hot.ro().unwrap();
+        let pks: HashSet<u64> = built
+            .iter()
+            .filter(|(k, _)| k.0 == kdx_decode::rowcount::CountKind::Pk)
+            .map(|(k, _)| k.1)
+            .collect();
+        assert!(!pks.is_empty());
+        for e in pks {
+            let all = rowcount::sum(&ro, kdx_decode::rowcount::CountKind::Pk, e, None).unwrap();
+            let (mut u, mut c) = (0, 0);
+            for ch in [0u8, 1] {
+                let one =
+                    rowcount::sum(&ro, kdx_decode::rowcount::CountKind::Pk, e, Some(ch)).unwrap();
+                let want = built
+                    .get((kdx_decode::rowcount::CountKind::Pk, e, ch))
+                    .unwrap_or((0, 0));
+                assert_eq!(one, want);
+                (u, c) = (u + one.0, c + one.1);
+            }
+            assert_eq!(all, (u, c));
         }
     }
 

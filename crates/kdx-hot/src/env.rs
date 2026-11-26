@@ -549,6 +549,12 @@ impl RwTxn<'_> {
         Ok(self.txn.del(self.tables.dbi(t), key, None)?)
     }
 
+    /// Delete every row of a table (one MDBX clear, O(pages), in this txn).
+    pub fn clear(&mut self, t: Table) -> Result<()> {
+        self.txn.clear_db(self.tables.dbi(t))?;
+        Ok(())
+    }
+
     pub fn set_meta(&mut self, name: &str, val: &[u8]) -> Result<()> {
         self.put(Table::Meta, name.as_bytes(), val)
     }

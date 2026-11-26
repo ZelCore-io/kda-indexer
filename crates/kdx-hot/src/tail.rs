@@ -165,6 +165,8 @@ pub fn apply(txn: &mut RwTxn<'_>, b: &IndexedBlock, dict: &mut HotDict) -> Resul
     }
     txn.put(Table::Undo, &bk, &undo::encode(&ops))?;
     set_checkpoint(txn, Stage::Tail, chain, height, br.hash)?;
+    // PR #48 review I-1: the counts now follow this tip.
+    rowcount::stamp(txn, chain)?;
     Ok(())
 }
 
@@ -301,9 +303,21 @@ fn undo_op(
             nft::mark_tx_dirty(txn, *k)?;
             // PR #48: subtract the row counts `apply` added, recomputed from the record (its
             // postings were undone just before; the record is still here).
-            if let Some(v) = txn.get(Table::TailTxs, &k.to_be_bytes())? {
-                let r = kdx_types::record::decode_tx(&v).context("hot tx record")?;
-                rowcount::add_tx(txn, &r, dict, -1)?;
+            match txn.get(Table::TailTxs, &k.to_be_bytes())? {
+                Some(v) => {
+                    let r = kdx_types::record::decode_tx(&v).context("hot tx record")?;
+                    rowcount::add_tx(txn, &r, dict, -1)?;
+                }
+                // Review M-1: its counts cannot be subtracted, so none is trusted.
+                None => {
+                    tracing::warn!(
+                        chain = k.chain(),
+                        height = k.height(),
+                        pos = k.pos(),
+                        "row counts: undone tx has no hot record"
+                    );
+                    rowcount::clear_ready(txn)?;
+                }
             }
             txn.del(Table::TailTxs, &k.to_be_bytes())?;
         }
@@ -383,6 +397,8 @@ pub fn unwind_to_with(
             clear_checkpoint(txn, Stage::Tail, chain)?;
         }
     }
+    // PR #48 review I-1: the counts follow the new tip (or no tip).
+    rowcount::stamp(txn, chain)?;
     Ok(n)
 }
 

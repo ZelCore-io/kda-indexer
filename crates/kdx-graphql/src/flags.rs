@@ -174,5 +174,8 @@ mod tests {
         assert!(r.extensions.is_empty(), "{:?}", r.extensions);
         let d = r.data.into_json().unwrap();
         assert_eq!(d["exact"], 7);
+        // Review M-5: async-graphql leaves a failed field out of its object (no null
+        // propagation): `cut` is absent, not `null`.
+        assert!(d.get("cut").is_none(), "{d}");
     }
 }
