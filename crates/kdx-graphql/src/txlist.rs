@@ -1285,16 +1285,42 @@ fn run_page_desc(
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
 
-/// Items of `spec`, exactly: every item the full walk lists. A walk still running at `until`
-/// (the request deadline) ends with [`ApiError::Deadline`], never with a partial count.
-pub fn count(view: &View, spec: &ListSpec, until: Instant) -> ApiResult<u64> {
+/// The end of a count walk the stored counts cannot answer: the request deadline, or one
+/// [`SCAN_WINDOW`] from `now` when that comes first (a page walk's window).
+pub fn count_until(until: Instant, now: Instant) -> Instant {
+    until.min(now + SCAN_WINDOW)
+}
+
+/// Items of `spec`, exactly: every item the full walk lists. A walk the stored counts cannot
+/// answer runs at most [`count_until`]; one still running then ends with
+/// [`ApiError::Deadline`] (`COUNT_TIMEOUT`), never with a partial count. A walk that decodes
+/// records takes a `walks` slot first, and is cut at once when none is free, so count walks
+/// never hold every heavy read slot.
+pub fn count(
+    view: &View,
+    spec: &ListSpec,
+    until: Instant,
+    walks: &kdx_api::server::CountWalks,
+) -> ApiResult<u64> {
     let (src, rows) = plan(view, spec)?;
     if let Some(n) = stored_count(view, spec, &src, &rows)? {
         return Ok(n);
     }
+    let until = count_until(until, Instant::now());
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
     let decode = rows.needs_record();
+    let _slot = if decode {
+        match walks.take() {
+            Some(s) => Some(s),
+            None => {
+                kdx_metrics::get().graphql_rejected("count_walks");
+                return Err(ApiError::Deadline);
+            }
+        }
+    } else {
+        None
+    };
     let mut n = 0u64;
     // The key walk reads the clock every `CHECK_EVERY` keys; a decoding walk also reads it
     // before each record it decodes.
@@ -1692,10 +1718,11 @@ async fn list_as(
     let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk { .. })
         && selects_direct(ctx, &["totalCount"]);
     let sp = spec.clone();
+    let walks = state.count_walks();
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
         // The count runs to the request deadline; a cut one is an error, not a number (audit
         // F-50, GQ-10). It is carried out of the read so the page is still served.
-        let exact = bounded.then(|| count(view, &sp, dl));
+        let exact = bounded.then(|| count(view, &sp, dl, &walks));
         if !reads {
             return Ok((Vec::new(), PageInfo::default(), exact));
         }
@@ -1725,9 +1752,12 @@ async fn list_as(
         let state = state.clone();
         let spec = spec.clone();
         Box::pin(async move {
-            read_list(&state, one_block, move |view| count(view, &spec, dl))
-                .await
-                .map_err(count_error)
+            let walks = state.count_walks();
+            read_list(&state, one_block, move |view| {
+                count(view, &spec, dl, &walks)
+            })
+            .await
+            .map_err(count_error)
         })
     }));
     Ok(ListPage { edges, info, total })
@@ -1823,6 +1853,30 @@ pub fn name_arg<'a>(name: &str, s: &'a str) -> async_graphql::Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An unindexed count walk ends one scan window from its start at the latest, whatever
+    /// the request deadline; a nearer deadline still ends it first.
+    #[test]
+    fn a_count_walk_is_bounded_by_the_scan_window() {
+        let now = Instant::now();
+        let far = now + std::time::Duration::from_secs(5);
+        assert_eq!(count_until(far, now), now + SCAN_WINDOW);
+        let near = now + std::time::Duration::from_millis(10);
+        assert_eq!(count_until(near, now), near);
+    }
+
+    /// Count walks take a slot without waiting: past the cap they are refused at once, and a
+    /// finished walk gives its slot back.
+    #[test]
+    fn count_walk_slots_are_capped_and_returned() {
+        let w = kdx_api::server::CountWalks::new(2);
+        let a = w.take().unwrap();
+        let _b = w.take().unwrap();
+        assert!(w.take().is_none());
+        drop(a);
+        assert!(w.take().is_some());
+    }
+
     use super::*;
     use serde_json::json;
 
