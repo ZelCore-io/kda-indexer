@@ -1285,10 +1285,14 @@ fn run_page_desc(
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
 
-/// The end of a count walk the stored counts cannot answer: the request deadline, or one
-/// [`SCAN_WINDOW`] from `now` when that comes first (a page walk's window).
+/// How long a count walk the stored counts cannot answer runs at most: two page-walk
+/// windows ([`SCAN_WINDOW`]), well under the request deadline.
+pub const COUNT_SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The end of a count walk the stored counts cannot answer: the request deadline, or
+/// [`COUNT_SCAN_WINDOW`] from `now` when that comes first.
 pub fn count_until(until: Instant, now: Instant) -> Instant {
-    until.min(now + SCAN_WINDOW)
+    until.min(now + COUNT_SCAN_WINDOW)
 }
 
 /// Items of `spec`, exactly: every item the full walk lists. A walk the stored counts cannot
@@ -1854,13 +1858,14 @@ pub fn name_arg<'a>(name: &str, s: &'a str) -> async_graphql::Result<&'a str> {
 #[cfg(test)]
 mod tests {
 
-    /// An unindexed count walk ends one scan window from its start at the latest, whatever
+    /// An unindexed count walk ends one count window from its start at the latest, whatever
     /// the request deadline; a nearer deadline still ends it first.
     #[test]
     fn a_count_walk_is_bounded_by_the_scan_window() {
         let now = Instant::now();
         let far = now + std::time::Duration::from_secs(5);
-        assert_eq!(count_until(far, now), now + SCAN_WINDOW);
+        assert_eq!(count_until(far, now), now + COUNT_SCAN_WINDOW);
+        assert!(COUNT_SCAN_WINDOW < far - now);
         let near = now + std::time::Duration::from_millis(10);
         assert_eq!(count_until(near, now), near);
     }

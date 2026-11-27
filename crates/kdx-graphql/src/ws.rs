@@ -174,8 +174,11 @@ impl Extension for WsOpsExt {
         // subscription and, once spent, null that field for the rest of its life. Execute
         // data is looked up first, so this one shadows the stream's.
         data.insert(Arc::new(crate::txlist::XchainBudget::default()));
-        // And its own account-miss read budget and memo, as an HTTP request has.
-        data.insert(crate::miss::MissBudget::default());
+        // And its own account-miss read budget and memo, as an HTTP request has (a request
+        // that brings one keeps it; a subscription stream has none of its own).
+        if ctx.data_opt::<crate::miss::MissBudget>().is_none() {
+            data.insert(crate::miss::MissBudget::default());
+        }
         match tokio::time::timeout(budget, next.run_with_data(ctx, operation_name, data)).await {
             Ok(r) => r,
             Err(_) => async_graphql::Response::from_errors(vec![server(
