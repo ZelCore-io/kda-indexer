@@ -263,7 +263,9 @@ fn balances_opts(
             rps: b.local_rps,
             concurrency: b.local_concurrency.max(1) as usize,
         },
-        batch: 256,
+        // Room for every read node's calls in flight once keys go `local_batch_keys` a call
+        // (one write txn per batch).
+        batch: (b.local_batch_keys as usize * 80).clamp(256, 4096),
         seed: true,
         caps: kdx_ingest::reconcile::Caps {
             module_share: b.module_share as usize,
@@ -275,8 +277,30 @@ fn balances_opts(
             history_walk_threads: b.history_walk_threads as usize,
         },
         keylist_skip: b.keylist_skip.clone(),
+        batch_keys: b.local_batch_keys as usize,
+        read_nodes: read_nodes(cfg)?,
     };
     Ok(Some((super::local_node_client(cfg)?, o)))
+}
+
+/// `balances.local_urls` as read nodes `n0`, `n1`, …: `node.url` shares the reconciler's
+/// client (`None`); every other URL gets a client of its own with the same `/local` caps.
+fn read_nodes(cfg: &Config) -> anyhow::Result<kdx_ingest::reconcile::ReadNodes> {
+    let mut v = Vec::new();
+    for (i, u) in cfg.balances.local_urls.iter().enumerate() {
+        let node = if *u == cfg.node.url {
+            None
+        } else {
+            let mut c = cfg.clone();
+            c.node.url = u.clone();
+            // The p2p settings name `node.url`'s peer endpoint; a read node needs none.
+            c.node.p2p_url = None;
+            c.node.p2p_cert_sha256 = None;
+            Some(super::local_node_client(&c)?)
+        };
+        v.push((format!("n{i}"), node));
+    }
+    Ok(kdx_ingest::reconcile::ReadNodes(v))
 }
 
 /// Tail stage 7 settings from `[search]`.

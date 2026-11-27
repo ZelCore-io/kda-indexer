@@ -713,15 +713,18 @@ with `[balances] enabled = false`.
   event (`acct` postings) for `coin` on each chain it touches. It walks the hot tail, then the
   segments, and writes 100,000 rows per commit with a resume cursor, so a restart continues
   where it stopped. Mainnet: roughly 1–2M rows.
-- **Reconcile**: up to 256 dirty rows per batch, chosen fresh for every batch: tail marks first
+- **Reconcile**: up to 256 dirty rows per batch (`local_batch_keys` × 80, at most 4,096, once
+  reads are batched; see *Faster drain* below), chosen fresh for every batch: tail marks first
   (`coin` first, then at most `[balances] module_share` keys per other module, round-robin),
   the seed backlog (`BalanceSeed`, `coin` first, then the other modules round-robin) only
   behind them. `module_share` shares the slots fairly; it does not shrink a batch: in the seed
   backlog, room left after the fair pass is topped up from the rest of the window (the first
   16 × batch keys), so a window of one module still fills the batch. Through a node client of its
   own at `[balances] local_rps` calls per second (default 50) with `local_concurrency` in
-  flight (default 8). Each call is `({module}.details (read-msg "a"))` with the account in the
-  request data, gas limit 150,000; keyset references are resolved with `describe-keyset`.
+  flight (default 8). Each call is `(map ({module}.details) (read-msg "as"))` with up to
+  `[balances] local_batch_keys` accounts of one module on one chain in the request data
+  (default 25), or `({module}.details (read-msg "a"))` for one account, gas limit 150,000;
+  keyset references are resolved with `describe-keyset`.
   Mainnet first pass: about 6–12 h at 50/s; everything else runs meanwhile.
 - **Marks**: every tail block marks the balances it may change (`TRANSFER` sides, every account
   of its events for `coin`), and a reorg's undo marks the unwound blocks' rows again. A row
@@ -823,6 +826,67 @@ kda-indexer -c /opt/coins/kda-indexer/mainnet01/config/mainnet01.toml reconcile-
 - `--nft-fill` (service stopped): runs the NFT history fill again (below), then drains the
   marks it made with `get-balance`. `--status` also prints `nft_rows`, `nft_dirty_rows` and
   `nft_filled_height`.
+
+#### Faster drain: batched reads and read nodes
+
+After a fresh mainnet reindex `BalanceDirty` holds about 10.4M rows. One `details` call a key
+at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
+
+- **Batched reads** (`local_batch_keys`, 1..=100, default 25): the keys of one module on one
+  chain go `local_batch_keys` at a time into `(map ({module}.details) (read-msg "as"))`. All
+  entries of an answer were read at the same block, so each key gets the answer's height and
+  `prevBlockHash` and the branch check below, exactly as a single answer. Pact stops at the
+  first account with no row and does not name it, so a batch that fails with the
+  absent-row message is split in halves and each half read again, down to single reads (which
+  tell absent from failure as before). Any other failure (a module with no `details`, out of
+  gas, a too-large answer) reads that batch's keys one by one; an entry that is unusable on its
+  own (no decimal balance, names another account) reads that key alone. Rows, marks and the
+  key index end up exactly as with single reads. `1` turns batching off.
+- **Read nodes** (`local_urls`, at most 8): the `details` reads are spread round robin over
+  these chainweb service APIs, each with its own `local_rps` (≤ 50) and `local_concurrency`
+  caps, so N nodes give N times the budget. Empty (the default) means `node.url` alone; list
+  `node.url` too to keep reading from it (it then shares the reconciler's client). A node that
+  gives a transport or HTTP error, or answers from a tip more than 10 blocks below our tail on
+  that chain, is skipped for 30 s (WARN `balances: read node skipped for a while`) and the read
+  is sent to the next node; with every node down the one back first is tried. The fungible
+  checks, keyset reads, NFT rows, key listing and discovery stay on `node.url`.
+- **Exactness across nodes**: every answer, whichever node gave it, goes through the same
+  branch check against our own store (the stored header hash at the answer's height). A node
+  on another fork gives `other_branch`: the row we hold is kept (only flagged unverified) and
+  the key is read again later, never stored as verified. An absent answer carries no block
+  metadata, so one from a node other than `node.url` is asked again of `node.url` before it
+  counts: absent rows are written exactly as the single-node reconciler writes them.
+- **Expected rate**: with 25 keys a call, one node at 50 calls/s reads up to about 1,250 keys/s
+  where the queue is mostly `coin` (fewer where a module has few dirty keys per chain in a
+  batch); three nodes triple the call budget. Watch the node's CPU and `/local` latency
+  (`kdx_balance_reconcile_seconds`) when raising either setting.
+
+```toml
+[balances]
+local_rps = 50
+local_concurrency = 8
+local_batch_keys = 25
+# node.url first; the others are extra chainweb nodes reachable from this host.
+local_urls = [
+  "http://127.0.0.1:1848",
+  "http://<read-node-1>:1848",
+  "http://<read-node-2>:1848",
+]
+```
+
+Metrics, labelled `node` = `n0`, `n1`, … in `local_urls` order (never the URL; the start-up
+log line `balances: details reads spread over the read nodes` names the primary):
+
+- `kdx_balance_local_node_calls{node,result}`: calls per node, `result` = ok | absent | error |
+  invalid | node_error | lagging;
+- `kdx_balance_local_node_keys{node}`: keys answered per node; `rate()` of it is the node's
+  rows/s;
+- `kdx_balance_local_node_up{node}`: 1 while the node is in use, 0 while it is skipped.
+
+Before raising `local_batch_keys` above 25, check on the node that a full batch stays well
+under the 150,000 gas limit and the 1 MiB answer cap (`node.max_body_bytes`): send the batched
+form for 100 real `k:` accounts to `/local` and read `gas` and the body size from the answer.
+A batch that runs out of gas is not wrong, only slow (it falls back to single reads).
 
 #### Receivers pass (D1)
 
@@ -1168,7 +1232,7 @@ Each budget is separate, so the node sees their sum. At the defaults with
 |---|---|---|---|
 | Miss read (`[graphql.account_miss]`) | `node_rps` 20/s | burst 40, 16 in flight | refused at once (store-only, flagged) |
 | Pact passthrough (`[graphql.pact]`) | `node_rps` 16/s (at most 64) | 8 in flight, 16 requests inside | waits within the item's 10 s timeout; past 16 requests `BUSY` |
-| Reconciler (`balances.local_rps`) | its own setting | its own | waits |
+| Reconciler (`balances.local_rps`) | its own setting, per read node (`local_urls`) | its own | waits |
 
 Worst case: about 36 `/local` calls/s plus the reconciler's rate, with bursts of 40 miss reads
 and 8 Pact calls in flight at once. Pact calls can be slow (each up to `timeout_ms`), so size

@@ -2,8 +2,9 @@
 //! Task 9, rulings B-1 and H-1).
 //!
 //! Safety (B-1):
-//! - Only six code forms are ever sent, each a fixed text with names passed in `data`:
-//!   `({m}.details (read-msg "a"))`, `(describe-keyset (read-msg "k"))`,
+//! - Only seven code forms are ever sent, each a fixed text with names passed in `data`:
+//!   `({m}.details (read-msg "a"))`, its batched form `(map ({m}.details) (read-msg "as"))`,
+//!   `(describe-keyset (read-msg "k"))`,
 //!   `({m}.get-balance (read-msg "t") (read-msg "a"))`, the fungible check
 //!   `(contains "fungible-v2" (at 'interfaces (describe-module (read-msg "m"))))`, and the two
 //!   GQ-15 forms for a trusted NFT ledger, `({m}.details (read-msg "t") (read-msg "a"))` and
@@ -416,6 +417,97 @@ impl LocalClient {
         let code = format!("({module}.details (read-msg \"a\"))");
         let (r, secs) = self.call_timed(chain, &code, json!({ "a": account })).await;
         (r.and_then(details_of), secs)
+    }
+}
+
+/// Most accounts one [`LocalClient::details_many`] call reads (`balances.local_batch_keys` is
+/// capped at this).
+pub const MAX_BATCH_KEYS: usize = 100;
+
+impl LocalClient {
+    /// `(map ({module}.details) (read-msg "as"))` with `data {"as": [accounts…]}`: the
+    /// `details` of up to [`MAX_BATCH_KEYS`] accounts of one module on one chain, read in one
+    /// call, so all at the same block (one `metaData` for the whole answer). Account names
+    /// still travel only in `data` (B-1).
+    ///
+    /// `Found` carries one entry per account, in order: the details, or why that entry is
+    /// unusable (the caller reads that account again on its own). `Absent` means at least one
+    /// account has no row (Pact stops at the first): the node does not say which, so the
+    /// caller splits the call. A Pact failure is the whole call's; an answer that is not a
+    /// list of `accounts.len()` entries is [`LocalError::Invalid`].
+    pub async fn details_many(
+        &self,
+        chain: u8,
+        module: &str,
+        accounts: &[&str],
+    ) -> (LocalResult<Vec<Result<Details, String>>>, f64) {
+        if accounts.is_empty() || accounts.len() > MAX_BATCH_KEYS {
+            return (
+                Err(LocalError::Skipped(format!(
+                    "a batch holds 1..={MAX_BATCH_KEYS} accounts"
+                ))),
+                0.0,
+            );
+        }
+        if let Err(e) = check_module(module)
+            .and_then(|_| accounts.iter().try_for_each(|a| check_name("account", a)))
+        {
+            return (Err(e), 0.0);
+        }
+        let code = format!("(map ({module}.details) (read-msg \"as\"))");
+        let (r, secs) = self
+            .call_timed(chain, &code, json!({ "as": accounts }))
+            .await;
+        (r.and_then(|r| details_list_of(r, accounts)), secs)
+    }
+}
+
+/// One `details` entry of a batched answer; the reason when it is unusable.
+fn one_details(v: &Value, account: &str) -> Result<Details, String> {
+    // `coin.details` echoes the account; a module that does must echo the one asked for.
+    if let Some(a) = v.get("account") {
+        if a.as_str() != Some(account) {
+            return Err("details: entry names another account".into());
+        }
+    }
+    let balance = v
+        .get("balance")
+        .and_then(decimal_text)
+        .ok_or_else(|| "details: no decimal balance".to_owned())?;
+    let (guard, guard_capped) = capped_guard(v.get("guard").cloned().unwrap_or(Value::Null));
+    Ok(Details {
+        balance,
+        guard,
+        guard_capped,
+    })
+}
+
+fn details_list_of(
+    r: Local<Value>,
+    accounts: &[&str],
+) -> LocalResult<Vec<Result<Details, String>>> {
+    match r {
+        Local::Absent => Ok(Local::Absent),
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => {
+            let list = value
+                .as_array()
+                .filter(|l| l.len() == accounts.len())
+                .ok_or_else(|| invalid("details batch: not one entry per account"))?;
+            let value = list
+                .iter()
+                .zip(accounts)
+                .map(|(v, a)| one_details(v, a))
+                .collect();
+            Ok(Local::Found {
+                value,
+                height,
+                prev_hash,
+            })
+        }
     }
 }
 
@@ -1255,5 +1347,49 @@ mod tests {
             println!("{acct}: {d:?}");
             assert!(matches!(d, Local::Found { .. }));
         }
+    }
+
+    /// A batched `details` answer: one entry per account in order, each checked like a single
+    /// answer; an entry naming another account or with no balance is unusable on its own; a
+    /// list of the wrong length makes the whole answer invalid.
+    #[test]
+    fn details_batch_answers_are_checked_per_entry() {
+        let found = |v: Value| Local::Found {
+            value: v,
+            height: 10,
+            prev_hash: Some("h".into()),
+        };
+        let g = json!({"keys": ["k1"], "pred": "keys-all"});
+        let r = details_list_of(
+            found(json!([
+                {"account": "a", "balance": 1.5, "guard": g},
+                {"account": "x", "balance": 2.0, "guard": g},
+                {"account": "c", "guard": g},
+                {"balance": {"decimal": "3.25"}, "guard": g},
+            ])),
+            &["a", "b", "c", "d"],
+        )
+        .unwrap();
+        let Local::Found {
+            value,
+            height,
+            prev_hash,
+        } = r
+        else {
+            panic!("found")
+        };
+        assert_eq!((height, prev_hash.as_deref()), (10, Some("h")));
+        assert_eq!(value[0].as_ref().unwrap().balance, "1.5");
+        assert!(value[1].is_err(), "names another account");
+        assert!(value[2].is_err(), "no balance");
+        assert_eq!(value[3].as_ref().unwrap().balance, "3.25");
+        assert!(matches!(
+            details_list_of(found(json!([{"balance": 1.0}])), &["a", "b"]),
+            Err(LocalError::Invalid(_))
+        ));
+        assert!(matches!(
+            details_list_of(Local::Absent, &["a"]),
+            Ok(Local::Absent)
+        ));
     }
 }

@@ -82,13 +82,14 @@ use kdx_hot::balances::{
 };
 use kdx_hot::tables::block_key;
 use kdx_hot::{checkpoint, HotStore, RwTxn, Stage, Table, Txn};
-use kdx_node::local::{Details, Local, LocalClient, LocalError, LocalOpts};
-use kdx_node::NodeClient;
+use kdx_node::local::{Details, Local, LocalClient, LocalError, LocalOpts, LocalResult};
+use kdx_node::{NodeClient, NodeError};
 use kdx_types::record::decode_block;
 use kdx_types::{DictKind, Hash32};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::read_pool::{ReadNode, ReadPool, LAG_BLOCKS};
 use crate::Ctx;
 
 /// Consecutive node errors or invalid answers after which a key is parked: its dirty mark is dropped (counted as
@@ -165,6 +166,51 @@ pub struct ReconcileOpts {
     /// `balances.keylist_skip`: modules the key listing never reads (the node blocks its cut
     /// while it answers a `keys` of a huge table).
     pub keylist_skip: Vec<String>,
+    /// `balances.local_batch_keys`: accounts per batched `details` call (1: one call a key).
+    pub batch_keys: usize,
+    /// `balances.local_urls`: the nodes the `details` reads are spread over; empty means the
+    /// primary (`node.url`) alone.
+    pub read_nodes: ReadNodes,
+}
+
+/// One read node of `balances.local_urls`: its label (`n0`, `n1`, …) and its own node client
+/// (its rate and concurrency caps are that node's), or `None` for the primary (`node.url`),
+/// which shares the reconciler's client and budget.
+#[derive(Clone, Default)]
+pub struct ReadNodes(pub Vec<(String, Option<NodeClient>)>);
+
+impl std::fmt::Debug for ReadNodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(l, n)| format!("{l}{}", if n.is_none() { " (primary)" } else { "" })),
+            )
+            .finish()
+    }
+}
+
+impl ReadNodes {
+    /// The read pool over `primary` and the other nodes, each with the `/local` caps `o`.
+    pub fn pool(&self, primary: &Arc<LocalClient>, o: LocalOpts, batch_keys: usize) -> ReadPool {
+        let nodes = if self.0.is_empty() {
+            vec![ReadNode::new("n0".into(), primary.clone(), true)]
+        } else {
+            self.0
+                .iter()
+                .map(|(label, node)| match node {
+                    None => ReadNode::new(label.clone(), primary.clone(), true),
+                    Some(n) => ReadNode::new(
+                        label.clone(),
+                        Arc::new(LocalClient::new(n.clone(), o)),
+                        false,
+                    ),
+                })
+                .collect()
+        };
+        ReadPool::new(nodes, batch_keys)
+    }
 }
 
 /// One dirty key taken for a batch: a tail mark (`BalanceDirty`) or a seed mark
@@ -518,33 +564,40 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
         return Outcome::Skipped;
     };
     let (r, secs) = local.details_timed(it.chain, module, acct).await;
-    let out = match r {
+    let out = outcome_of(local, it, r).await;
+    kdx_metrics::get().balance_reconcile(out.label(), secs);
+    out
+}
+
+/// The keyset a trusted row's guard refers to, read on the same chain (I-6); `None` when the
+/// guard names none or the read failed (keys left as cached).
+async fn resolve_ref(
+    local: &LocalClient,
+    it: &Item,
+    guard: &Value,
+) -> Option<(String, Option<Value>)> {
+    match guard_keys(guard) {
+        GuardKeys::Ref(name) if it.trusted => match local.describe_keyset(it.chain, &name).await {
+            Ok(Local::Found { value: ks, .. }) => Some((name, Some(ks))),
+            Ok(Local::Absent) => Some((name, None)),
+            Err(e) => {
+                tracing::debug!(error = %e, "describe-keyset failed; keys left as cached");
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// What one `details` answer means for `it` (the single-key reading every path shares).
+async fn outcome_of(local: &LocalClient, it: &Item, r: LocalResult<Details>) -> Outcome {
+    let module = it.module_name.as_deref().unwrap_or("");
+    match r {
         Ok(Local::Found {
             value,
             height,
             prev_hash,
-        }) => {
-            let as_of = u32::try_from(height).unwrap_or(u32::MAX);
-            let resolved = match guard_keys(&value.guard) {
-                GuardKeys::Ref(name) if it.trusted => {
-                    match local.describe_keyset(it.chain, &name).await {
-                        Ok(Local::Found { value: ks, .. }) => Some((name, Some(ks))),
-                        Ok(Local::Absent) => Some((name, None)),
-                        Err(e) => {
-                            tracing::debug!(error = %e, "describe-keyset failed; keys left as cached");
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            };
-            Outcome::Found(Box::new(Answer {
-                details: value,
-                as_of,
-                prev_hash,
-                resolved,
-            }))
-        }
+        }) => found(local, it, value, height, prev_hash).await,
         Ok(Local::Absent) => Outcome::Absent(it.tail),
         Err(LocalError::Skipped(_)) => Outcome::Skipped,
         Err(LocalError::Failure(m)) => {
@@ -565,9 +618,247 @@ async fn call(local: &LocalClient, it: &Item) -> Outcome {
             tracing::debug!(error = %e, "details: node error, kept dirty");
             Outcome::NodeError
         }
+    }
+}
+
+/// A `details` success read at `height` on the block `prev_hash`.
+async fn found(
+    local: &LocalClient,
+    it: &Item,
+    details: Details,
+    height: u64,
+    prev_hash: Option<String>,
+) -> Outcome {
+    let as_of = u32::try_from(height).unwrap_or(u32::MAX);
+    let resolved = resolve_ref(local, it, &details.guard).await;
+    Outcome::Found(Box::new(Answer {
+        details,
+        as_of,
+        prev_hash,
+        resolved,
+    }))
+}
+
+/// The answer was read more than [`LAG_BLOCKS`] below our tail on its chain.
+fn lagging(height: u64, tail: u32) -> bool {
+    height.saturating_add(u64::from(LAG_BLOCKS)) < u64::from(tail)
+}
+
+/// The result label of one read-node call, for its metrics.
+fn node_label<T>(r: &LocalResult<T>) -> &'static str {
+    match r {
+        Ok(Local::Found { .. }) => "ok",
+        Ok(Local::Absent) => "absent",
+        Err(LocalError::Node(_)) => "node_error",
+        Err(LocalError::Invalid(_)) => "invalid",
+        Err(LocalError::Failure(_) | LocalError::Skipped(_)) => "error",
+    }
+}
+
+/// Send one read through the pool with failover: a node error or a lagging answer marks the
+/// node down and the read goes to the next node; once every node was tried, the last lagging
+/// answer (still exact, only old) or the last node error stands. Returns the result, the
+/// seconds of the call that stands and the index of the node that answered.
+async fn pooled<T, F, Fut>(
+    pool: &ReadPool,
+    tail: u32,
+    keys: u64,
+    mut send: F,
+) -> (LocalResult<T>, f64, usize)
+where
+    F: FnMut(Arc<LocalClient>) -> Fut,
+    Fut: std::future::Future<Output = (LocalResult<T>, f64)>,
+{
+    let mut tried: Vec<usize> = Vec::new();
+    let mut last: Option<(LocalResult<T>, f64, usize)> = None;
+    while let Some(i) = pool.pick(&tried) {
+        tried.push(i);
+        let node = pool.node(i);
+        let (r, secs) = send(node.client.clone()).await;
+        let m = kdx_metrics::get();
+        match &r {
+            Err(LocalError::Node(_)) => {
+                m.balance_local_node(&node.label, "node_error", 0);
+                pool.mark_down(i, "node error");
+                last = match last {
+                    // A lagging answer beats a later node error.
+                    Some(l @ (Ok(_), ..)) => Some(l),
+                    _ => Some((r, secs, i)),
+                };
+            }
+            Ok(Local::Found { height, .. }) if lagging(*height, tail) => {
+                m.balance_local_node(&node.label, "lagging", 0);
+                pool.mark_down(i, "lagging");
+                last = Some((r, secs, i));
+            }
+            _ => {
+                let answered = match &r {
+                    Ok(Local::Found { .. }) => keys,
+                    Ok(Local::Absent) => 1,
+                    _ => 0,
+                };
+                m.balance_local_node(&node.label, node_label(&r), answered);
+                pool.mark_up(i);
+                return (r, secs, i);
+            }
+        }
+    }
+    last.unwrap_or_else(|| {
+        (
+            Err(NodeError::Transport("no read node".into()).into()),
+            0.0,
+            0,
+        )
+    })
+}
+
+/// One key read on its own through the pool. An `Absent` answer carries no block identity
+/// (the node sends no `metaData`), so one from a node other than the primary is asked again
+/// of the primary (`local`, `node.url`): absent rows are exactly as the single-node reconciler
+/// writes them.
+async fn read_single(local: &LocalClient, pool: &ReadPool, it: &Item) -> Outcome {
+    let (Some(acct), Some(module)) = (&it.account_name, &it.module_name) else {
+        return Outcome::Skipped;
     };
+    let (mut r, mut secs, i) = pooled(pool, it.tail, 1, |c| async move {
+        c.details_timed(it.chain, module, acct).await
+    })
+    .await;
+    if matches!(r, Ok(Local::Absent)) && !pool.node(i).primary {
+        (r, secs) = local.details_timed(it.chain, module, acct).await;
+    }
+    let out = outcome_of(local, it, r).await;
     kdx_metrics::get().balance_reconcile(out.label(), secs);
     out
+}
+
+type Chunk<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(usize, Outcome)>> + Send + 'a>>;
+
+/// Read the keys `idx` of `items` (one chain, one module) in one batched `details` call. An
+/// answer gives every key the same block (height and hash), checked per key like a single
+/// answer. When some key has no row the node fails the call without naming it: the keys are
+/// split in halves and each half read again (down to single reads, which tell `Absent` from a
+/// failure exactly as before). Any other failure, an unusable answer or a refused call reads
+/// the keys one by one; an unusable entry reads that key alone.
+fn read_chunk<'a>(
+    local: &'a LocalClient,
+    pool: &'a ReadPool,
+    items: &'a [Item],
+    idx: Vec<usize>,
+) -> Chunk<'a> {
+    Box::pin(async move {
+        if idx.len() == 1 {
+            return vec![(idx[0], read_single(local, pool, &items[idx[0]]).await)];
+        }
+        let first = &items[idx[0]];
+        let module = first.module_name.as_deref().unwrap_or("");
+        let accts: Vec<&str> = idx
+            .iter()
+            .map(|&k| items[k].account_name.as_deref().unwrap_or(""))
+            .collect();
+        let n = idx.len() as u64;
+        let (r, secs, _) = pooled(pool, first.tail, n, |c| {
+            let accts = accts.clone();
+            async move { c.details_many(first.chain, module, &accts).await }
+        })
+        .await;
+        let singles = |keys: Vec<usize>| {
+            join_all(
+                keys.into_iter()
+                    .map(|k| async move { (k, read_single(local, pool, &items[k]).await) }),
+            )
+        };
+        match r {
+            Ok(Local::Found {
+                value,
+                height,
+                prev_hash,
+            }) => {
+                let mut again = Vec::new();
+                let mut ok = Vec::new();
+                for (&k, e) in idx.iter().zip(value) {
+                    match e {
+                        Ok(d) => ok.push((k, d)),
+                        Err(why) => {
+                            tracing::debug!(
+                                chain = first.chain,
+                                module,
+                                why,
+                                "details batch entry unusable; read alone"
+                            );
+                            again.push(k);
+                        }
+                    }
+                }
+                let prev = prev_hash.as_ref();
+                let mut out: Vec<(usize, Outcome)> =
+                    join_all(ok.into_iter().map(|(k, d)| async move {
+                        let o = found(local, &items[k], d, height, prev.cloned()).await;
+                        kdx_metrics::get().balance_reconcile(o.label(), secs);
+                        (k, o)
+                    }))
+                    .await;
+                out.extend(singles(again).await);
+                out
+            }
+            Ok(Local::Absent) => {
+                let mut idx = idx;
+                let back = idx.split_off(idx.len() / 2);
+                let (a, b) = futures::join!(
+                    read_chunk(local, pool, items, idx),
+                    read_chunk(local, pool, items, back)
+                );
+                a.into_iter().chain(b).collect()
+            }
+            Err(LocalError::Node(e)) => {
+                tracing::debug!(error = %e, "details batch: node error on every read node, kept dirty");
+                idx.into_iter()
+                    .map(|k| {
+                        kdx_metrics::get().balance_reconcile("error", secs);
+                        (k, Outcome::NodeError)
+                    })
+                    .collect()
+            }
+            Err(e) => {
+                tracing::debug!(chain = first.chain, module, error = %e, "details batch failed; keys read one by one");
+                singles(idx).await
+            }
+        }
+    })
+}
+
+/// [`call`] for every item through the read pool: keys of one chain and module go in batched
+/// calls of `pool.batch_keys` ([`read_chunk`]), spread over the pool's nodes.
+async fn call_pooled(local: &LocalClient, pool: &ReadPool, items: &[Item]) -> Vec<Outcome> {
+    let mut out: Vec<Option<Outcome>> = (0..items.len()).map(|_| None).collect();
+    let mut groups: BTreeMap<(u8, u32), Vec<usize>> = BTreeMap::new();
+    for (k, it) in items.iter().enumerate() {
+        if let Some(l) = it.skip {
+            kdx_metrics::get().balance_reconcile(l, 0.0);
+            out[k] = Some(Outcome::Dropped(l));
+        } else if it.account_name.is_none() || it.module_name.is_none() {
+            out[k] = Some(Outcome::Skipped);
+        } else {
+            groups.entry((it.chain, it.module)).or_default().push(k);
+        }
+    }
+    let chunks = groups.into_values().flat_map(|g| {
+        g.chunks(pool.batch_keys)
+            .map(<[usize]>::to_vec)
+            .collect::<Vec<_>>()
+    });
+    for (k, o) in join_all(chunks.map(|c| read_chunk(local, pool, items, c)))
+        .await
+        .into_iter()
+        .flatten()
+    {
+        out[k] = Some(o);
+    }
+    // Every key has an outcome; were one missing, it stays dirty (a node error), never dropped.
+    out.into_iter()
+        .map(|o| o.unwrap_or(Outcome::NodeError))
+        .collect()
 }
 
 /// Whether another trusted row of `account` (not `except`) has `pk` in its guard. Bounded by
@@ -886,10 +1177,24 @@ impl BranchWatch {
     }
 }
 
-/// Reconcile one batch of dirty keys.
+/// Reconcile one batch of dirty keys, one `details` call per key on `local`.
 pub async fn reconcile_batch(
     ctx: &Ctx,
     local: &LocalClient,
+    keys: &[Dirty],
+    caps: &Caps,
+) -> Result<BatchStats> {
+    reconcile_batch_with(ctx, local, None, keys, caps).await
+}
+
+/// [`reconcile_batch`] with the `details` reads sent through `pool` (batched per chain and
+/// module, spread over its nodes); `local` (the primary, `node.url`) still makes the fungible
+/// checks, the keyset reads and the re-read of an `Absent` answer from another node. Every
+/// answer is checked against our store's branch the same way, whichever node gave it.
+pub async fn reconcile_batch_with(
+    ctx: &Ctx,
+    local: &LocalClient,
+    pool: Option<&ReadPool>,
     keys: &[Dirty],
     caps: &Caps,
 ) -> Result<BatchStats> {
@@ -983,8 +1288,11 @@ pub async fn reconcile_batch(
         }
     }
 
-    // In-flight calls are capped by the client's semaphore (`local_concurrency`).
-    let outcomes: Vec<Outcome> = join_all(items.iter().map(|it| call(local, it))).await;
+    // In-flight calls are capped by each client's semaphore (`local_concurrency`).
+    let outcomes: Vec<Outcome> = match pool {
+        Some(p) => call_pooled(local, p, &items).await,
+        None => join_all(items.iter().map(|it| call(local, it))).await,
+    };
 
     let mut st = BatchStats::default();
     let mut txn = ctx.hot.rw()?;
@@ -1679,7 +1987,13 @@ async fn run_with(
     let receivers = o
         .seed
         .then(|| tokio::spawn(receivers_task(ctx.clone(), history_stop.clone())));
-    let r = reconcile_loop(&ctx, &local, &o, &stop, fill_retry, nft_retry).await;
+    let pool = o.read_nodes.pool(&local, o.local, o.batch_keys);
+    tracing::info!(
+        nodes = ?o.read_nodes,
+        batch_keys = pool.batch_keys,
+        "balances: details reads spread over the read nodes"
+    );
+    let r = reconcile_loop(&ctx, &local, &pool, &o, &stop, fill_retry, nft_retry).await;
     history_stop.cancel();
     for h in [history, receivers].into_iter().flatten() {
         let _ = h.await;
@@ -1688,9 +2002,11 @@ async fn run_with(
 }
 
 /// The reconcile loop of [`run_with`] after its first passes.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_loop(
     ctx: &Arc<Ctx>,
     local: &Arc<LocalClient>,
+    pool: &ReadPool,
     o: &ReconcileOpts,
     stop: &CancellationToken,
     fill_retry: Duration,
@@ -1774,7 +2090,7 @@ async fn reconcile_loop(
             }
         }
         let t0 = Instant::now();
-        let st = reconcile_batch(&ctx, &local, &batch, &o.caps).await?;
+        let st = reconcile_batch_with(&ctx, &local, Some(pool), &batch, &o.caps).await?;
         let k = st.ok + st.absent + st.skipped + st.failures + st.dropped;
         done += k;
         let r = k as f64 / t0.elapsed().as_secs_f64().max(1e-3);
@@ -3387,6 +3703,8 @@ pub(crate) mod tests {
             seed: true,
             caps: Caps::default(),
             keylist_skip: Vec::new(),
+            batch_keys: 1,
+            read_nodes: ReadNodes::default(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -3587,6 +3905,8 @@ pub(crate) mod tests {
                 ..Caps::default()
             },
             keylist_skip: Vec::new(),
+            batch_keys: 1,
+            read_nodes: ReadNodes::default(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -3663,6 +3983,8 @@ pub(crate) mod tests {
                 ..Caps::default()
             },
             keylist_skip: Vec::new(),
+            batch_keys: 1,
+            read_nodes: ReadNodes::default(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -3738,6 +4060,8 @@ pub(crate) mod tests {
             seed: true,
             caps: Caps::default(),
             keylist_skip: Vec::new(),
+            batch_keys: 1,
+            read_nodes: ReadNodes::default(),
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(run_with(
@@ -3811,6 +4135,520 @@ pub(crate) mod tests {
         }
         assert_eq!(count_retries(&mut m, &batch, &[(k, mk)]), vec![(k, mk)]);
         assert!(m.is_empty());
+    }
+
+    /// Batched and multi-node `details` reads (`reconcile_batch_with`, `read_pool`).
+    mod pooled {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+
+        /// A mock node. `/local` answers by account: `ghost…` has no row (Pact's absent
+        /// failure; in a batch the whole call fails), `fails` is a Pact failure, `bad` is an
+        /// answer with no balance, `gc` has the guard key in `gc_key`, any other account
+        /// `balance` with key `k1`. Module `free.nod` has no `details` (every call fails),
+        /// `free.tok` is the one module listing fungible-v2. `down`: HTTP 503 for everything.
+        /// Every success reads height 10 on block `prev`.
+        pub(crate) struct Mock {
+            pub prev: Mutex<String>,
+            pub balance: &'static str,
+            pub gc_key: Mutex<&'static str>,
+            pub down: std::sync::atomic::AtomicBool,
+            pub batch_calls: AtomicUsize,
+            pub single_calls: AtomicUsize,
+        }
+
+        impl Mock {
+            fn new(prev: Hash32, balance: &'static str) -> Arc<Mock> {
+                Arc::new(Mock {
+                    prev: Mutex::new(prev.to_b64url()),
+                    balance,
+                    gc_key: Mutex::new("k1"),
+                    down: Default::default(),
+                    batch_calls: AtomicUsize::new(0),
+                    single_calls: AtomicUsize::new(0),
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.batch_calls.load(Ordering::SeqCst) + self.single_calls.load(Ordering::SeqCst)
+            }
+
+            fn entry(&self, module: &str, acct: &str) -> Result<Value, &'static str> {
+                if module == "free.nod" {
+                    return Err("Cannot resolve free.nod.details");
+                }
+                if acct.starts_with("ghost") {
+                    return Err("No value found in table coin_coin-table for key: ghost");
+                }
+                if acct == "fails" {
+                    return Err("boom");
+                }
+                if acct == "bad" {
+                    return Ok(json!({"account": acct, "guard": null}));
+                }
+                let key = if acct == "gc" {
+                    *self.gc_key.lock().unwrap()
+                } else {
+                    "k1"
+                };
+                let bal = if module == "coin" {
+                    self.balance
+                } else {
+                    "7.25"
+                };
+                Ok(
+                    json!({"account": acct, "balance": bal.parse::<f64>().unwrap(),
+                          "guard": {"keys": [key], "pred": "keys-all"}}),
+                )
+            }
+
+            fn answer(&self, cmd: &Value) -> (u16, Value) {
+                if self.down.load(Ordering::SeqCst) {
+                    return (503, json!({}));
+                }
+                let meta = json!({"blockHeight": 11, "prevBlockHash": *self.prev.lock().unwrap()});
+                let ok = |data: Value| {
+                    (
+                        200,
+                        json!({"result": {"status": "success", "data": data}, "metaData": meta}),
+                    )
+                };
+                let fail = |m: &str| {
+                    (
+                        200,
+                        json!({"result": {"status": "failure", "error": {"message": m}}}),
+                    )
+                };
+                let data = cmd
+                    .pointer("/payload/exec/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let code = cmd
+                    .pointer("/payload/exec/code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(m) = data.get("m").and_then(Value::as_str) {
+                    return ok(json!(m == "free.tok"));
+                }
+                if let Some(list) = data.get("as").and_then(Value::as_array) {
+                    self.batch_calls.fetch_add(1, Ordering::SeqCst);
+                    let module = code
+                        .strip_prefix("(map (")
+                        .and_then(|c| c.split(".details").next())
+                        .unwrap_or("");
+                    let mut out = Vec::new();
+                    for a in list {
+                        match self.entry(module, a.as_str().unwrap_or("")) {
+                            Ok(v) => out.push(v),
+                            Err(m) => return fail(m),
+                        }
+                    }
+                    return ok(Value::Array(out));
+                }
+                self.single_calls.fetch_add(1, Ordering::SeqCst);
+                let module = code
+                    .strip_prefix('(')
+                    .and_then(|c| c.split(".details").next())
+                    .unwrap_or("");
+                match self.entry(module, data.get("a").and_then(Value::as_str).unwrap_or("")) {
+                    Ok(v) => ok(v),
+                    Err(m) => fail(m),
+                }
+            }
+        }
+
+        /// Serve `mock` on a local port; its base URL.
+        fn serve(mock: Arc<Mock>) -> String {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(mut s) = s else { return };
+                    let mock = mock.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        let (head_end, len) = loop {
+                            let n = s.read(&mut tmp).unwrap_or(0);
+                            if n == 0 {
+                                break (0, 0);
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                                let len = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                break (i + 4, len);
+                            }
+                        };
+                        while head_end > 0 && buf.len() < head_end + len {
+                            let n = s.read(&mut tmp).unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                        }
+                        let req: Value =
+                            serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                        let cmd: Value = req
+                            .get("cmd")
+                            .and_then(Value::as_str)
+                            .and_then(|c| serde_json::from_str(c).ok())
+                            .unwrap_or(Value::Null);
+                        let (status, body) = mock.answer(&cmd);
+                        let body = body.to_string();
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        fn local_at(url: &str) -> Arc<LocalClient> {
+            let node = NodeClient::new(&NodeClientConfig {
+                base: url.parse().unwrap(),
+                network: "mainnet01".into(),
+                timeout: Duration::from_secs(5),
+                max_rps: 0,
+                concurrency: 8,
+                p2p_url: None,
+                p2p_cert_sha256: None,
+                max_body_bytes: 1 << 20,
+                max_sse_event_bytes: 1 << 20,
+            })
+            .unwrap();
+            Arc::new(LocalClient::new(
+                node,
+                LocalOpts {
+                    rps: 0,
+                    concurrency: 8,
+                },
+            ))
+        }
+
+        /// A URL nothing listens on (connection refused).
+        fn dead_url() -> String {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            format!("http://{a}")
+        }
+
+        fn pool_of(nodes: &[(&Arc<LocalClient>, bool)], batch_keys: usize) -> ReadPool {
+            ReadPool::new(
+                nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (c, p))| ReadNode::new(format!("test{i}"), (*c).clone(), *p))
+                    .collect(),
+                batch_keys,
+            )
+        }
+
+        /// A store with `coin` rows of `coin_accts`, `free.tok` and `free.nod` rows of
+        /// `tok_accts`, all dirty on chain 0 at height 10 (our header there is `tip_hash`).
+        fn store(
+            dir: &std::path::Path,
+            coin_accts: &[&str],
+            tok_accts: &[&str],
+        ) -> (Ctx, Arc<HotStore>) {
+            let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
+            let mut txn = hot.rw().unwrap();
+            let mut dict = HotDict::load(&txn).unwrap();
+            let coin = dict.intern(DictKind::Module, "coin");
+            let tok = dict.intern(DictKind::Module, "free.tok");
+            let nod = dict.intern(DictKind::Module, "free.nod");
+            let mut marks = Vec::new();
+            for a in coin_accts {
+                marks.push((dict.intern(DictKind::Account, a), coin));
+            }
+            for a in tok_accts {
+                let id = dict.intern(DictKind::Account, a);
+                marks.push((id, tok));
+                marks.push((id, nod));
+            }
+            dict.persist(&mut txn).unwrap();
+            for (a, m) in marks {
+                balances::mark_dirty(&mut txn, a, m, 0, 10).unwrap();
+            }
+            txn.commit().unwrap();
+            put_header(&hot, 0, 10, tip_hash());
+            let (ctx, _) = client_on(dir, &hot, Arc::new(Mutex::new(tip_hash().to_b64url())));
+            (ctx, hot)
+        }
+
+        fn mark_again(hot: &HotStore, account: &str, module: &str) {
+            let mut txn = hot.rw().unwrap();
+            let mut d = HotDict::load(&txn).unwrap();
+            // Known names: interning finds their ids.
+            let (a, m) = (
+                d.intern(DictKind::Account, account),
+                d.intern(DictKind::Module, module),
+            );
+            balances::mark_dirty(&mut txn, a, m, 0, 10).unwrap();
+            txn.commit().unwrap();
+        }
+
+        /// Every row (with `reconciled_at` zeroed), the dirty keys and the key index.
+        type Dump = (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+        fn dump(hot: &HotStore) -> Dump {
+            let txn = hot.ro().unwrap();
+            let all = |t| txn.scan_chunk(t, None, 100_000, |_| true).unwrap();
+            let rows = all(Table::Balances)
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut r = BalanceRow::decode(&v).unwrap();
+                    r.reconciled_at = 0;
+                    (k, r.encode())
+                })
+                .collect();
+            let keys = |t| all(t).into_iter().map(|(k, _)| k).collect();
+            (rows, keys(Table::BalanceDirty), keys(Table::KeyAccounts))
+        }
+
+        async fn drain(
+            ctx: &Ctx,
+            hot: &HotStore,
+            local: &LocalClient,
+            pool: Option<&ReadPool>,
+        ) -> BatchStats {
+            let keys = refill(hot, 4096, 64).unwrap();
+            reconcile_batch_with(ctx, local, pool, &keys, &Caps::default())
+                .await
+                .unwrap()
+        }
+
+        const COIN: &[&str] = &[
+            "alice", "bob", "carol", "ghost1", "gc", "fails", "bad", "dave", "ghost2",
+        ];
+        const TOK: &[&str] = &["alice", "bob", "erin"];
+
+        /// Batched reads write exactly the rows, marks and key index single reads write, for
+        /// present, absent, guard-changed, non-coin, failing and unusable keys, in fewer calls.
+        #[tokio::test]
+        async fn batched_reads_match_single_reads() {
+            let mut out = Vec::new();
+            for batch_keys in [None, Some(50)] {
+                let dir = tempfile::tempdir().unwrap();
+                let (ctx, hot) = store(dir.path(), COIN, TOK);
+                let mock = Mock::new(tip_hash(), "1.5");
+                let local = local_at(&serve(mock.clone()));
+                let pool = batch_keys.map(|b| pool_of(&[(&local, true)], b));
+                let st1 = drain(&ctx, &hot, &local, pool.as_ref()).await;
+                // The guard of `gc` changes; its row is read again.
+                *mock.gc_key.lock().unwrap() = "k2";
+                mark_again(&hot, "gc", "coin");
+                let st2 = drain(&ctx, &hot, &local, pool.as_ref()).await;
+                let counts = |s: &BatchStats| {
+                    (
+                        s.ok,
+                        s.absent,
+                        s.failures,
+                        s.invalid,
+                        s.node_errors,
+                        s.other_branch,
+                    )
+                };
+                out.push((
+                    dump(&hot),
+                    counts(&st1),
+                    counts(&st2),
+                    mock.calls(),
+                    mock.batch_calls.load(Ordering::SeqCst),
+                ));
+            }
+            let (single, batched) = (&out[0], &out[1]);
+            assert_eq!(single.0, batched.0, "same rows, marks and key index");
+            assert_eq!(
+                (single.1, single.2),
+                (batched.1, batched.2),
+                "same outcomes"
+            );
+            // 6 present coin rows + 2 ghosts absent, `fails` failed, `bad` invalid; free.tok 3
+            // present; free.nod 3 failures.
+            assert_eq!(single.1, (8, 2, 4, 1, 0, 0), "{:?}", single.1);
+            let rows = &single.0 .0;
+            assert!(rows
+                .iter()
+                .any(|(_, v)| BalanceRow::decode(v).is_some_and(|r| r.balance == "7.25")));
+            assert_eq!(single.4, 0, "the single path never batches");
+            // This mix is the worst case (a failing key in every group reads it one by one);
+            // the savings are in `reads_spread_over_nodes_and_fail_over` (40 keys, 10 calls).
+            assert!(batched.4 > 0, "the batched path batches");
+        }
+
+        /// A failing key fails the whole batched call: its keys are read one by one, and only
+        /// the failing key's mark is dropped. An absent key splits the call instead.
+        #[tokio::test]
+        async fn a_failed_batch_falls_back_to_single_reads() {
+            let names: Vec<String> = (0..10).map(|i| format!("acct{i}")).collect();
+            let mut accts: Vec<&str> = names.iter().map(String::as_str).collect();
+            accts.push("fails");
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &accts, &[]);
+            let mock = Mock::new(tip_hash(), "1.5");
+            let local = local_at(&serve(mock.clone()));
+            let pool = pool_of(&[(&local, true)], 50);
+            let st = drain(&ctx, &hot, &local, Some(&pool)).await;
+            assert_eq!((st.ok, st.failures), (10, 1), "{st:?}");
+            assert_eq!(mock.batch_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.single_calls.load(Ordering::SeqCst),
+                11,
+                "the batch read one by one"
+            );
+            assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 0);
+
+            // 32 keys with one absent: split, not 32 single reads.
+            let names: Vec<String> = (0..31).map(|i| format!("acct{i}")).collect();
+            let mut accts: Vec<&str> = names.iter().map(String::as_str).collect();
+            accts.push("ghost9");
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &accts, &[]);
+            let mock = Mock::new(tip_hash(), "1.5");
+            let local = local_at(&serve(mock.clone()));
+            let pool = pool_of(&[(&local, true)], 50);
+            let st = drain(&ctx, &hot, &local, Some(&pool)).await;
+            assert_eq!((st.ok, st.absent, st.failures), (31, 1, 0), "{st:?}");
+            assert!(
+                mock.calls() <= 12,
+                "split down to the absent key: {} calls",
+                mock.calls()
+            );
+            assert_eq!(
+                mock.single_calls.load(Ordering::SeqCst),
+                2,
+                "only the last pair alone"
+            );
+        }
+
+        /// Calls spread over every read node; a node that fails is skipped and its reads go to
+        /// another node, with no node error left for the batch.
+        #[tokio::test]
+        async fn reads_spread_over_nodes_and_fail_over() {
+            let names: Vec<String> = (0..40).map(|i| format!("acct{i}")).collect();
+            let accts: Vec<&str> = names.iter().map(String::as_str).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &accts, &[]);
+            let (ma, mb) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            let (a, b) = (local_at(&serve(ma.clone())), local_at(&serve(mb.clone())));
+            let pool = pool_of(&[(&a, true), (&b, false)], 4);
+            let st = drain(&ctx, &hot, &a, Some(&pool)).await;
+            assert_eq!(st.ok, 40, "{st:?}");
+            let (ca, cb) = (
+                ma.batch_calls.load(Ordering::SeqCst),
+                mb.batch_calls.load(Ordering::SeqCst),
+            );
+            assert_eq!(ca + cb, 10);
+            assert!(ca >= 3 && cb >= 3, "spread: {ca} / {cb}");
+
+            // The first node is down: everything is read on the second.
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &accts, &[]);
+            let mb = Mock::new(tip_hash(), "1.5");
+            let b = local_at(&serve(mb.clone()));
+            let dead = local_at(&dead_url());
+            let pool = pool_of(&[(&dead, false), (&b, false)], 4);
+            let st = drain(&ctx, &hot, &b, Some(&pool)).await;
+            assert_eq!((st.ok, st.node_errors), (40, 0), "{st:?}");
+            assert_eq!(mb.batch_calls.load(Ordering::SeqCst), 10);
+            assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 0);
+
+            // A down node among others: the key reconciles, the stats show no node error.
+            mb.down.store(true, Ordering::SeqCst);
+            mark_again(&hot, "acct1", "coin");
+            let mc = Mock::new(tip_hash(), "1.5");
+            let c = local_at(&serve(mc.clone()));
+            let pool = pool_of(&[(&b, false), (&c, true)], 4);
+            let st = drain(&ctx, &hot, &c, Some(&pool)).await;
+            assert_eq!((st.ok, st.node_errors), (1, 0), "{st:?}");
+            assert_eq!(mc.calls(), 1);
+
+            // Every node down: node errors, the key stays dirty.
+            mc.down.store(true, Ordering::SeqCst);
+            mark_again(&hot, "acct2", "coin");
+            let st = drain(&ctx, &hot, &c, Some(&pool)).await;
+            assert_eq!((st.ok, st.node_errors), (0, 1), "{st:?}");
+            assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 1);
+        }
+
+        /// An answer from a node on another branch is not stored over our row: the row is only
+        /// flagged unverified and the key stays dirty; a later answer on our branch clears it.
+        /// An `Absent` answer from a non-primary node is asked again of the primary.
+        #[tokio::test]
+        async fn an_off_branch_node_answer_is_retried_not_stored() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &["alice"], &[]);
+            let good = Mock::new(tip_hash(), "1.5");
+            let fork = Mock::new(Hash32([0x22; 32]), "99.0");
+            let (g, f) = (
+                local_at(&serve(good.clone())),
+                local_at(&serve(fork.clone())),
+            );
+            let st = drain(&ctx, &hot, &g, Some(&pool_of(&[(&g, true)], 25))).await;
+            assert_eq!(st.ok, 1);
+            let key = {
+                let txn = hot.ro().unwrap();
+                txn.scan_chunk(Table::Balances, None, 10, |_| true).unwrap()[0]
+                    .0
+                    .clone()
+            };
+            let row = |hot: &HotStore| {
+                BalanceRow::decode(
+                    &hot.ro()
+                        .unwrap()
+                        .get(Table::Balances, &key)
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                (row(&hot).balance.as_str(), row(&hot).unverified),
+                ("1.5", false)
+            );
+
+            mark_again(&hot, "alice", "coin");
+            let st = drain(&ctx, &hot, &g, Some(&pool_of(&[(&f, false)], 25))).await;
+            assert_eq!((st.ok, st.other_branch), (1, 1), "{st:?}");
+            assert_eq!(row(&hot).balance, "1.5", "the fork's value is not stored");
+            assert!(row(&hot).unverified);
+            assert_eq!(
+                hot.ro().unwrap().count(Table::BalanceDirty).unwrap(),
+                1,
+                "retried"
+            );
+
+            let st = drain(&ctx, &hot, &g, Some(&pool_of(&[(&g, true)], 25))).await;
+            assert_eq!((st.ok, st.other_branch), (1, 0), "{st:?}");
+            assert!(!row(&hot).unverified);
+            assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 0);
+
+            // Absent on a secondary node: the primary is asked too.
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &["ghost1"], &[]);
+            let (p, s) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(s.clone())));
+            let st = drain(&ctx, &hot, &pc, Some(&pool_of(&[(&sc, false)], 25))).await;
+            assert_eq!(st.absent, 1, "{st:?}");
+            assert_eq!(
+                (
+                    s.single_calls.load(Ordering::SeqCst),
+                    p.single_calls.load(Ordering::SeqCst)
+                ),
+                (1, 1)
+            );
+        }
     }
 }
 
@@ -3963,6 +4801,8 @@ mod miner_rows {
             seed: true,
             caps: Caps::default(),
             keylist_skip: Vec::new(),
+            batch_keys: 1,
+            read_nodes: ReadNodes::default(),
         };
         let d3_done = || {
             hot.ro()

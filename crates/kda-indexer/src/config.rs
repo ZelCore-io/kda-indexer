@@ -927,6 +927,14 @@ pub struct BalancesConfig {
     pub local_rps: u32,
     /// `/local` calls in flight.
     pub local_concurrency: u32,
+    /// Accounts read per batched `details` call, `(map ({m}.details) (read-msg "as"))`, per
+    /// chain and module (1..=100; 1: one call a key, the old reconciler).
+    pub local_batch_keys: u32,
+    /// Chainweb nodes the reconciler spreads its `details` reads over, each with its own
+    /// `local_rps` and `local_concurrency` caps. Empty (the default): `node.url` alone. List
+    /// `node.url` too to keep reading from it; other passes (fungible checks, keysets, NFT
+    /// rows, key listing) and absent answers always use `node.url`.
+    pub local_urls: Vec<url::Url>,
     /// Dirty keys of one non-coin module that take a batch slot before the others get theirs
     /// (I-7): the fair share. Room left in a seed batch is topped up beyond it.
     pub module_share: u32,
@@ -959,6 +967,8 @@ impl Default for BalancesConfig {
             enabled: true,
             local_rps: 50,
             local_concurrency: 8,
+            local_batch_keys: DEFAULT_LOCAL_BATCH_KEYS,
+            local_urls: Vec::new(),
             module_share: 32,
             module_rows: 1_000_000,
             fungible_module_rows: kdx_ingest::reconcile::DEFAULT_FUNGIBLE_MODULE_ROWS,
@@ -971,8 +981,16 @@ impl Default for BalancesConfig {
     }
 }
 
-/// Most `/local` calls per second (B-1, H-1).
+/// Most `/local` calls per second (B-1, H-1), per node.
 pub const MAX_LOCAL_RPS: u32 = 50;
+
+/// Default `balances.local_batch_keys`. 25 `coin.details` reads stay far under the call's
+/// `GAS_LIMIT` (150,000) and a 1 MiB answer; `docs/operations.md` has the checks to run
+/// before raising it.
+pub const DEFAULT_LOCAL_BATCH_KEYS: u32 = 25;
+
+/// Most `balances.local_urls`.
+pub const MAX_LOCAL_URLS: usize = 8;
 
 impl BalancesConfig {
     /// Value ranges (M-6): `local_rps` 0 would turn both `/local` rate limiters off.
@@ -987,6 +1005,26 @@ impl BalancesConfig {
             "balances.local_concurrency must be in 1..=64 (got {})",
             self.local_concurrency
         );
+        anyhow::ensure!(
+            (1..=kdx_node::local::MAX_BATCH_KEYS as u32).contains(&self.local_batch_keys),
+            "balances.local_batch_keys must be in 1..={} (got {})",
+            kdx_node::local::MAX_BATCH_KEYS,
+            self.local_batch_keys
+        );
+        anyhow::ensure!(
+            self.local_urls.len() <= MAX_LOCAL_URLS,
+            "balances.local_urls holds at most {MAX_LOCAL_URLS} nodes"
+        );
+        for (i, u) in self.local_urls.iter().enumerate() {
+            anyhow::ensure!(
+                matches!(u.scheme(), "http" | "https") && u.host().is_some(),
+                "balances.local_urls[{i}] must be an http(s) URL with a host"
+            );
+            anyhow::ensure!(
+                !self.local_urls[..i].contains(u),
+                "balances.local_urls[{i}] is listed twice"
+            );
+        }
         anyhow::ensure!(
             self.module_share >= 1
                 && self.module_rows >= 1
@@ -1322,7 +1360,39 @@ mod balances_tests {
             ..ok.clone()
         };
         assert!(wide.validate().is_ok());
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let nodes = BalancesConfig {
+            local_urls: vec![u("http://node-a.example:1848"), u("https://node-b.example")],
+            local_batch_keys: 50,
+            ..ok.clone()
+        };
+        assert!(nodes.validate().is_ok());
         for bad in [
+            BalancesConfig {
+                local_batch_keys: 0,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_batch_keys: kdx_node::local::MAX_BATCH_KEYS as u32 + 1,
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_urls: vec![
+                    u("http://node-a.example:1848"),
+                    u("http://node-a.example:1848"),
+                ],
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_urls: vec![u("ftp://node-a.example")],
+                ..ok.clone()
+            },
+            BalancesConfig {
+                local_urls: (0..=MAX_LOCAL_URLS)
+                    .map(|i| u(&format!("http://node-{i}.example")))
+                    .collect(),
+                ..ok.clone()
+            },
             BalancesConfig {
                 local_rps: 0,
                 ..ok.clone()
