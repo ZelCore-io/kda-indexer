@@ -154,7 +154,7 @@ impl Block {
             .map_err(from_api)?
             .ok_or_else(|| {
                 err(
-                    Code::NotAvailable,
+                    Code::NotSupported,
                     "this block's minerData names no account",
                 )
             })?;

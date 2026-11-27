@@ -101,6 +101,8 @@ fn mock(mode: Mode) -> (Arc<Mock>, DetailsFn) {
 struct Fx {
     _dir: tempfile::TempDir,
     schema: KdxSchema,
+    /// The same store with no miss reader (node reads off).
+    bare: KdxSchema,
     reader: Arc<MissReader>,
     mock: Arc<Mock>,
     fed: Arc<Mutex<Vec<FoundRow>>>,
@@ -109,6 +111,11 @@ struct Fx {
 /// A store with ALICE's coin row on chain 0 (5.0) and `free.tok` known; the reader over the
 /// mock node.
 fn fixture(mode: Mode, s: MissSettings) -> Fx {
+    fixture_with(mode, s, &[])
+}
+
+/// [`fixture`] with more miner blocks `(chain, height, miner)` (heights above 1).
+fn fixture_with(mode: Mode, s: MissSettings, extra: &[(u8, u64, &str)]) -> Fx {
     let d = tempfile::tempdir().unwrap();
     let g = kdx_hot::Geometry {
         max_gb: 1,
@@ -131,9 +138,17 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
     };
     t.put(Table::Balances, &bal_key(alice, coin, 0), &row.encode())
         .unwrap();
-    for (c, miner) in MINERS {
-        let ib = index_block(&miner_block(c, miner), &VerifyReport::default(), &mut dict)
-            .expect("block indexes");
+    let blocks = MINERS
+        .iter()
+        .map(|&(c, m)| (c, 1, m))
+        .chain(extra.iter().copied());
+    for (c, h, miner) in blocks {
+        let ib = index_block(
+            &miner_block(c, h, miner),
+            &VerifyReport::default(),
+            &mut dict,
+        )
+        .expect("block indexes");
         kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
     }
     t.commit().unwrap();
@@ -158,6 +173,14 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
     let f2 = fed.clone();
     let sink: FoundSink = Arc::new(move |r| f2.lock().unwrap().push(r));
     let reader = Arc::new(MissReader::new(details, Some(sink), s));
+    let bare = build_schema_with_miss(
+        Some(st.clone()),
+        GraphqlSettings::default(),
+        None,
+        None,
+        None,
+        None,
+    );
     let schema = build_schema_with_miss(
         Some(st),
         GraphqlSettings::default(),
@@ -169,6 +192,7 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
     Fx {
         _dir: d,
         schema,
+        bare,
         reader,
         mock,
         fed,
@@ -181,32 +205,47 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
 const MINERS: [(u8, &str); 4] = [(12, CARD), (0, ALICE), (3, "k:nobody"), (4, "ab")];
 
 fn miner_hash(c: u8) -> String {
-    b64url_encode(&[0xB0 ^ c; 32])
+    b64url_encode(&at(0xB0, c, 1))
 }
 
-fn miner_block(c: u8, miner: &str) -> kdx_decode::DecodedBlock {
+/// 32 bytes of `seed ^ c`; above height 1 the last two bytes name the height.
+fn at(seed: u8, c: u8, h: u64) -> [u8; 32] {
+    let mut b = [seed ^ c; 32];
+    if h > 1 {
+        b[30] = 0xEE;
+        b[31] = u8::try_from(h).unwrap();
+    }
+    b
+}
+
+fn miner_block(c: u8, h: u64, miner: &str) -> kdx_decode::DecodedBlock {
     let cb = serde_json::to_vec(
         &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
-        "reqKey": b64url_encode(&[0xCB ^ c; 32]), "logs": null, "events": [],
+        "reqKey": b64url_encode(&at(0xCB, c, h)), "logs": null, "events": [],
         "metaData": null, "continuation": null, "txId": null}),
     )
     .unwrap();
     let md = serde_json::to_vec(&json!({"account": miner, "predicate": "keys-all",
         "public-keys": []}))
     .unwrap();
-    let payload_hash = b64url_encode(&[0xA4 ^ c; 32]);
+    let payload_hash = b64url_encode(&at(0xA4, c, h));
+    let parent = if h > 1 {
+        at(0xB0, c, h - 1)
+    } else {
+        [0xB1 ^ c; 32]
+    };
     let header = json!({
         "nonce": "1", "creationTime": 1_700_000_000_000_000u64,
-        "parent": b64url_encode(&[0xB1 ^ c; 32]),
+        "parent": b64url_encode(&parent),
         "adjacents": {"5": b64url_encode(&[0xAD ^ c; 32])},
         "target": b64url_encode(&[0xff; 32]), "payloadHash": payload_hash, "chainId": c,
-        "weight": b64url_encode(&[1; 32]), "height": 1, "chainwebVersion": "mainnet01",
-        "epochStart": 1, "featureFlags": 0, "hash": miner_hash(c)
+        "weight": b64url_encode(&[1; 32]), "height": h, "chainwebVersion": "mainnet01",
+        "epochStart": 1, "featureFlags": 0, "hash": b64url_encode(&at(0xB0, c, h))
     });
     let payload = json!({
         "transactions": [], "minerData": b64url_encode(&md),
-        "transactionsHash": b64url_encode(&[0xA7 ^ c; 32]),
-        "outputsHash": b64url_encode(&[0xA8 ^ c; 32]),
+        "transactionsHash": b64url_encode(&at(0xA7, c, h)),
+        "outputsHash": b64url_encode(&at(0xA8, c, h)),
         "payloadHash": payload_hash, "coinbase": b64url_encode(&cb),
     });
     decode_block(&header, &payload).expect("block decodes")
@@ -784,4 +823,71 @@ async fn miner_account_reads_the_node_on_a_miss_and_answers_zero_as_stock() {
     let v = exec(&fx, &miner_q(12), [10, 0, 0, 1]).await;
     assert_eq!(v["data"]["block"]["minerAccount"], zero(12, CARD), "{v}");
     assert_eq!(v["extensions"]["nodeReadIncomplete"], json!(true), "{v}");
+}
+
+/// PR #65 I-1: a page of blocks by one miner on one chain asks the same key once per block.
+/// The request charges it once and every block joins the one read: one node call, the same
+/// row on every block, no flag, even past the per-IP burst and the request budget.
+#[tokio::test]
+async fn a_page_of_one_miners_blocks_makes_one_read_and_one_charge() {
+    let s = MissSettings {
+        per_ip_rps: 2,
+        per_ip_burst: 20,
+        node_rps: 0,
+        max_reads_per_request: 4,
+        ..MissSettings::default()
+    };
+    let extra: Vec<(u8, u64, &str)> = (2..=30).map(|h| (12, h, CARD)).collect();
+    let fx = fixture_with(Mode::Slow, s, &extra);
+    let q = "{ blocksFromHeight(startHeight: 1, chainIds: [\"12\"], first: 50) \
+             { edges { node { height minerAccount { accountName chainId balance \
+             guard { __typename raw } } } } } }";
+    let budget = MissBudget::default();
+    let r = fx
+        .schema
+        .execute(
+            Request::new(q)
+                .data(budget.clone())
+                .data(ClientIp(IpAddr::from([10, 0, 0, 9]))),
+        )
+        .await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let v = serde_json::to_value(&r).unwrap();
+    let edges = v["data"]["blocksFromHeight"]["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 30, "{v}");
+    let first = &edges[0]["node"]["minerAccount"];
+    assert_eq!(first["guard"]["__typename"], json!("KeysetGuard"), "{v}");
+    for e in edges {
+        assert_eq!(&e["node"]["minerAccount"], first, "{v}");
+    }
+    assert!(v.get("extensions").is_none(), "{v}");
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.used(), 1);
+    assert_eq!(fx.fed.lock().unwrap().len(), 1, "fed back once");
+}
+
+/// PR #65 m-4: with no miss reader a missing miner row still answers stock's zero, flagged.
+#[tokio::test]
+async fn a_missing_miner_row_with_reads_off_is_zero_and_flagged() {
+    let fx = fixture(Mode::Chain, settings());
+    let r = fx.bare.execute(Request::new(miner_q(12))).await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        v["data"]["block"]["minerAccount"],
+        json!({"accountName": CARD, "chainId": "12", "balance": 0.0,
+               "guard": {"__typename": "RawGuard", "raw": "null"}}),
+        "{v}"
+    );
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], json!(true), "{v}");
+    // A stored row needs no read: no flag.
+    let r = fx.bare.execute(Request::new(miner_q(0))).await;
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        v["data"]["block"]["minerAccount"]["balance"],
+        json!(5.0),
+        "{v}"
+    );
+    assert!(v.get("extensions").is_none(), "{v}");
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 0);
 }

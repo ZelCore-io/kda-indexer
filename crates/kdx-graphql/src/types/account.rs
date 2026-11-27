@@ -224,7 +224,13 @@ pub async fn miner_chain_account(
         .map_err(from_api)?;
     let mut rows = rows;
     if rows.is_empty() {
-        with_misses(ctx, &account, module, ok, &[chain], &mut rows).await;
+        if ok && gql(ctx).miss.is_some() {
+            with_misses(ctx, &account, module, ok, &[chain], &mut rows).await;
+        } else {
+            // No node read to make (reads off, or a module the store does not serve): the
+            // zero below is unverified, so say so (PR #65 m-4).
+            crate::flags::mark(ctx, crate::flags::Flag::NodeReadIncomplete);
+        }
     }
     let row = rows.into_iter().next().unwrap_or_else(|| ChainRow {
         chain,
