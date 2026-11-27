@@ -585,7 +585,7 @@ pub fn mark_keys(
     })();
     if r.is_err() {
         // Names interned here never reached MDBX: forget them (review M3).
-        *d = HotDict::load(&hot.ro()?)?;
+        crate::ctx::reload_dict(hot, &mut d)?;
     }
     r
 }
@@ -1023,6 +1023,9 @@ async fn run_task(
             r = step(&ctx, &local, &caps, &mut kl) => r,
         };
         if let Err(e) = r {
+            if crate::ctx::stop_on_reload_failure(&e, &stop) {
+                return;
+            }
             tracing::warn!(error = %e, "balances: key listing step failed; retried later");
             kl.next_at = Some(Instant::now() + STORE_PAUSE);
         }

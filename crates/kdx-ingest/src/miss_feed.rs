@@ -48,6 +48,7 @@ pub fn spawn(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Found>, stop: CancellationTok
             let c = ctx.clone();
             match tokio::task::spawn_blocking(move || mark(&c, &batch)).await {
                 Ok(Ok(n)) => tracing::debug!(marked = n, "balances: gap Q node-found rows marked"),
+                Ok(Err(e)) if crate::ctx::stop_on_reload_failure(&e, &stop) => break,
                 Ok(Err(e)) => {
                     tracing::warn!(error = format!("{e:#}"), "balances: gap Q marks failed")
                 }
@@ -92,4 +93,68 @@ pub fn mark(ctx: &Ctx, rows: &[Found]) -> Result<usize> {
         ctx.reload_dict(&mut d)?;
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use kdx_hot::{Geometry, HotDict, HotStore, Table};
+    use kdx_types::Hash32;
+
+    use super::*;
+
+    /// F-52 (M-5): the gap Q feed, a real background writer, stops itself and the process
+    /// after a failed dictionary reload, and the failure is recorded so the command fails.
+    #[tokio::test]
+    async fn the_feed_stops_the_process_after_a_failed_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotStore::open(dir.path(), Geometry::default()).unwrap());
+        std::fs::create_dir_all(dir.path().join("segments")).unwrap();
+        let mut txn = hot.rw().unwrap();
+        // The marks need a tail (`check_ready`).
+        kdx_hot::set_checkpoint(&mut txn, kdx_hot::Stage::Tail, 0, 1, Hash32([1; 32])).unwrap();
+        // A malformed `Tokens` row of module 0: the marks' write txn fails.
+        txn.put(Table::Tokens, &0u32.to_be_bytes(), b"bad").unwrap();
+        txn.commit().unwrap();
+        let (ctx, _) = crate::reconcile::tests::client_on(
+            dir.path(),
+            &hot,
+            Arc::new(Mutex::new(String::new())),
+        );
+        let mut d = HotDict::default();
+        d.intern(DictKind::Module, "coin");
+        *ctx.dict.lock().unwrap() = d;
+        // Account ids that are not dense: the reload after the failed txn fails too.
+        let mut txn = hot.rw().unwrap();
+        txn.put(
+            Table::DictRev(DictKind::Account),
+            &7u32.to_be_bytes(),
+            b"k:x",
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let ctx = Arc::new(ctx);
+        let stop = CancellationToken::new();
+        let (tx, rx) = channel();
+        spawn(ctx.clone(), rx, stop.clone());
+        let account = format!("k:{}", "ab".repeat(32));
+        tx.send((account, "coin".into(), 0, 1)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), stop.cancelled())
+            .await
+            .expect("a failed reload stops the process");
+        assert!(
+            crate::ctx::reload_failure().is_some(),
+            "the failure is recorded"
+        );
+        assert!(
+            ctx.dict.lock().unwrap().is_poisoned(),
+            "the drained dictionary can no longer be persisted"
+        );
+        // The feed task ended: its receiver is gone.
+        tokio::time::timeout(Duration::from_secs(5), tx.closed())
+            .await
+            .expect("the feed stopped");
+    }
 }

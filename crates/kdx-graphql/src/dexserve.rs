@@ -1705,3 +1705,29 @@ pub fn tokens(
         page_info: info,
     })
 }
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    fn items() -> Vec<(u128, u32)> {
+        (0..50u32).rev().map(|i| (u128::from(i), i)).collect()
+    }
+
+    /// Stock's `getPaginationParams`: `first: 0` / `last: 0` is the default page, with a
+    /// cursor or without (M-1: stock-exact; the served budget prices it at the default page).
+    #[test]
+    fn a_zero_page_is_the_default_page() {
+        let it = items();
+        let after = enc(999_999);
+        let before = enc(0);
+        let (p, _) = stock_page(&it, Some(&after), None, Some(0), None, 20).unwrap();
+        assert_eq!(p.len(), 20);
+        let (p, _) = stock_page(&it, None, Some(&before), None, Some(0), 20).unwrap();
+        assert_eq!(p.len(), 20);
+        let (p, _) = stock_page(&it, None, None, Some(0), None, 20).unwrap();
+        assert_eq!(p.len(), 20);
+        let (p, _) = stock_page(&it, Some(&after), None, None, None, 20).unwrap();
+        assert_eq!(p.len(), 20);
+    }
+}

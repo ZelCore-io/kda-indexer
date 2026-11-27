@@ -62,6 +62,8 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     kdx_ingest::disk::ensure_free(&data_dir, cfg.backfill.min_free_gb)?;
     let token = CancellationToken::new();
     signals(token.clone())?;
+    // A background writer whose dictionary reload failed (F-52) stops the process.
+    kdx_ingest::ctx::set_process_stop(token.clone());
     super::notify::spawn_watchdog(&[Component::Ingest, Component::Api]);
     super::notify::spawn_api_heartbeat(token.clone());
     heartbeat::beat(Component::Ingest);
@@ -562,7 +564,9 @@ async fn follow(
         reorg_depth_max = txn.counter(kdx_ingest::apply::counters::REORG_DEPTH_MAX)?,
         "run: stopped"
     );
-    res
+    // F-52: a writer that stopped the process after a failed dictionary reload cancelled the
+    // token like a signal; the run still fails, so systemd (`Restart=on-failure`) restarts it.
+    kdx_ingest::ctx::fail_on_reload_failure(res, kdx_ingest::ctx::reload_failure())
 }
 
 /// First wait after a one-off fill fails; it doubles per failure up to [`FILL_RETRY_MAX`].
@@ -736,6 +740,31 @@ mod tests {
         token.cancel();
         let r = backfill_with_api(pending::<anyhow::Result<()>>(), &token, api).await;
         assert!(r.unwrap().is_none());
+    }
+
+    /// F-52: a writer whose dictionary reload failed cancels the process token, which stops
+    /// the run as a signal does; the recorded failure still makes `run` end with an error, so
+    /// systemd restarts it.
+    #[tokio::test]
+    async fn a_reload_failure_stop_is_an_error() {
+        let token = CancellationToken::new();
+        let stop = token.clone();
+        let api = tokio::spawn(async move {
+            stop.cancelled().await;
+            Ok(())
+        });
+        // The writer: its reload failed, so it stops the process.
+        let e = anyhow::Error::new(kdx_ingest::ctx::DictReloadFailed::new(anyhow::anyhow!(
+            "no readers"
+        )));
+        assert!(kdx_ingest::ctx::stop_on_reload_failure(&e, &token));
+        let r = backfill_with_api(pending::<anyhow::Result<()>>(), &token, api).await;
+        assert!(r.unwrap().is_none(), "the stop itself is clean");
+        let failed = kdx_ingest::ctx::reload_failure();
+        assert!(failed.is_some(), "the failure is recorded");
+        let e = kdx_ingest::ctx::fail_on_reload_failure(Ok(()), failed)
+            .expect_err("a stop after a failed reload must fail the run");
+        assert!(format!("{e:#}").contains("no readers"), "{e:#}");
     }
 
     /// A backfill error is returned after the API task has been joined.

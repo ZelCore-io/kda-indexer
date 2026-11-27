@@ -893,6 +893,24 @@ async fn a_backfill_from_mid_chain_is_not_served_as_exact() {
     );
 }
 
+/// A partial store (its first range starts above height 0) misses the holders below that
+/// height, so `reconcile-holders` rebuilds the table but leaves it not ready, as
+/// `reconcile-counts` does for the chain counters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_holders_on_a_partial_store_does_not_mark_it_ready() {
+    let pool = pool();
+    let all: Vec<usize> = (0..POOL_LEN).collect();
+    let base = fake_node(&pool, &[(0, branch(&all, 0, 0, 0))]);
+    let db = tempfile::tempdir().unwrap();
+    let c = Arc::new(ctx_with_node(db.path(), 2, 1000, 2, &base));
+    kdx_ingest::backfill::run(c.clone(), 10, 19, kdx_ingest::HeaderMode::Cut)
+        .await
+        .unwrap();
+    let rep = kdx_ingest::holders_fill::reconcile(&c.segdir, &c.hot, 2, false, &|| false).unwrap();
+    assert!(!rep.ready, "{rep:?}");
+    assert!(!kdx_hot::holders::marker_set(&c.hot.ro().unwrap()).unwrap());
+}
+
 /// The `TokenChains` table is ready and equal to what `Holders` gives.
 fn token_chains_are_exact(c: &kdx_ingest::Ctx) {
     let ro = c.hot.ro().unwrap();
