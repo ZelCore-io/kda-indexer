@@ -278,6 +278,7 @@ fn balances_opts(
             recheck_secs: b.recheck_hours.saturating_mul(3600),
             history_slice_txs: kdx_ingest::seed_receivers::HISTORY_SLICE_TXS,
             history_walk_threads: b.history_walk_threads as usize,
+            refill_window_batches: b.refill_window_batches as usize,
         },
         keylist_skip: b.keylist_skip.clone(),
         batch_keys: b.local_batch_keys as usize,

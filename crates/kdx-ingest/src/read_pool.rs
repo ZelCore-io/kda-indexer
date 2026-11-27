@@ -118,6 +118,25 @@ impl ReadPool {
             })
     }
 
+    /// [`Self::pick`] for a batched `details` read: a node other than the primary that is up
+    /// and not in `tried`, round robin, preferring one with a free concurrency slot (a slow
+    /// node then gets fewer calls), else the first such node even with no free slot (the call
+    /// waits for one there). The primary's `local_rps` is the budget of the reads only it
+    /// decides (`try` markers, absent answers, fungible checks, keysets); a batch it took
+    /// would hold up about 25 of those. With no such node, [`Self::pick`].
+    pub fn pick_batch(&self, tried: &[usize]) -> Option<usize> {
+        let n = self.nodes.len();
+        let now = Instant::now();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut up = (0..n)
+            .map(|k| (start + k) % n)
+            .filter(|&i| !tried.contains(&i) && !self.nodes[i].primary && self.nodes[i].is_up(now));
+        up.clone()
+            .find(|&i| self.nodes[i].client.free_slots() > 0)
+            .or_else(|| up.next())
+            .or_else(|| self.pick(tried))
+    }
+
     /// Skip node `i` for [`COOLDOWN`].
     pub fn mark_down(&self, i: usize, why: &'static str) {
         let node = &self.nodes[i];
@@ -186,6 +205,27 @@ mod tests {
                 .collect(),
             25,
         )
+    }
+
+    /// Batched reads go to the nodes other than the primary while one is up; the primary
+    /// takes them when they are all down or tried, and a pool of the primary alone still reads.
+    #[test]
+    fn batched_reads_spare_the_primary() {
+        let p = pool(3);
+        let seen: Vec<usize> = (0..6).filter_map(|_| p.pick_batch(&[])).collect();
+        assert!(seen.iter().all(|&i| i != 0), "{seen:?}");
+        assert!(seen.contains(&1) && seen.contains(&2), "spread: {seen:?}");
+        assert_eq!(p.pick_batch(&[1]), Some(2));
+        assert_eq!(
+            p.pick_batch(&[1, 2]),
+            Some(0),
+            "failover reaches the primary"
+        );
+        assert_eq!(p.pick_batch(&[0, 1, 2]), None);
+        p.mark_down(1, "test");
+        p.mark_down(2, "test");
+        assert_eq!(p.pick_batch(&[]), Some(0), "the others down: the primary");
+        assert_eq!(pool(1).pick_batch(&[]), Some(0));
     }
 
     #[test]

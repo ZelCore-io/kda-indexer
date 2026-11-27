@@ -856,6 +856,30 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
   receivers pass wait behind, and tip marks (the tip share of the batch) wait for the whole
   round. Watch `kdx_balance_reconcile_seconds` and the tail's lag when raising
   `local_batch_keys`.
+- **Refill window** (`refill_window_batches`, 1..=32, default 8): picking a batch walks all of
+  `BalanceDirty` (seconds on a 10M-row backlog, whatever the batch size), so one walk takes
+  keys for this many batches at once. Each batch of the window keeps its own write
+  transaction, bookkeeping and backoff, and clears only the exact mark it read, so a key the
+  tail marks again meanwhile is read again later. The window is taken again once used up or
+  5 s old (counted from the end of its walk), and the tip share leads every window. The next
+  window's walk runs while the window's last batch reads, and leaves that batch's keys out.
+  So a tip mark made just after a walk passed its key waits at most about that walk, 5 s, the
+  next walk or the batch it overlaps (the longer of the two) and the batch that reads it: a
+  few seconds past 5 s on a large backlog. 1 walks the table before every batch (the
+  behaviour before windows). Batched `details` calls go to the `local_urls` nodes other than
+  `node.url` while one is up (one with a free slot first): `node.url`'s `local_rps` is the
+  budget of the reads only it decides, and one absent key costs one call there, so with about
+  12% absent keys the drain tops out near `local_rps` / 0.12 keys a second (about 400). Two
+  exceptions keep a node a few blocks behind (within the 10-block lag limit, so still up) from
+  holding fresh marks back: the tip share's batched calls are spread over every node,
+  `node.url` included, and a key a batched answer read below its mark is read once more
+  alone on another node (`node.url` included). The INFO line
+  `balances: reconcile` shows `refill_secs` (the last walk) and `window_left`, and its `st`
+  carries `phases`, the last batch's seconds per phase; `kdx_balance_batch_phase_seconds{phase}`
+  has them all: `refill`, `prep`, `fungible`, `reads_batched` (until the last chunk's batched
+  answer), `reads_rereads` (keys read alone after it: `try` markers and absent answers asked
+  of `node.url`, at most `local_rps` a second), `txn_wait`, `branch`, `write`, `clear`,
+  `commit` and `after`.
 - **Read nodes** (`local_urls`, at most 8): the `details` reads are spread round robin over
   these chainweb service APIs, each with its own `local_rps` (≤ 50) and `local_concurrency`
   caps, so N nodes give N times the budget, and up to N × `local_concurrency` `/local` calls
@@ -893,6 +917,7 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
 local_rps = 50
 local_concurrency = 8
 local_batch_keys = 25
+refill_window_batches = 8
 # node.url first; the others are extra chainweb nodes reachable from this host.
 local_urls = [
   "http://127.0.0.1:1848",
