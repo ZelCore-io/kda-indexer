@@ -26,6 +26,6 @@ pub mod undo;
 
 pub use checkpoint::{checkpoint, set_checkpoint, Stage};
 pub use dict::HotDict;
-pub use env::{Geometry, HotStore, RevScan, RoTxn, RwTxn, Txn, FORMAT_VERSION};
+pub use env::{Geometry, HotStore, RevScan, RoTxn, RwTxn, Txn, Walk, FORMAT_VERSION};
 pub use tables::{Table, Tables};
 pub use undo::UndoOp;

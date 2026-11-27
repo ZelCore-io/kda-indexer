@@ -3648,6 +3648,77 @@ mod stored_count {
         assert_eq!(total_spent(&fx.schema, l0).await, Some(user0 + 13));
     }
 
+    /// `totalCount` of `l` and the error codes of the request (generous deadline).
+    async fn total_or_codes(s: &KdxSchema, l: &str) -> (Option<i64>, Vec<String>) {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: Instant::now() + Duration::from_secs(60),
+        });
+        let r = s.execute(req).await;
+        let codes = r
+            .errors
+            .iter()
+            .filter_map(|e| e.extensions.as_ref()?.get("code").map(|c| c.to_string()))
+            .collect();
+        let d = serde_json::to_value(&r.data).unwrap();
+        let n = d
+            .get(field(l))
+            .and_then(|c| c.get("totalCount"))
+            .and_then(Value::as_i64);
+        (n, codes)
+    }
+
+    /// I-1: on a store taller than the height walk's window ([`MAX_HEIGHTS`] heights), an
+    /// all-history count the counters cannot answer is `COUNT_TIMEOUT`, never the window's
+    /// partial number; once they are ready it counts the heights below the window too, while
+    /// `minHeight: 0` keeps the windowed walk.
+    #[tokio::test]
+    async fn all_history_counts_on_a_store_taller_than_the_walk() {
+        let extra = kdx_graphql::txlist::MAX_HEIGHTS;
+        let base = {
+            let fx = fixture();
+            reconcile(&fx);
+            total_spent(&fx.schema, "transactions(ARGS)").await.unwrap()
+        };
+        let fx = fixture_big(GraphqlSettings::default(), extra);
+        let lists = [
+            "transactions(ARGS)",
+            "transactions(chainId: \"0\", ARGS)",
+            "transactions(isCoinbase: true, ARGS)",
+            "transfers(ARGS)",
+            "transfers(chainId: \"0\", ARGS)",
+        ];
+        assert!(!ready(&fx));
+        for l in lists {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert_eq!(n, None, "{l}: no partial count");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("COUNT_TIMEOUT")),
+                "{l}: {codes:?}"
+            );
+        }
+        reconcile(&fx);
+        let all = total_spent(&fx.schema, "transactions(ARGS)").await.unwrap();
+        assert_eq!(
+            all,
+            base + i64::from(extra),
+            "every height, below the window too"
+        );
+        // The window alone: the extra blocks' txs (heights 13 and up), not the fixture's.
+        let windowed = total(&fx.schema, "transactions(minHeight: 0, ARGS)").await;
+        assert_eq!(windowed, i64::from(extra));
+        assert!(all > windowed);
+        for l in lists {
+            assert!(total_spent(&fx.schema, l).await.is_some(), "{l}");
+        }
+        // Counters cleared again: the error comes back, not the window's number.
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::chaincount::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+        let (n, codes) = total_or_codes(&fx.schema, "transactions(ARGS)").await;
+        assert!(n.is_none() && codes.iter().any(|c| c.contains("COUNT_TIMEOUT")));
+    }
+
     /// Unwind chain `chain` to `to` and apply `fork` (another block hash) in one txn.
     fn reorg(fx: &Fx, chain: u8, to: u32, fork: &[(u32, &[Shape])]) {
         let mut t = fx.store.hot.rw().unwrap();

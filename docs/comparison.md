@@ -281,11 +281,12 @@ The G4 replay of real traffic (below) met most of these classes again; its
   count all history from stored counters, as stock does, although the list itself pages
   only the newest 20,000 heights. `transactions` equals stock's `Counters` sum (user txs,
   plus one coinbase per block with `isCoinbase: true`). For `transfers` stock answers the
-  last value of its `Transfers` id sequence (NFT rows and rows deleted by reorgs included:
-  441,794,129 on 11-27), ours the sum of the per-token `transfers(fungibleName)` counts, so
-  the two numbers differ by those rows. Before this (G4 11-27) ours cut the unfiltered
-  `transfers` count with `COUNT_TIMEOUT` at 4.9 s and counted `transactions` over the last
-  20,000 heights only (50,948).
+  last value of its `Transfers` id sequence (NFT rows and rows deleted by reorgs included),
+  ours the sum of the per-token `transfers(fungibleName)` counts, so the two numbers differ
+  by those rows. Before this (G4 11-27) ours cut the unfiltered `transfers` count with
+  `COUNT_TIMEOUT` at 4.9 s and counted `transactions` over the last 20,000 heights only
+  (50,948). While our counters are not ready, both counts are `COUNT_TIMEOUT` on mainnet,
+  never the 20,000-height number.
 - An account's transfer lists (`transfers(accountName)`, `FungibleAccount.transfers`,
   `FungibleChainAccount.transfers`) list a transfer to oneself once and count it once.
   Stock's `UNION ALL` of the sender and receiver halves lists it twice, under one cursor,

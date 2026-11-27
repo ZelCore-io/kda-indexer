@@ -39,7 +39,7 @@ use kdx_types::record::TxRecord;
 use kdx_types::Dict;
 
 use crate::checkpoint::Stage;
-use crate::env::{RwTxn, Txn};
+use crate::env::{RwTxn, Txn, Walk};
 use crate::tables::Table;
 
 /// Meta key of the readiness marker.
@@ -258,18 +258,66 @@ pub fn sum(txn: &impl Txn, kind: CountKind, entity: u64, chain: Option<u8>) -> R
     }))
 }
 
+/// Rows [`sum_kind`] reads between two calls of its `stop` check.
+const SUM_CHECK_EVERY: u64 = 1_024;
+
 /// `(user, coinbase)` rows stored for every entity of `kind`, on `chain` or summed over all
-/// chains: one scan of the kind's key range (one row per entity and chain).
-pub fn sum_kind(txn: &impl Txn, kind: CountKind, chain: Option<u8>) -> Result<(u64, u64)> {
+/// chains, folded from one cursor as they are read (nothing is collected). With `chain` it
+/// reads that chain's row of each entity (one seek per entity; the chain is the key's last
+/// byte), not the other chains'. `stop` is asked every [`SUM_CHECK_EVERY`] rows; when it
+/// answers true the sum ends with `None`, never a partial sum.
+pub fn sum_kind(
+    txn: &impl Txn,
+    kind: CountKind,
+    chain: Option<u8>,
+    mut stop: impl FnMut() -> bool,
+) -> Result<Option<(u64, u64)>> {
     let k = kind as u8;
-    let rows = txn.scan(Table::RowCounts, &[k], |key| key.first() == Some(&k))?;
-    Ok(rows
-        .iter()
-        .filter(|(key, _)| chain.is_none_or(|c| key.get(9) == Some(&c)))
-        .fold((0, 0), |(u, c), (_, v)| {
+    let from = match chain {
+        Some(c) => key(kind, 0, c).to_vec(),
+        None => vec![k],
+    };
+    let (mut user, mut cb, mut n, mut cut) = (0u64, 0u64, 0u64, false);
+    txn.walk_rows(Table::RowCounts, &from, |key_b, v| {
+        if key_b.first() != Some(&k) {
+            return Walk::Stop;
+        }
+        n += 1;
+        if n % SUM_CHECK_EVERY == 0 && stop() {
+            cut = true;
+            return Walk::Stop;
+        }
+        let (Some(e), Some(&c)) = (
+            key_b
+                .get(1..9)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_be_bytes),
+            key_b.get(9).filter(|_| key_b.len() == 10),
+        ) else {
+            // Not a count row's key (the check counts it): skipped.
+            return Walk::Next;
+        };
+        let add = |user: &mut u64, cb: &mut u64| {
             let (a, b) = decode_val(v);
-            (u.saturating_add(a), c.saturating_add(b))
-        }))
+            *user = user.saturating_add(a);
+            *cb = cb.saturating_add(b);
+        };
+        let Some(want) = chain else {
+            add(&mut user, &mut cb);
+            return Walk::Next;
+        };
+        if c < want {
+            return Walk::Seek(key(kind, e, want).to_vec());
+        }
+        if c == want {
+            add(&mut user, &mut cb);
+        }
+        match e.checked_add(1) {
+            Some(next) => Walk::Seek(key(kind, next, want).to_vec()),
+            None => Walk::Stop,
+        }
+    })?;
+    Ok((!cut).then_some((user, cb)))
 }
 
 /// Add `sign` × the terms of `r` (1 at apply, -1 at unwind). A record whose output does not
@@ -570,4 +618,50 @@ pub fn unknown_kind_rows(txn: &impl Txn) -> Result<u64> {
 /// else it does, such as clearing the marker).
 pub fn clear_table(txn: &mut RwTxn<'_>) -> Result<()> {
     txn.clear(Table::RowCounts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::{Geometry, HotStore};
+
+    /// `sum_kind` folds every row of its kind (no other kind's), reads one chain's row per
+    /// entity with `chain`, and ends with `None` when `stop` answers true.
+    #[test]
+    fn sum_kind_sums_one_kind_per_chain_and_stops_without_a_partial_sum() {
+        let d = tempfile::tempdir().unwrap();
+        let hs = HotStore::open(d.path(), Geometry::default()).unwrap();
+        let mut t = hs.rw().unwrap();
+        let rows = 3_000u64;
+        for e in 0..rows {
+            for c in [0u8, 3, 19] {
+                // Entity 7 has no chain 3 row.
+                if e == 7 && c == 3 {
+                    continue;
+                }
+                let v = encode_val((u64::from(c) + 1, 1));
+                t.put(Table::RowCounts, &key(CountKind::TokenXfer, e, c), &v)
+                    .unwrap();
+            }
+        }
+        let other = encode_val((1_000, 1_000));
+        for k in [CountKind::EvtTxs, CountKind::Sndr] {
+            t.put(Table::RowCounts, &key(k, 1, 3), &other).unwrap();
+        }
+        t.commit().unwrap();
+        let ro = hs.ro().unwrap();
+        let sum = |c| sum_kind(&ro, CountKind::TokenXfer, c, || false).unwrap();
+        assert_eq!(sum(None), Some(((1 + 4 + 20) * rows - 4, 3 * rows - 1)));
+        assert_eq!(sum(Some(0)), Some((rows, rows)));
+        assert_eq!(sum(Some(3)), Some((4 * (rows - 1), rows - 1)));
+        assert_eq!(sum(Some(19)), Some((20 * rows, rows)));
+        assert_eq!(sum(Some(5)), Some((0, 0)));
+        let mut asked = 0;
+        let cut = sum_kind(&ro, CountKind::TokenXfer, None, || {
+            asked += 1;
+            asked == 2
+        })
+        .unwrap();
+        assert_eq!(cut, None);
+    }
 }

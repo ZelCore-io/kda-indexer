@@ -471,7 +471,9 @@ impl View {
     }
 
     /// `(user, coinbase)` rows stored for every entity of `kind` (on `chain`, or over all
-    /// chains), or `None` while the stored counts are not ready.
+    /// chains), or `None` while the stored counts are not ready. The rows are summed from a
+    /// cursor (one per entity and chain); past the request deadline the sum ends with
+    /// [`ApiError::Deadline`] (`COUNT_TIMEOUT`), never a partial number.
     pub fn row_count_kind(
         &self,
         kind: kdx_decode::rowcount::CountKind,
@@ -480,7 +482,11 @@ impl View {
         if !kdx_hot::rowcount::ready(&self.txn)? {
             return Ok(None);
         }
-        Ok(Some(kdx_hot::rowcount::sum_kind(&self.txn, kind, chain)?))
+        let deadline = self.deadline;
+        match kdx_hot::rowcount::sum_kind(&self.txn, kind, chain, || Instant::now() >= deadline)? {
+            Some(n) => Ok(Some(n)),
+            None => Err(ApiError::Deadline),
+        }
     }
 
     pub fn check_deadline(&self) -> ApiResult<()> {

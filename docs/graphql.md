@@ -209,7 +209,11 @@ These refusals are safety, not parity: each is a document stock answers slowly, 
 runs out of memory on, or that only an attack sends. Stock has none of them:
 - 20,000 fields after fragment expansion, 8 directives, the introspection cost of 100,000, the
   parser nesting of 64, and the query, variables and body size caps (attack shapes);
-- more than 2 deferred `totalCount` walks in one operation (each walks a whole account list);
+- more than 2 deferred `totalCount` walks in one operation (each walks a whole account list).
+  Every list `totalCount` but a block's or a tx's own counts toward the 2, including those
+  that usually answer from stored counters (the all-history counts below): the limit is
+  priced from the document, before it is known whether the counters are ready, so a count
+  that would walk cannot be told from one that would not;
 - a request (a batch: all its operations together) whose read budget is over 1,100,000 rows,
   for example many aliases of `transactions(first: 0) { … events(first: 0) … }`, which stock's
   gate prices at 0 while each serves 20 × 20 rows;
@@ -667,18 +671,30 @@ the oracle puts them.
     - `transfers` (with or without `chainId`, `isNFT` absent or `false`): the sum over every
       token of the stored `transfers(fungibleName)` counts, coinbase transfers included.
       Stock answers the last value of its `Transfers` id sequence: every transfer row it
-      ever inserted, NFT transfers and rows a reorg deleted included, so its number is an
-      estimate somewhat above ours (on 11-27 it answered 441,794,129). **Known
+      ever inserted, NFT transfers and rows a reorg deleted included, an estimate that
+      counts rows ours does not (on 11-27 it answered 441,794,129; ours was not taken at
+      the same height, so the two are not compared here). **Known
       difference:** a transfer row the list takes from an event whose name only ends in
       `TRANSFER` (`<m>.WIZ_TRANSFER`), in a tx with no `<m>.TRANSFER` event, is listed by the
       height walk and not counted here; stock keeps only events named `TRANSFER`, so it
       counts none of them.
 
-    Both read O(chains) or O(tokens × chains) stored rows, well inside the deadline. While
-    the counters they read are not ready, these lists walk their 20,000 heights as before
-    (the count then is the walk's, and a decoding `transfers` walk that long is usually cut
-    with `COUNT_TIMEOUT`). With a height or depth filter they keep the walk: stock answers
-    those from its height counters with a block-count formula, which we do not copy.
+    `transactions` reads O(chains) stored rows. `transfers` sums one stored row per token
+    and chain (one per token with `chainId`), streamed from a cursor; past the request
+    deadline it answers `COUNT_TIMEOUT`, never a partial sum. While the counters they read
+    are not ready (after `backfill`, `rebuild-range`, a startup guard mismatch, before the
+    first `reconcile-counts`), the 20,000-height walk answers only on a store whose history
+    fits in it (highest height minus the store's lowest at most 19,999); on a taller store
+    (mainnet) the count is `COUNT_TIMEOUT`, never the walk's partial number.
+
+    With a height or depth filter these lists keep the walk: stock answers those from its
+    height counters with a block-count formula, which we do not copy. So the count changes
+    meaning with the filter: `transactions { totalCount }` is all history, but
+    `transactions(minHeight: 0) { totalCount }` counts what the 20,000-height walk lists
+    (the newest 20,000 heights), as its edges do.
+
+    The operation limit of two list `totalCount`s ([limits](#limits)) counts these too: it
+    is priced before the counters' readiness is known.
 
     These keep the walk (and its `COUNT_TIMEOUT` on very long lists): `minHeight`,
     `maxHeight`, `minimumDepth`; `transactions(accountName, fungibleName)` (the module filter
@@ -690,7 +706,8 @@ the oracle puts them.
     buckets, which on the lists that need them (a popular event) is the same cut. While the
     counts are not ready (never built, or cleared by `backfill`, `rebuild-range`,
     `segments add-index` or `hot drop-family`), every list walks as above: slower, never
-    wrong.
+    wrong (the all-history counts above answer `COUNT_TIMEOUT` instead on a store taller
+    than their walk).
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
   payload `data` and capability `args` are compact JSON text of the node's values (numbers
   keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.

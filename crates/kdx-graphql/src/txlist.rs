@@ -1538,7 +1538,9 @@ fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResu
 
 /// The `totalCount` of a list with no selective argument (the height walk) and no height or
 /// depth filter, as stock counts it: over the whole history, not the 20,000 heights the walk
-/// lists ([`MAX_HEIGHTS`]). `None` (the caller walks) when the stored counters cannot answer.
+/// lists ([`MAX_HEIGHTS`]). When the stored counters cannot answer, the walk serves the count
+/// only on a store whose history fits its window ([`walk_covers_history`]); on a taller store
+/// the count is [`ApiError::Deadline`] (`COUNT_TIMEOUT`), never the window's partial number.
 ///
 /// - `transactions`: the user txs of the per-chain counters (`kdx_hot::chaincount`, the
 ///   `countersOfEachChain.transactionCount` numbers), plus one coinbase per block with
@@ -1556,7 +1558,7 @@ fn all_history_count(view: &View, f: &KeyFilter, rows: &Rows) -> ApiResult<Optio
             coinbase,
         } => {
             if !kdx_hot::chaincount::ready(&view.txn)? {
-                return Ok(None);
+                return walk_covers_history(view);
             }
             let counts = kdx_hot::chaincount::read_all(&view.txn)?;
             let mut n = 0u64;
@@ -1564,9 +1566,9 @@ fn all_history_count(view: &View, f: &KeyFilter, rows: &Rows) -> ApiResult<Optio
                 if f.chain.is_some_and(|x| x != c) {
                     continue;
                 }
-                // A chain without a row (or a damaged one) is not served as 0: walk.
+                // A chain without a row (or a damaged one) is not served as 0.
                 let Some(Some(k)) = counts.get(&c) else {
-                    return Ok(None);
+                    return walk_covers_history(view);
                 };
                 n = n.saturating_add(k.user_txs);
                 if *coinbase && !f.user_only {
@@ -1583,12 +1585,27 @@ fn all_history_count(view: &View, f: &KeyFilter, rows: &Rows) -> ApiResult<Optio
             let Some((user, cb)) =
                 view.row_count_kind(kdx_decode::rowcount::CountKind::TokenXfer, f.chain)?
             else {
-                return Ok(None);
+                return walk_covers_history(view);
             };
             Ok(Some(user.saturating_add(if f.user_only { 0 } else { cb })))
         }
         _ => Ok(None),
     }
+}
+
+/// `Ok(None)` (the caller walks) when the height walk lists the store's whole history: its
+/// span, the highest height with data down to the store's floor, is at most [`MAX_HEIGHTS`]
+/// heights. On a taller store the walk would count the newest [`MAX_HEIGHTS`] heights only,
+/// a partial number for a count that means all history: [`ApiError::Deadline`]
+/// (`COUNT_TIMEOUT`) instead.
+fn walk_covers_history(view: &View) -> ApiResult<Option<u64>> {
+    let Some(top) = view.max_data_height()? else {
+        return Ok(None);
+    };
+    if top.saturating_sub(kdx_api::compat::store_floor(view)) >= MAX_HEIGHTS {
+        return Err(ApiError::Deadline);
+    }
+    Ok(None)
 }
 
 /// Keys a decoding count walk reads ahead at once ([`count`]).
