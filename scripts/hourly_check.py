@@ -11,7 +11,8 @@ the indexer's native and admin listeners, and the node.
 
 Steps:
   1. Read the hour's lines from the log and its rotations (`<log>`, `<log>.1`, ...); a file
-     last written before the hour began is not opened.
+     last written before the hour began is not opened. Lines with `"local": true` (a loopback
+     client: this script's own replays) are skipped and counted as `skipped_local`.
   2. Sample: one request of every distinct query shape (route, query-parameter names; for
      GraphQL the operation's document and variable names), then up to `per_route` per route,
      at most `budget` in all. Identical requests are replayed once. Only GET/HEAD compat
@@ -152,6 +153,9 @@ def read_window(paths, start_ms, end_ms, counts):
                     counts["bad-line"] += 1
                     continue
                 if start_ms <= e.get("t", 0) < end_ms:
+                    if e.get("local") is True:
+                        counts["skipped-local"] += 1  # loopback: this script's own replays
+                        continue
                     yield e
 
 
@@ -541,6 +545,7 @@ def run(cfg, label, start_ms, end_ms, dry, deadline=None):
     items, routes, skipped = sample(entries, cfg["budget"], cfg["per_route"], label)
     served, lag = served_stats(entries)
     rep = {"hour": label, "lines": len(entries), "bad_lines": counts["bad-line"],
+           "skipped_local": counts["skipped-local"],
            "routes": dict(routes), "skipped": dict(skipped), "sampled": len(items),
            "served": served, "served_lag_max": lag,
            "replay": {"classes": {}, "per_route": {}, "examples": [], "not_run": 0}}
@@ -636,9 +641,9 @@ def run(cfg, label, start_ms, end_ms, dry, deadline=None):
 
 
 def summary_text(rep):
-    out = ["hour %s  %s  lines %d  sampled %d  not-run %d" % (
+    out = ["hour %s  %s  lines %d  sampled %d  not-run %d  skipped_local %d" % (
         rep["hour"], rep["status"], rep["lines"], rep["sampled"],
-        rep["replay"].get("not_run", 0))]
+        rep["replay"].get("not_run", 0), rep.get("skipped_local", 0))]
     c = rep["replay"]["classes"]
     out.append("classes " + " ".join("%s=%d" % (k, c[k]) for k in ORDER + ["not-run"] if c.get(k))
                + "  (G4: " + " ".join("%s=%d" % (LETTER[k], c[k]) for k in LETTER if c.get(k)) + ")")

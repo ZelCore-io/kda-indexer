@@ -89,6 +89,8 @@ pub struct Entry {
     pub status: u16,
     pub micros: u64,
     pub client: Option<u64>,
+    /// The client address (as `client`, after `trusted_proxies`) is loopback.
+    pub local: bool,
     pub tips: Option<(i64, i64)>,
     pub lag: Option<i64>,
     pub body: Option<GraphqlBody>,
@@ -134,6 +136,9 @@ impl Entry {
         }
         if let Some(c) = self.client {
             v["client"] = Value::String(format!("{c:016x}"));
+        }
+        if self.local {
+            v["local"] = Value::Bool(true);
         }
         if let Some((lo, hi)) = self.tips {
             v["tip_min"] = lo.into();
@@ -425,6 +430,11 @@ fn writer(
     let _ = w.out.flush();
 }
 
+/// 127.0.0.0/8 or ::1 (an IPv4-mapped `::ffff:127.x` counts as its IPv4 address).
+pub fn is_loopback(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 /// Middleware of the compat and GraphQL listeners (outermost, so the guard's 429/503 and the
 /// deadline's 504 are logged as the client saw them).
 pub async fn layer(
@@ -448,10 +458,12 @@ pub async fn layer(
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
-    let client = req
+    let ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .and_then(|ConnectInfo(peer)| log.client(st.client_ip_of(*peer, req.headers())));
+        .map(|ConnectInfo(peer)| st.client_ip_of(*peer, req.headers()));
+    let client = ip.and_then(|ip| log.client(ip));
+    let local = ip.is_some_and(is_loopback);
     let mut resp = next.run(req).await;
     let body = resp.extensions_mut().remove::<GraphqlBody>();
     let m = kdx_metrics::get();
@@ -464,6 +476,7 @@ pub async fn layer(
         status: resp.status().as_u16(),
         micros: u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX),
         client,
+        local,
         tips: m.indexed_tip_range(),
         lag: m.max_chain_lag(),
         body,
@@ -498,6 +511,7 @@ mod tests {
             status: 200,
             micros: 12_345,
             client: Some(0xab),
+            local: false,
             tips: Some((6_000_000, 6_000_002)),
             lag: Some(1),
             body: body.map(|b| GraphqlBody {
@@ -505,6 +519,32 @@ mod tests {
                 len: b.len(),
             }),
         }
+    }
+
+    #[test]
+    fn local_flag_only_for_loopback_and_never_the_address() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for l in ["127.0.0.1", "127.9.8.7", "::1", "::ffff:127.0.0.1"] {
+            assert!(is_loopback(ip(l)), "{l}");
+        }
+        for r in [
+            "198.51.100.7",
+            "10.0.0.1",
+            "2001:db8::1",
+            "::ffff:198.51.100.7",
+        ] {
+            assert!(!is_loopback(ip(r)), "{r}");
+        }
+        let mut e = entry(None);
+        assert!(serde_json::from_str::<Value>(&e.to_line(4096))
+            .unwrap()
+            .get("local")
+            .is_none());
+        e.local = true;
+        let line = e.to_line(4096);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["local"], true);
+        assert!(!line.contains("127.0.0.1"));
     }
 
     #[test]

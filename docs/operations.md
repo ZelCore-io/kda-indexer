@@ -503,9 +503,10 @@ One line, for example:
 | `route` | the route template that served it (null when none matched) |
 | `status`, `ms` | status the client got (the limits' 429/503/504 included) and the time to the response head |
 | `client` | keyed hash of the client address (after `api.trusted_proxies`); absent with `client_ip = "omit"` |
+| `local` | `true` when the client address (as for `client`, after `api.trusted_proxies`) is loopback (127.0.0.0/8 or ::1); absent otherwise, and written with `client_ip = "omit"` too. The address itself is never written. `hourly_check.py` skips these lines, so its own loopback replays are not sampled again |
 | `tip_min`, `tip_max`, `lag_max` | lowest and highest indexed chain height and the largest chain lag, as last sampled for `/metrics` (at most 10 s old) |
 | `gql` | GraphQL POST only: the body's `operationName`, `query` and `variables` (each request of a batch) |
-| `gql_cut`, `gql_len` | instead of `gql`, when the body is over `max_body_bytes` or not JSON |
+| `gql_cut`, `gql_len` | instead of `gql`, when the body is over `max_body_bytes` or not JSON (a 400 for a body that is not JSON or not a valid request is logged too) |
 
 What it never holds: the client address (the hash key is random per process, so a hash does
 not link across restarts, and nothing can turn it back without the key), headers, cookies,
