@@ -338,11 +338,16 @@ The G4 replay of real traffic (below) met most of these classes again; its
 - `events(parametersFilter:)`: stock never reads the argument and answers the unfiltered
   events for every value; ours applies the Prisma JSON filter forms it documents
   (`array_starts_with`, `array_ends_with`, `array_contains`, `equals`, `not`, the
-  `string_*` forms, `path`) and ignores any other value as stock does, flagged
+  `string_*` forms, `path`, `mode: "insensitive"`) and ignores any other value as stock
+  does, flagged
   `parametersFilterIgnored` ([graphql.md](graphql.md#transactions-events-and-transfers)).
+  Two readings of ours may differ from Prisma's: an array operand of `array_starts_with` or
+  `array_ends_with` is a prefix or suffix of that many elements (Prisma may compare it with
+  one element as a nested array; unverified), and the `string_*` forms match JSON strings
+  only, not the text of a number.
 - `Block.minerAccount`: stock reads the miner's row from the node for every block, so its
-  balance is the node's at the time of the read; ours serves the stored row and reads the
-  node only on a miss. Both answer balance 0 with a `raw: "null"` `RawGuard` when the chain
+  balance is the node's at the time of the read; ours serves the stored row, which can lag
+  the node by the reconciler's delay, and reads the node only on a miss. Both answer balance 0 with a `raw: "null"` `RawGuard` when the chain
   has no row ([graphql.md](graphql.md#blocks-and-network)).
 - chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
   recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The

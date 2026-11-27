@@ -334,8 +334,13 @@ number open.
   account, a timeout). Ours serves the stored row (any balance); with none, one node read of
   that chain through the account-miss reader (its budgets, rate limits and cache); with no
   row found or the read refused or failed, stock's zero row (`nodeReadIncomplete` when the
-  read failed or was refused). Never a field error, except for a block whose minerData
-  carries no account string (`NOT_AVAILABLE`; stock's schema check fails there too).
+  read failed or was refused, and when no read can be made: node reads off, or a module the
+  store does not serve). One request asks each `(miner, chain)` once: every block of the
+  same miner on the same chain in a page joins that one read and is charged once against
+  the request budget and the client's rate, so a page answers one row per miner and chain.
+  The stored row can lag the node by the reconciler's delay. Never a field error, except
+  for a block whose minerData carries no account string (`NOT_SUPPORTED`; stock's schema
+  check fails there too).
 - `blocksFromHeight` with `startHeight` above `endHeight` is an empty list (stock errors).
 - Block lists are ordered by height, then chain ascending: `blocksFromHeight` ascending by
   height, as the oracle lists it (R-P5P9-57 M2a); `blocksFromDepth` and
@@ -575,12 +580,17 @@ the oracle puts them.
   Prisma JSON filter but never reads it: every value, malformed included, answers the
   unfiltered events. Ours serves the Prisma JSON filter forms on the parameters array, ANDed
   when one object has several keys: `array_starts_with` and `array_ends_with` (a value or an
-  array of values in order), `array_contains` (a value, or an array whose every value is a
+  array of values in order: our reading of an array operand is a prefix or suffix of that
+  many elements; Prisma may compare it with the first or last element as a nested array,
+  unverified), `array_contains` (a value, or an array whose every value is a
   member; members compare by equality), `equals` and `not` (the whole value), the string
-  forms `string_contains`, `string_starts_with` and `string_ends_with`, and `path` (keys or
+  forms `string_contains`, `string_starts_with` and `string_ends_with` (a JSON string only:
+  a number at the path never matches, where Prisma's text extraction would match its
+  digits), `mode` (`"insensitive"` makes `equals` on a string and the `string_*` forms
+  compare Unicode-lowercased; `not` and the `array_*` forms stay exact), and `path` (keys or
   indexes, `["0"]` is the first parameter) that the other keys apply to. Each is a row
   predicate, so a filtered list costs what the unfiltered list costs. Any other value (an
-  unknown key such as `mode`, a wrong shape, text that is not JSON, over 8 KB) is ignored as
+  unknown key such as `gt`, `gte`, `lt` or `lte`, a `mode` other than `"insensitive"` or `"default"`, a wrong shape, text that is not JSON, over 8 KB) is ignored as
   stock ignores it: the unfiltered events, with `extensions.parametersFilterIgnored: true`.
   The `events` subscription takes the same forms (ignored ones without the flag). When
   `array_starts_with` (or `equals` on `path: ["0"]`) fixes the first value to a

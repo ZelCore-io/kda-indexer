@@ -299,6 +299,10 @@ pub struct KeyFilter {
 pub struct ParamFilter {
     path: Vec<String>,
     preds: Vec<ParamPred>,
+    /// `mode: "insensitive"`: `equals` on a string and `string_*` compare lowercased (Unicode
+    /// lowercase of both sides; the operands are lowered once at parse). `not` and `array_*`
+    /// stay exact.
+    insensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -334,6 +338,7 @@ impl ParamFilter {
         let mut f = ParamFilter {
             path: Vec::new(),
             preds: Vec::new(),
+            insensitive: false,
         };
         for (k, x) in o {
             let text = || x.as_str().map(str::to_owned);
@@ -350,6 +355,14 @@ impl ParamFilter {
                         .collect::<Option<_>>()?;
                     continue;
                 }
+                "mode" => {
+                    f.insensitive = match x.as_str()? {
+                        "insensitive" => true,
+                        "default" => false,
+                        _ => return None,
+                    };
+                    continue;
+                }
                 "array_starts_with" => ParamPred::StartsWith(operand(x)?),
                 "array_ends_with" => ParamPred::EndsWith(operand(x)?),
                 "array_contains" => ParamPred::Contains(operand(x)?),
@@ -361,6 +374,17 @@ impl ParamFilter {
                 _ => return None,
             };
             f.preds.push(p);
+        }
+        if f.insensitive {
+            for p in &mut f.preds {
+                match p {
+                    ParamPred::StrContains(x) | ParamPred::StrStarts(x) | ParamPred::StrEnds(x) => {
+                        *x = x.to_lowercase();
+                    }
+                    ParamPred::Equals(Value::String(x)) => *x = x.to_lowercase(),
+                    _ => {}
+                }
+            }
         }
         (!f.preds.is_empty()).then_some(f)
     }
@@ -389,6 +413,12 @@ impl ParamFilter {
                 None => return false,
             }
         }
+        let folded = if self.insensitive {
+            t.as_str().map(str::to_lowercase)
+        } else {
+            None
+        };
+        let text = folded.as_deref().or_else(|| t.as_str());
         self.preds.iter().all(|p| match p {
             ParamPred::StartsWith(x) => t
                 .as_array()
@@ -399,11 +429,12 @@ impl ParamFilter {
             ParamPred::Contains(x) => t
                 .as_array()
                 .is_some_and(|a| x.iter().all(|x| a.contains(x))),
+            ParamPred::Equals(Value::String(x)) if self.insensitive => text == Some(x.as_str()),
             ParamPred::Equals(x) => t == x,
             ParamPred::Not(x) => t != x,
-            ParamPred::StrContains(x) => t.as_str().is_some_and(|s| s.contains(x.as_str())),
-            ParamPred::StrStarts(x) => t.as_str().is_some_and(|s| s.starts_with(x.as_str())),
-            ParamPred::StrEnds(x) => t.as_str().is_some_and(|s| s.ends_with(x.as_str())),
+            ParamPred::StrContains(x) => text.is_some_and(|s| s.contains(x.as_str())),
+            ParamPred::StrStarts(x) => text.is_some_and(|s| s.starts_with(x.as_str())),
+            ParamPred::StrEnds(x) => text.is_some_and(|s| s.ends_with(x.as_str())),
         })
     }
 
@@ -414,7 +445,8 @@ impl ParamFilter {
             .iter()
             .find_map(|p| match (p, self.path.as_slice()) {
                 (ParamPred::StartsWith(x), []) => x.first().and_then(Value::as_str),
-                (ParamPred::Equals(x), [z]) if z == "0" => x.as_str(),
+                // Insensitive: the stored name's case is unknown, so no exact posting source.
+                (ParamPred::Equals(x), [z]) if z == "0" && !self.insensitive => x.as_str(),
                 _ => None,
             })
     }
@@ -1824,8 +1856,26 @@ mod tests {
         assert!(!f.matches(&json!(["k:a", "k:b", 1])));
         let f = ParamFilter::parse(r#"{"not":[]}"#).unwrap();
         assert!(f.matches(&json!(["x"])) && !f.matches(&json!([])));
+        // `mode: "insensitive"`: string_* and equals on a string compare lowercased; `not`
+        // and array_* stay exact; equals no longer names an exact posting source.
+        let f = ParamFilter::parse(
+            r#"{"path":["0"],"string_starts_with":"K:Ab","mode":"insensitive"}"#,
+        )
+        .unwrap();
+        assert!(f.matches(&json!(["k:aBc"])) && !f.matches(&json!([1])));
+        let f =
+            ParamFilter::parse(r#"{"path":["0"],"equals":"K:ΑΒ","mode":"insensitive"}"#).unwrap();
+        assert!(f.matches(&json!(["k:αβ"])) && !f.matches(&json!(["k:αβγ"])));
+        assert_eq!(f.first_str(), None);
+        let f = ParamFilter::parse(r#"{"path":["0"],"equals":"K:a","mode":"default"}"#).unwrap();
+        assert!(!f.matches(&json!(["k:a"])) && f.first_str() == Some("K:a"));
+        let f = ParamFilter::parse(r#"{"array_contains":"K:a","mode":"insensitive"}"#).unwrap();
+        assert!(!f.matches(&json!(["k:a"])));
         // Stock ignores the argument: what we cannot serve is ignored too (no filter).
         for ignored in [
+            r#"{"string_contains":"a","mode":"insensitive","gt":1}"#,
+            r#"{"string_contains":"a","mode":"loose"}"#,
+            r#"{"mode":"insensitive"}"#,
             r#"{"array_starts_with":"a","x":1}"#,
             r#"{"array_starts_with":[]}"#,
             r#"{"path":["0"]}"#,
