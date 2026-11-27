@@ -379,6 +379,18 @@ async fn drain_bench() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| tmp.path().to_path_buf());
     let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
+    // Our tail at height 10 on every chain, with the header the nodes name: an absent answer
+    // (`as_of` = the tail) then clears marks up to 10, as on a live host.
+    {
+        let mut txn = hot.rw().unwrap();
+        for c in 0..20u8 {
+            kdx_hot::set_checkpoint(&mut txn, kdx_hot::Stage::Tail, c, 10, tip_hash()).unwrap();
+        }
+        txn.commit().unwrap();
+        for c in 0..20u8 {
+            put_header(&hot, c, 10, tip_hash());
+        }
+    }
     // Accounts `a0..`, 20 chains, about 2/3 `coin` rows and 400 other modules.
     const ACCOUNTS: u32 = 500_000;
     let have = balances::dirty_count(&hot.ro().unwrap()).unwrap() as u32;
@@ -395,9 +407,6 @@ async fn drain_bench() {
             .collect();
         dict.persist(&mut txn).unwrap();
         txn.commit().unwrap();
-        for c in 0..20u8 {
-            put_header(&hot, c, 10, tip_hash());
-        }
         let mut i = have;
         while i < rows {
             let mut txn = hot.rw().unwrap();
