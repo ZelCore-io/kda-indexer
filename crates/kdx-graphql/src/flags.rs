@@ -113,6 +113,8 @@ impl Extension for FlagsExt {
         next: NextExecute<'_>,
     ) -> Response {
         let mut r = next.run(ctx, operation_name).await;
+        // Taken, not read: a subscription stream runs every message through this one
+        // extension, so a flag one message set must not carry into the next.
         for (f, name) in [
             (Flag::SearchTruncated, "searchTruncated"),
             (Flag::KeyAccountsTruncated, "truncated"),
@@ -121,7 +123,7 @@ impl Extension for FlagsExt {
             (Flag::DexPricesPartial, "dexPricesPartial"),
             (Flag::ParametersFilterIgnored, "parametersFilterIgnored"),
         ] {
-            if self.0.is_set(f) {
+            if self.0.cell(f).swap(false, Ordering::Relaxed) {
                 r.extensions.insert(name.to_owned(), Value::Boolean(true));
             }
         }

@@ -174,6 +174,8 @@ impl Extension for WsOpsExt {
         // subscription and, once spent, null that field for the rest of its life. Execute
         // data is looked up first, so this one shadows the stream's.
         data.insert(Arc::new(crate::txlist::XchainBudget::default()));
+        // And its own account-miss read budget and memo, as an HTTP request has.
+        data.insert(crate::miss::MissBudget::default());
         match tokio::time::timeout(budget, next.run_with_data(ctx, operation_name, data)).await {
             Ok(r) => r,
             Err(_) => async_graphql::Response::from_errors(vec![server(
@@ -590,10 +592,27 @@ mod tests {
         }
     }
 
+    /// One message of `marks`: the first marks the node-read flag, the rest do not.
+    struct Mark(bool);
+
+    #[Object]
+    impl Mark {
+        /// Whether the message has an account-miss read budget of its own.
+        async fn budgeted(&self, ctx: &Context<'_>) -> bool {
+            if self.0 {
+                crate::flags::mark(ctx, crate::flags::Flag::NodeReadIncomplete);
+            }
+            ctx.data_opt::<crate::miss::MissBudget>().is_some()
+        }
+    }
+
     struct S;
 
     #[Subscription]
     impl S {
+        async fn marks(&self) -> impl Stream<Item = Mark> {
+            stream::iter([Mark(true), Mark(false), Mark(false)])
+        }
         async fn ticks(&self) -> impl Stream<Item = Tick> {
             stream::iter([Tick, Tick])
         }
@@ -672,6 +691,28 @@ mod tests {
             let v = r.data.into_json().unwrap();
             let got = v["transfers"]["granted"].as_u64().unwrap() as usize;
             assert_eq!(got, LOOKUPS * READS, "message {i}");
+        }
+    }
+
+    /// Each subscription message has its own account-miss read budget, and a response flag
+    /// one message sets is not carried into the messages after it.
+    #[tokio::test]
+    async fn every_subscription_message_has_its_own_miss_budget_and_flags() {
+        let schema = Schema::build(Q, EmptyMutation, S)
+            .extension(crate::flags::Flags)
+            .extension(WsOps)
+            .finish();
+        let items: Vec<_> = schema
+            .execute_stream("subscription { marks { budgeted } }")
+            .collect()
+            .await;
+        assert_eq!(items.len(), 3);
+        for (i, r) in items.into_iter().enumerate() {
+            assert!(r.errors.is_empty(), "message {i}: {:?}", r.errors);
+            let flagged = r.extensions.contains_key("nodeReadIncomplete");
+            assert_eq!(flagged, i == 0, "message {i}: {:?}", r.extensions);
+            let v = r.data.into_json().unwrap();
+            assert_eq!(v["marks"]["budgeted"], true, "message {i}");
         }
     }
 }
