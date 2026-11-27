@@ -1621,10 +1621,13 @@ fn walk_covers_history(view: &View) -> ApiResult<Option<u64>> {
     Ok(None)
 }
 
-/// Whether the store misses history below its floor, the test `row_counts::reconcile` and
-/// `holders_fill` use to withhold their all-time markers: it was started at a height above 0
-/// (`run --start-height`, `META_PARTIAL_FROM`), or its lowest height (first range, else the
-/// hot floor) is above 0 (`backfill --from H` into a new data dir).
+/// Whether the store misses history below its floor: it was started at a height above 0
+/// (`run --start-height`, `META_PARTIAL_FROM`), or its lowest height is above 0 (`backfill
+/// --from H` into a new data dir). The lowest height is the first range's start, else (no
+/// manifest, or an empty one) the hot floor. `row_counts::reconcile` and `holders_fill`
+/// withhold their all-time markers on the marker or a first range above 0 only, so with no
+/// range and a hot floor above 0 this test is stricter than theirs: the chain counters may
+/// be ready there, and this still refuses the all-history count.
 fn partial_store(view: &View) -> ApiResult<bool> {
     use kdx_hot::Txn as _;
     if view
