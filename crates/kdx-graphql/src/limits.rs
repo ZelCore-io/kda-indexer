@@ -72,6 +72,11 @@ const PAGED: &[&str] = &[
     // ZelCore extensions.
     "transactionsByPactCode",
     "balance",
+    // DEX lists (stock's): served at their default page when `first`/`last` are absent.
+    "pools",
+    "liquidityPositions",
+    "poolTransactions",
+    "tokens",
 ];
 
 /// Lists that clamp at `wide_page` instead of `max_page`: the block lists and account
@@ -175,6 +180,9 @@ struct Walk<'a> {
     intro_cost: u64,
     /// `crossChainTransfer` fields on the current path (M-5).
     xchain: usize,
+    /// The `Query.pool` field being walked: its page arguments are the ones its
+    /// `Pool.transactions` serves when that field gives none of its own.
+    pool: Option<&'a Field>,
     /// Refuse on this model's depth, complexity and count limits ([`analyze`]); off for the
     /// served gate ([`budget`]), where stock's limits refuse instead (FIX-3 part C).
     enforce: bool,
@@ -400,7 +408,12 @@ impl<'a> Walk<'a> {
                     }
                     let xc = usize::from(name == "crossChainTransfer");
                     self.xchain += xc;
+                    let saved_pool = self.pool;
+                    if name == "pool" && ty == Some("Query") {
+                        self.pool = Some(f);
+                    }
                     let child = self.set(&f.selection_set.node, d, intro, fty, inner);
+                    self.pool = saved_pool;
                     self.xchain -= xc;
                     (self.outer, self.conn_mult) = (saved, saved_cm);
                     if list.is_some() {
@@ -544,10 +557,32 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// Whether `f` gives any of `Pool.transactions`' own arguments (else it serves those of
+    /// the `pool` field above it).
+    fn gives_tx_args(&self, f: &'a Field) -> bool {
+        ["type", "first", "after", "last", "before"]
+            .iter()
+            .any(|a| match self.arg(f, a) {
+                Arg::Absent => false,
+                Arg::Val(v) => v != Value::Null,
+                Arg::Unbound => true,
+            })
+    }
+
     fn multiplier(&mut self, f: &'a Field, parent: Option<&str>) -> u64 {
         let s = self.s;
         // The wide lists clamp at `wide_page` (R-P5P9-20), everything else at `max_page`.
         let name = f.name.node.as_str();
+        // `Pool.transactions` without arguments of its own serves the page asked of
+        // `Query.pool`: priced from there.
+        let f = match self.pool {
+            Some(p)
+                if name == "transactions" && parent == Some("Pool") && !self.gives_tx_args(f) =>
+            {
+                p
+            }
+            _ => f,
+        };
         // The served budget (FIX-3 part D, S5) prices a page as the resolver serves it: as
         // asked up to the safety cap (above it the resolver refuses), and an absent
         // `first`/`last` at `default_page`. The legacy model keeps its clamps.
@@ -711,6 +746,7 @@ fn walk(
         conn_mult: 1,
         counts: 0,
         xchain: 0,
+        pool: None,
     };
     let ops: Vec<_> = match &doc.operations {
         DocumentOperations::Single(op) => vec![op],
@@ -1421,6 +1457,54 @@ mod tests {
                 "{f}"
             );
         }
+    }
+
+    /// The DEX lists are priced at their default page when `first`/`last` are absent, and
+    /// `pool(first:, last:)` prices the `transactions` page it forwards. A zero page with a
+    /// cursor costs (and serves) no rows, so the aliased charts cost nothing only when no
+    /// pool is read.
+    #[test]
+    fn dex_pages_are_priced_as_served() {
+        let charts = |args: &str| {
+            let many: String = (0..10)
+                .map(|i| format!("c{i}: charts(timeFrame: ALL) {{ tvl {{ value }} }} "))
+                .collect();
+            served(
+                &format!("{{ pools{args} {{ edges {{ node {{ {many} }} }} }} }}"),
+                json!({}),
+            )
+        };
+        let absent = charts("").unwrap_or(u64::MAX);
+        assert!(absent >= 20 * 10 * DEX_LIST_COST, "{absent}");
+        // The list read itself, and no `charts` (no pool is served).
+        assert!(charts("(first: 0, after: \"OTk5OTk5\")").unwrap() < 2 * DEX_LIST_COST);
+        for f in ["liquidityPositions", "poolTransactions", "tokens"] {
+            let one = served(
+                &format!("{{ {f}(first: 1) {{ edges {{ cursor }} }} }}"),
+                json!({}),
+            );
+            let def = served(&format!("{{ {f} {{ edges {{ cursor }} }} }}"), json!({}));
+            assert!(
+                def.is_err() || def.clone().unwrap() > one.clone().unwrap_or(0),
+                "{f}: {def:?} {one:?}"
+            );
+        }
+        let pool = |args: &str| {
+            served(
+                &format!("{{ pool(id: \"x\"{args}) {{ transactions {{ edges {{ node {{ c: __typename }} }} }} }} }}"),
+                json!({}),
+            )
+            .unwrap()
+        };
+        // Each of the 1000 forwarded rows is priced (at least 1 per edge).
+        assert!(pool(", first: 1000") >= pool(", first: 1") + 999);
+        // Arguments of its own win over the forwarded ones.
+        let own = served(
+            "{ pool(id: \"x\", first: 1000) { transactions(first: 1) { edges { node { c: __typename } } } } }",
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(own, pool(", first: 1"));
     }
 
     /// N-06: `lastTokenPriceInKda` costs its scan's rows, so aliases of it reach the
