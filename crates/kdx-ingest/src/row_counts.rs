@@ -372,6 +372,10 @@ pub fn reconcile(
         chaincount::stamp_all(&mut txn)?;
         rep.chain_counters_ready = true;
     }
+    // The row counts are marked ready on a partial store too: per key they count what its
+    // lists hold (the same number the posting walk gives), which the keyed `totalCount`s
+    // serve. Only their sum over every token is an all-time value, and the GraphQL
+    // all-history count refuses it on a partial store (`kdx_graphql::txlist`).
     if rep.unrendered == 0 {
         rowcount::set_ready(&mut txn, next_txnum)?;
         rep.ready = true;

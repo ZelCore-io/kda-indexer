@@ -62,6 +62,9 @@ pub mod meta {
     pub const GEOMETRY: &str = "geometry";
     /// u64 1 when every hot tx carries its `sndr` posting (FIX-2, `sndr::backfill`).
     pub const SNDR_HOT: &str = "sndr_hot";
+    /// The first height of a store started with `run --start-height` (dev): a partial store,
+    /// with no all-time counters.
+    pub const PARTIAL_FROM: &str = "partial_from";
 }
 
 pub struct HotStore {

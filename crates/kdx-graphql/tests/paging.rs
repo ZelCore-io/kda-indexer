@@ -3719,6 +3719,103 @@ mod stored_count {
         assert!(n.is_none() && codes.iter().any(|c| c.contains("COUNT_TIMEOUT")));
     }
 
+    /// The unfiltered all-history lists: on a partial store none of them has a number.
+    const PARTIAL_LISTS: &[&str] = &[
+        "transactions(ARGS)",
+        "transactions(chainId: \"0\", ARGS)",
+        "transactions(isCoinbase: true, ARGS)",
+        "transfers(ARGS)",
+        "transfers(chainId: \"0\", ARGS)",
+    ];
+
+    /// Every list of [`PARTIAL_LISTS`] answers `NOT_AVAILABLE` and no number.
+    async fn no_all_history_count(fx: &Fx, why: &str) {
+        for l in PARTIAL_LISTS {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert_eq!(n, None, "{why}: {l}: no count of the store's own rows");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("NOT_AVAILABLE")),
+                "{why}: {l}: {codes:?}"
+            );
+        }
+    }
+
+    /// I1-b: a partial store (started above height 0) holds fewer than 20,000 heights, so the
+    /// walk would list all of them, but they are not all history: unfiltered `transactions`
+    /// and `transfers` `totalCount` are `NOT_AVAILABLE`, before and after `reconcile-counts`
+    /// (which marks the per-token counts ready there; one token's count is still served).
+    #[tokio::test]
+    async fn a_partial_store_has_no_all_history_count() {
+        // `run --start-height`: the meta marker.
+        let fx = fixture();
+        let mut t = fx.store.hot.rw().unwrap();
+        t.set_meta(kdx_hot::env::meta::PARTIAL_FROM, &5u32.to_be_bytes())
+            .unwrap();
+        t.commit().unwrap();
+        no_all_history_count(&fx, "marker, counts not ready").await;
+        reconcile(&fx);
+        assert!(ready(&fx), "per-token counts are ready on a partial store");
+        no_all_history_count(&fx, "marker, counts ready").await;
+        let one = "transfers(fungibleName: \"coin\", ARGS)";
+        assert_eq!(
+            total_spent(&fx.schema, one).await,
+            Some(walk(&fx.schema, one).await),
+            "one token's count: what the store lists"
+        );
+
+        // `backfill --from H` into a new data dir: no marker, the first range starts above 0.
+        let fx = fixture();
+        let mut m = Manifest::load(&fx.store.segdir).unwrap().unwrap();
+        m.entries.remove(0);
+        m.commit(&fx.store.segdir).unwrap();
+        let ro = fx.store.hot.ro().unwrap();
+        assert!(ro.meta(kdx_hot::env::meta::PARTIAL_FROM).unwrap().is_none());
+        drop(ro);
+        no_all_history_count(&fx, "floor above 0, counts not ready").await;
+        let r =
+            row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, false, &|| false).unwrap();
+        assert!(r.ready && !r.chain_counters_ready, "{r:?}");
+        no_all_history_count(&fx, "floor above 0, counts ready").await;
+    }
+
+    /// The walk's boundary: a store spanning 19,999 heights above its floor (0) is listed
+    /// whole and its count answers; at 20,000 the count is `COUNT_TIMEOUT`.
+    #[tokio::test]
+    async fn the_walk_answers_up_to_a_span_of_19999_heights() {
+        let max = kdx_graphql::txlist::MAX_HEIGHTS;
+        // The fixture's tip is height 12; its extra blocks start at 13.
+        let fx = fixture_big(GraphqlSettings::default(), max - 1 - 12);
+        assert!(!ready(&fx));
+        let ro = fx.store.hot.ro().unwrap();
+        let top = kdx_hot::checkpoint(&ro, kdx_hot::Stage::Tail, 0)
+            .unwrap()
+            .unwrap()
+            .0;
+        drop(ro);
+        assert_eq!(top, max - 1, "span 19,999");
+        for l in ["transactions(ARGS)", "transfers(ARGS)"] {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert!(codes.is_empty(), "{l}: {codes:?}");
+            assert!(n.is_some_and(|n| n > i64::from(max) - 13), "{l}: {n:?}");
+        }
+        // One more height: span 20,000.
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let (b, _) = decoded(0, max, &[Shape::One]);
+        let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+        kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        for l in ["transactions(ARGS)", "transfers(ARGS)"] {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert_eq!(n, None, "{l}: span 20,000");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("COUNT_TIMEOUT")),
+                "{l}: {codes:?}"
+            );
+        }
+    }
+
     /// Unwind chain `chain` to `to` and apply `fork` (another block hash) in one txn.
     fn reorg(fx: &Fx, chain: u8, to: u32, fork: &[(u32, &[Shape])]) {
         let mut t = fx.store.hot.rw().unwrap();

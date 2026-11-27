@@ -26,7 +26,7 @@ use crate::ctx::Ctx;
 use crate::{backfill, disk, etl};
 
 /// Meta key: the first height of a store started with `run --start-height` (dev).
-pub const META_PARTIAL_FROM: &str = "partial_from";
+pub const META_PARTIAL_FROM: &str = kdx_hot::env::meta::PARTIAL_FROM;
 
 pub(crate) fn crash_at(point: &str) {
     if std::env::var("KDX_CRASH_AT").ok().as_deref() == Some(point) {

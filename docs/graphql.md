@@ -685,7 +685,12 @@ the oracle puts them.
     are not ready (after `backfill`, `rebuild-range`, a startup guard mismatch, before the
     first `reconcile-counts`), the 20,000-height walk answers only on a store whose history
     fits in it (highest height minus the store's lowest at most 19,999); on a taller store
-    (mainnet) the count is `COUNT_TIMEOUT`, never the walk's partial number.
+    (mainnet) the count is `COUNT_TIMEOUT`, never the walk's partial number. A partial
+    store (started with `run --start-height`, or by `backfill --from H` above 0 into a new
+    data dir) has no all-history count at all: these unfiltered counts answer
+    `NOT_AVAILABLE`, whether the counters are ready or not, as its `countersOfEachChain` and
+    holders do. Its per-token, per-account and per-event counts still answer: they count
+    what its lists hold.
 
     With a height or depth filter these lists keep the walk: stock answers those from its
     height counters with a block-count formula, which we do not copy. So the count changes
