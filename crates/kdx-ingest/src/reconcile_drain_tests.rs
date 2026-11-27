@@ -201,6 +201,10 @@ fn window_is_due_when_used_up_or_old() {
     assert_eq!(w.left(), 1);
     assert_eq!(w.next_batch(2), vec![d(3)]);
     assert!(w.due(t, WINDOW_MAX_AGE), "used up");
+    // A window refilled while a batch was in flight leaves that batch's keys out.
+    w.set_without(vec![d(1), d(2), d(3), d(4)], t, &[d(2), d(4)]);
+    assert_eq!(w.left(), 2);
+    assert_eq!(w.next_batch(5), vec![d(1), d(3)]);
     w.set(vec![d(4)], t);
     w.clear();
     assert!(w.due(t, WINDOW_MAX_AGE));
@@ -416,7 +420,7 @@ async fn drain_bench() {
                 }
                 let a = accts[(i % ACCOUNTS) as usize];
                 let c = ((i / ACCOUNTS) % 20) as u8;
-                let m = if i % 3 == 0 {
+                let m = if i.is_multiple_of(3) {
                     mods[(i % 400) as usize]
                 } else {
                     coin
@@ -468,19 +472,16 @@ async fn drain_bench() {
             .iter()
             .map(|n| n.calls.load(Ordering::Relaxed))
             .collect();
+        let refill = |b: &HashMap<[u8; 9], Mark>| {
+            spawn_refill(hot.clone(), 1024, caps.module_share, k, b.clone())
+        };
+        let mut batch_secs = 0.0;
         let start = Instant::now();
+        // `reconcile_loop`'s refill, batch and bookkeeping steps.
         while start.elapsed() < Duration::from_secs(secs) {
             if w.due(Instant::now(), WINDOW_MAX_AGE) {
-                let (h, b) = (hot.clone(), std::mem::take(&mut back));
-                let t = Instant::now();
-                let (keys, b) = tokio::task::spawn_blocking(move || {
-                    refill_window(&h, 1024, caps.module_share, k, &b).map(|r| (r, b))
-                })
-                .await
-                .unwrap()
-                .unwrap();
-                back = b;
-                refill_secs += secs_since(t);
+                let (keys, s) = refill(&back).await.unwrap().unwrap();
+                refill_secs += s;
                 refills += 1;
                 w.set(keys, Instant::now());
             }
@@ -488,11 +489,26 @@ async fn drain_bench() {
             if batch.is_empty() {
                 break;
             }
+            let next = (k > 1
+                && (w.left() == 0
+                    || w.due(
+                        Instant::now() + Duration::from_secs_f64(batch_secs),
+                        WINDOW_MAX_AGE,
+                    )))
+            .then(|| refill(&back));
+            let t0 = Instant::now();
             let st = reconcile_batch_with(&ctx, &primary, Some(&pool), &batch, &caps)
                 .await
                 .unwrap();
+            batch_secs = secs_since(t0);
             after_batch(&hot, &mut fails, &mut retries, &batch, &st).unwrap();
             note_remarked(&mut back, &batch, &st);
+            if let Some(next) = next {
+                let (keys, s) = next.await.unwrap().unwrap();
+                refill_secs += s;
+                refills += 1;
+                w.set_without(keys, Instant::now(), &batch);
+            }
             done += st.ok + st.absent + st.skipped + st.failures + st.dropped;
             batches += 1;
             tot.ok += st.ok;

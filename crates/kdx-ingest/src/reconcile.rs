@@ -542,6 +542,14 @@ impl RefillWindow {
         self.taken = Some(at);
     }
 
+    /// [`Self::set`] without the keys of `read`: a window refilled while the batch `read` was
+    /// in flight would hand its keys out again (their marks are cleared only at its commit).
+    pub fn set_without(&mut self, mut keys: Vec<Dirty>, at: Instant, read: &[Dirty]) {
+        let read: HashSet<[u8; 9]> = read.iter().map(|d| d.key).collect();
+        keys.retain(|d| !read.contains(&d.key));
+        self.set(keys, at);
+    }
+
     /// The next batch: up to `n` keys, in the window's order.
     pub fn next_batch(&mut self, n: usize) -> Vec<Dirty> {
         let end = self.pos.saturating_add(n.max(1)).min(self.keys.len());
@@ -559,6 +567,24 @@ impl RefillWindow {
     pub fn clear(&mut self) {
         *self = Self::default();
     }
+}
+
+/// [`refill_window`] on a blocking thread: the keys, and the seconds the walk took (also
+/// observed as the `refill` phase).
+pub fn spawn_refill(
+    hot: Arc<HotStore>,
+    n: usize,
+    share: usize,
+    k: usize,
+    back: HashMap<[u8; 9], Mark>,
+) -> tokio::task::JoinHandle<Result<(Vec<Dirty>, f64)>> {
+    tokio::task::spawn_blocking(move || {
+        let t = Instant::now();
+        let keys = refill_window(&hot, n, share, k, &back)?;
+        let secs = secs_since(t);
+        kdx_metrics::get().balance_batch_phase("refill", secs);
+        Ok((keys, secs))
+    })
 }
 
 /// One dirty key with what the call needs.
@@ -2312,6 +2338,7 @@ async fn reconcile_loop(
     let mut watch = BranchWatch::default();
     let mut window = RefillWindow::default();
     let mut refill_secs = 0.0f64;
+    let mut batch_secs = 0.0f64;
     loop {
         if stop.is_cancelled() {
             return Ok(());
@@ -2360,22 +2387,18 @@ async fn reconcile_loop(
         }
         // One walk of `BalanceDirty` per window of `refill_window_batches` batches; every
         // batch of it still gets its own write txn, bookkeeping and backoff below.
-        if window.due(Instant::now(), WINDOW_MAX_AGE) {
-            let (h, n, share, k) = (
+        let refill = |back: &HashMap<[u8; 9], Mark>| {
+            spawn_refill(
                 ctx.hot.clone(),
                 o.batch,
                 o.caps.module_share,
                 o.caps.refill_window_batches,
-            );
-            let b = std::mem::take(&mut back);
-            let t = Instant::now();
-            let (keys, b) = tokio::task::spawn_blocking(move || {
-                refill_window(&h, n, share, k, &b).map(|r| (r, b))
-            })
-            .await??;
-            back = b;
-            refill_secs = secs_since(t);
-            kdx_metrics::get().balance_batch_phase("refill", refill_secs);
+                back.clone(),
+            )
+        };
+        if window.due(Instant::now(), WINDOW_MAX_AGE) {
+            let (keys, secs) = refill(&back).await??;
+            refill_secs = secs;
             // The age counts from the end of the walk: counted from its start, a walk and
             // one slow batch would use up the age and every batch would refill again.
             window.set(keys, Instant::now());
@@ -2394,8 +2417,19 @@ async fn reconcile_loop(
                 _ = tokio::time::sleep(IDLE) => continue,
             }
         }
+        // The window is used up (or will be too old) after this batch: walk the table for the
+        // next one while this batch reads. The new window leaves out this batch's keys (with a
+        // window of one batch it would be that batch again: refilled after it, as before).
+        let next = (o.caps.refill_window_batches > 1
+            && (window.left() == 0
+                || window.due(
+                    Instant::now() + Duration::from_secs_f64(batch_secs),
+                    WINDOW_MAX_AGE,
+                )))
+        .then(|| refill(&back));
         let t0 = Instant::now();
         let st = reconcile_batch_with(&ctx, &local, Some(pool), &batch, &o.caps).await?;
+        batch_secs = secs_since(t0);
         let k = st.ok + st.absent + st.skipped + st.failures + st.dropped;
         done += k;
         let r = k as f64 / t0.elapsed().as_secs_f64().max(1e-3);
@@ -2419,6 +2453,11 @@ async fn reconcile_loop(
         after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
         kdx_metrics::get().balance_batch_phase("after", secs_since(t));
         note_remarked(&mut back, &batch, &st);
+        if let Some(next) = next {
+            let (keys, secs) = next.await??;
+            refill_secs = secs;
+            window.set_without(keys, Instant::now(), &batch);
+        }
         let alert = watch.note(Instant::now(), &st);
         if let Some(n) = alert.no_hash {
             tracing::warn!(

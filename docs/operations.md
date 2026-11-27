@@ -861,8 +861,13 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
   keys for this many batches at once. Each batch of the window keeps its own write
   transaction, bookkeeping and backoff, and clears only the exact mark it read, so a key the
   tail marks again meanwhile is read again later. The window is taken again once used up or
-  5 s old, so a fresh tip mark waits at most about 5 s; the tip share leads every window. 1
-  walks the table before every batch (the behaviour before windows). The INFO line
+  5 s old (counted from the end of its walk), so a fresh tip mark waits at most about 5 s
+  plus a batch; the tip share leads every window. The next window's walk runs while the
+  window's last batch reads, and leaves that batch's keys out. 1 walks the table before every
+  batch (the behaviour before windows). Batched `details` calls go to the `local_urls` nodes
+  other than `node.url` while one is up: `node.url`'s `local_rps` is the budget of the reads
+  only it decides, and one absent key costs one call there, so with about 12% absent keys
+  the drain tops out near `local_rps` / 0.12 keys a second (about 400). The INFO line
   `balances: reconcile` shows `refill_secs` (the last walk) and `window_left`, and its `st`
   carries `phases`, the last batch's seconds per phase; `kdx_balance_batch_phase_seconds{phase}`
   has them all: `refill`, `prep`, `fungible`, `reads_batched` (until the last chunk's batched
