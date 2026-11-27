@@ -16,6 +16,9 @@ pub struct HotDict {
     mem: MemDict,
     /// Names interned since the last `persist`, in id order per kind.
     pending: Vec<(DictKind, u32)>,
+    /// Set when a reload after a failed write txn failed (F-52): the ids handed out since may
+    /// not be in `DictRev`, so `persist` refuses and no later write txn can commit them.
+    poisoned: bool,
 }
 
 impl HotDict {
@@ -38,6 +41,7 @@ impl HotDict {
         Ok(HotDict {
             mem: MemDict::from(m),
             pending: Vec::new(),
+            poisoned: false,
         })
     }
 
@@ -58,13 +62,30 @@ impl HotDict {
         &self.mem
     }
 
+    /// Mark the dictionary unusable for writes: its reload after a failed write txn failed
+    /// (F-52), so `persist` refuses from now on.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Whether [`HotDict::poison`] was called.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Write the queued names (forward and reverse rows) in `txn`.
     ///
     /// Clears the queue inside the open txn. Contract (F-52): when that txn then aborts or
     /// fails to commit, the caller must reload the dictionary from MDBX
     /// (`kdx_ingest::Ctx::reload_dict`) and stop on a failed reload, because the drained
     /// names' ids are no longer queued and never reached `DictRev`.
+    ///
+    /// Refuses once [`HotDict::poison`]ed.
     pub fn persist(&mut self, txn: &mut RwTxn<'_>) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "the dictionary is poisoned: its reload after a failed write txn failed (F-52)"
+        );
         for &(k, id) in &self.pending {
             let name = self.mem.name(k, id).expect("pending id was interned");
             let idb = id.to_be_bytes();

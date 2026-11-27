@@ -544,7 +544,7 @@ async fn main() -> anyhow::Result<()> {
     kdx_hot::nft::set_ledgers(cfg.nft.ledgers.clone());
     kdx_hot::balances::set_marking(cfg.balances.enabled);
     kdx_metrics::init(&cfg.network, env!("CARGO_PKG_VERSION"), env!("KDX_GIT_SHA"));
-    match cli.command {
+    let res = match cli.command {
         Command::Config {
             action: ConfigAction::Check,
         } => {
@@ -856,7 +856,10 @@ async fn main() -> anyhow::Result<()> {
             records_b,
             out,
         }),
-    }
+    };
+    // F-52: a writer that stopped after a failed dictionary reload (run, backfill, rebuild,
+    // reconcile-balances) makes the command fail, never end "ok" with exit 0.
+    kdx_ingest::ctx::fail_on_reload_failure(res, kdx_ingest::ctx::reload_failure())
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
