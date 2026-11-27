@@ -330,10 +330,9 @@ impl Subscription {
             Some(c) => vec![chain_arg(&c)?],
             None => chain_set(None)?,
         };
-        let params = parameters_filter
-            .as_deref()
-            .map(ParamFilter::parse)
-            .transpose()?;
+        // Stock ignores the argument; a form we cannot serve is ignored too (no flags ride
+        // on subscription events).
+        let params = parameters_filter.as_deref().and_then(ParamFilter::parse);
         let depth = depth_arg("minimumDepth", minimum_depth)?;
         // At most the walker's price per message: the default page (I-1).
         let per_msg = {

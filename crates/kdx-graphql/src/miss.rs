@@ -147,10 +147,24 @@ impl Default for MissSettings {
     }
 }
 
-/// One request's read budget, shared by its fields, aliases and batch operations.
-#[derive(Debug, Clone, Default)]
+/// One request's read budget, shared by its fields, aliases and batch operations, and its
+/// memo of the reads it started (PR #65 I-1). A key that one field of the request has already
+/// asked, granted or refused, is never charged again: every later field joins that answer, so
+/// a page of blocks by one miner makes one charge and gives every block the same row. The memo
+/// holds at most one entry per key the request asked, bounded by the request's own fields.
+#[derive(Clone, Default)]
 pub struct MissBudget {
     used: Arc<AtomicUsize>,
+    memo: Arc<Mutex<HashMap<Key, Call>>>,
+}
+
+impl std::fmt::Debug for MissBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MissBudget")
+            .field("used", &self.used())
+            .field("memo", &self.memo().len())
+            .finish()
+    }
 }
 
 impl MissBudget {
@@ -158,6 +172,10 @@ impl MissBudget {
     #[doc(hidden)]
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
+    }
+
+    fn memo(&self) -> MutexGuard<'_, HashMap<Key, Call>> {
+        self.memo.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -586,53 +604,63 @@ impl MissReader {
                 }
             }
         }
-        if todo.is_empty() {
-            out.found.sort_by_key(|(c, _, _)| *c);
-            return out;
+        let key = |c: u8| (account.to_owned(), module.to_owned(), c);
+        let memo = ctx.data_opt::<MissBudget>();
+        // Keys another field of this request already asked: join that answer, uncharged.
+        let mut calls: Vec<(u8, Call, bool)> = Vec::new();
+        if let Some(b) = memo {
+            let m = b.memo();
+            todo.retain(|&c| match m.get(&key(c)) {
+                Some(call) => {
+                    calls.push((c, call.clone(), false));
+                    false
+                }
+                None => true,
+            });
         }
-        // The client's own limit first, so a refused client spends none of the request
-        // budget; it is charged only what the budget can still grant.
-        let want = todo.len().min(self.budget_left(ctx));
-        if want > 0 {
-            if let Some(rate) = &self.rate {
-                let allowed = match crate::client_ip(ctx) {
-                    // No peer address: no shared fallback bucket.
-                    None => false,
-                    Some(ip) => rate.allow_n(ip, u32::try_from(want).unwrap_or(u32::MAX)),
-                };
-                if !allowed {
-                    out.incomplete = true;
-                    kdx_metrics::get().graphql_rejected("account_miss_rate");
-                    out.found.sort_by_key(|(c, _, _)| *c);
-                    return out;
+        if !todo.is_empty() {
+            let refused = self.charge(ctx, &mut todo);
+            if !refused.is_empty() {
+                out.incomplete = true;
+            }
+            let deadline = (Instant::now() + self.core.settings.timeout).min(crate::deadline(ctx));
+            let mut m = memo.map(MissBudget::memo);
+            for c in todo {
+                let call = self.request_call(key(c), deadline);
+                if let Some(m) = m.as_mut() {
+                    m.insert(key(c), call.clone());
+                }
+                calls.push((c, call, true));
+            }
+            // A refused key is remembered as refused, so every field of the request that asks
+            // it answers alike (unanswered), and none is charged again.
+            if let Some(m) = m.as_mut() {
+                for c in refused {
+                    let busy: Call = futures::future::ready(Err(ReadErr::Busy)).boxed().shared();
+                    m.insert(key(c), busy);
                 }
             }
         }
-        let granted = self.budget(ctx, todo.len());
-        if granted < todo.len() {
-            out.incomplete = true;
-            kdx_metrics::get().graphql_rejected("account_miss_budget");
-        }
-        todo.truncate(granted);
-        let deadline = (Instant::now() + self.core.settings.timeout).min(crate::deadline(ctx));
-        let reads = todo.into_iter().map(|c| async move {
-            let r = self.one(c, account, module, deadline).await;
-            (c, r)
-        });
-        for (c, r) in futures::future::join_all(reads).await {
+        let reads = calls
+            .into_iter()
+            .map(|(c, call, own)| async move { (c, call.await, own) });
+        for (c, r, own) in futures::future::join_all(reads).await {
             match r {
                 Ok(NodeRow::Found {
                     balance,
                     guard,
                     height,
                 }) => {
-                    if let Some(sink) = &self.sink {
-                        sink(FoundRow {
-                            account: account.to_owned(),
-                            module: module.to_owned(),
-                            chain: c,
-                            height: u32::try_from(height).unwrap_or(u32::MAX),
-                        });
+                    // Fed back once, by the field that started the read.
+                    if own {
+                        if let Some(sink) = &self.sink {
+                            sink(FoundRow {
+                                account: account.to_owned(),
+                                module: module.to_owned(),
+                                chain: c,
+                                height: u32::try_from(height).unwrap_or(u32::MAX),
+                            });
+                        }
                     }
                     out.found.push((c, balance, guard));
                 }
@@ -644,19 +672,48 @@ impl MissReader {
         out
     }
 
-    /// One read before `deadline`: join the key's call in flight, or start one.
-    async fn one(
-        &self,
-        chain: u8,
-        account: &str,
-        module: &str,
-        deadline: Instant,
-    ) -> Result<NodeRow, ReadErr> {
-        let call = self.flight((account.to_owned(), module.to_owned(), chain), deadline)?;
-        let left = deadline.saturating_duration_since(Instant::now());
-        tokio::time::timeout(left, call)
-            .await
-            .unwrap_or(Err(ReadErr::Timeout))
+    /// Charge the client's limit and the request budget for `todo`, keeping in `todo` only
+    /// the chains granted; the chains refused are returned.
+    fn charge(&self, ctx: &Context<'_>, todo: &mut Vec<u8>) -> Vec<u8> {
+        // The client's own limit first, so a refused client spends none of the request
+        // budget; it is charged only what the budget can still grant.
+        let want = todo.len().min(self.budget_left(ctx));
+        if want > 0 {
+            if let Some(rate) = &self.rate {
+                let allowed = match crate::client_ip(ctx) {
+                    // No peer address: no shared fallback bucket.
+                    None => false,
+                    Some(ip) => rate.allow_n(ip, u32::try_from(want).unwrap_or(u32::MAX)),
+                };
+                if !allowed {
+                    kdx_metrics::get().graphql_rejected("account_miss_rate");
+                    return std::mem::take(todo);
+                }
+            }
+        }
+        let granted = self.budget(ctx, todo.len());
+        if granted < todo.len() {
+            kdx_metrics::get().graphql_rejected("account_miss_budget");
+        }
+        todo.split_off(granted)
+    }
+
+    /// One read before `deadline`, shareable by every field of the request: join the key's
+    /// call in flight, or start one. A refusal is a ready error.
+    fn request_call(&self, key: Key, deadline: Instant) -> Call {
+        match self.flight(key, deadline) {
+            Err(e) => futures::future::ready(Err(e)).boxed().shared(),
+            Ok(call) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                async move {
+                    tokio::time::timeout(left, call)
+                        .await
+                        .unwrap_or(Err(ReadErr::Timeout))
+                }
+                .boxed()
+                .shared()
+            }
+        }
     }
 
     /// The key's call in flight, or a new one (a node token taken without waiting).

@@ -826,10 +826,7 @@ pub async fn query_events(
     if qual.is_none() && module.is_none() {
         return Err(bad_input("events needs qualifiedEventName or moduleName"));
     }
-    let params = parameters_filter
-        .as_deref()
-        .map(ParamFilter::parse)
-        .transpose()?;
+    let params = ParamFilter::arg(ctx, parameters_filter.as_deref());
     // `blockHash` is checked, and filters a `requestKey`'s copies (stock ANDs both; F-30).
     let block = block_hash
         .as_deref()

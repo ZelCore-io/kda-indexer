@@ -86,7 +86,6 @@ Errors carry `extensions.code`:
 | `LIMIT` | a resource limit; `extensions.limit` names it (table below) |
 | `TIMEOUT` | the request deadline passed |
 | `COUNT_TIMEOUT` | `totalCount` could not be counted exactly before the request deadline; the field answers no number (see `totalCount`) |
-| `UNSUPPORTED_FILTER` | an `events` `parametersFilter` form that is not served |
 | `NOT_AVAILABLE` | stored data the field needs is missing: an NFT holding's `guard` or `info` not read yet, a fill or readiness wait, or the node had no usable answer. The rest of the item answers |
 | `INTERNAL` | an internal error (logged, never detailed in the answer) |
 | `INTERNAL_SERVER_ERROR` | the stock indexer's code, kept where ours answers as stock does: the complexity refusal (Limits), and a request refused before any field runs because a variable is missing or its value does not coerce to its type. Such a request answers HTTP 500 with no `data` key, as stock answers it; in a batch the status stays 200. Also `transaction(minimumDepth:)` outside 1..=100, with stock's message (`[ERROR][GRAPHQL][VALID_RANGE] Minimum depth must not be lower than 1.` or `… higher than 100.`), `transaction: null` and HTTP 200 |
@@ -111,8 +110,7 @@ never raises, nulls a non-null field in place (the field answers `null`, the err
 does not bubble. These are the `extensions.code`s `COUNT_TIMEOUT` (a cut `totalCount`), `LIMIT`
 (the `transactionsByPactCode` search slot, page and item caps, DEX budgets), `TIMEOUT` (the
 request deadline, including the DEX one) and `NOT_AVAILABLE` (data still being built: a fill
-or readiness wait), `NOT_SUPPORTED` (a field not served, such as `Block.minerAccount`, or a
-search left off) and `UNSUPPORTED_FILTER` (an `events` filter form not served), plus the `pactQuery`/`gasLimitEstimate` caps, which carry stock's
+or readiness wait) and `NOT_SUPPORTED` (a search left off), plus the `pactQuery`/`gasLimitEstimate` caps, which carry stock's
 `INTERNAL_SERVER_ERROR` code and name the cap in `extensions.limit` (`pact_items`,
 `pact_rate`, `pact_busy`). A strict client sees `null` in a non-null slot for these; blanking
 the whole page would lose the fields that did answer. Every other error, async-graphql's own
@@ -330,8 +328,19 @@ number open.
   `flags` are `Decimal`s sent as strings (the oracle's form); `epoch` and `creationTime` are
   `DateTime`s.
 - `neighbors` lists the adjacent blocks ascending by chain id. `parent` is `null` for a
-  genesis block. `minerAccount` is the miner's current `coin` row on the block's chain; a
-  miner without a row is a field error.
+  genesis block. `minerAccount` answers as stock: stock reads `(coin.details "<miner>")` from the
+  node for every block and answers balance 0 with a `RawGuard` (`raw: "null"`, keys `[]`,
+  predicate `""`) when the read fails for any reason (no row on the chain, a name that is no
+  account, a timeout). Ours serves the stored row (any balance); with none, one node read of
+  that chain through the account-miss reader (its budgets, rate limits and cache); with no
+  row found or the read refused or failed, stock's zero row (`nodeReadIncomplete` when the
+  read failed or was refused, and when no read can be made: node reads off, or a module the
+  store does not serve). One request asks each `(miner, chain)` once: every block of the
+  same miner on the same chain in a page joins that one read and is charged once against
+  the request budget and the client's rate, so a page answers one row per miner and chain.
+  The stored row can lag the node by the reconciler's delay. Never a field error, except
+  for a block whose minerData carries no account string (`NOT_SUPPORTED`; stock's schema
+  check fails there too).
 - `blocksFromHeight` with `startHeight` above `endHeight` is an empty list (stock errors).
 - Block lists are ordered by height, then chain ascending: `blocksFromHeight` ascending by
   height, as the oracle lists it (R-P5P9-57 M2a); `blocksFromDepth` and
@@ -567,9 +576,24 @@ the oracle puts them.
   fields, past which a lookup answers `null`. Anyone can post failed `cont` txs naming a
   pending pact (it costs only gas): more than 1,000 of them before the one that succeeds make
   the outgoing link `null` here where stock links it. Griefing only, bounded, not fixed.
-- **`events`**: `qualifiedEventName` is required. `parametersFilter` accepts only
-  `{"array_starts_with": <value or array>}` (the event's first parameters equal the value or
-  the array's values); anything else is `UNSUPPORTED_FILTER`. When the first value is a
+- **`events`**: `qualifiedEventName` is required. Stock documents `parametersFilter` as a
+  Prisma JSON filter but never reads it: every value, malformed included, answers the
+  unfiltered events. Ours serves the Prisma JSON filter forms on the parameters array, ANDed
+  when one object has several keys: `array_starts_with` and `array_ends_with` (a value or an
+  array of values in order: our reading of an array operand is a prefix or suffix of that
+  many elements; Prisma may compare it with the first or last element as a nested array,
+  unverified), `array_contains` (a value, or an array whose every value is a
+  member; members compare by equality), `equals` and `not` (the whole value), the string
+  forms `string_contains`, `string_starts_with` and `string_ends_with` (a JSON string only:
+  a number at the path never matches, where Prisma's text extraction would match its
+  digits), `mode` (`"insensitive"` makes `equals` on a string and the `string_*` forms
+  compare Unicode-lowercased; `not` and the `array_*` forms stay exact), and `path` (keys or
+  indexes, `["0"]` is the first parameter) that the other keys apply to. Each is a row
+  predicate, so a filtered list costs what the unfiltered list costs. Any other value (an
+  unknown key such as `gt`, `gte`, `lt` or `lte`, a `mode` other than `"insensitive"` or `"default"`, a wrong shape, text that is not JSON, over 8 KB) is ignored as
+  stock ignores it: the unfiltered events, with `extensions.parametersFilterIgnored: true`.
+  The `events` subscription takes the same forms (ignored ones without the flag). When
+  `array_starts_with` (or `equals` on `path: ["0"]`) fixes the first value to a
   string, the account's `acct` postings are walked (fast) only if they hold every match: the
   string is a Pact principal (posted wherever it appears), or the event is named `TRANSFER`
   (a non-principal name is posted as a transfer side). Otherwise the event name's postings
@@ -714,8 +738,8 @@ under [Scalars](#scalars), and decimal text under the compat notes of [api.md](a
     predicate `''`). Once the reconciler stores the row it renders resolved, as every stored
     row does (GQ-14). The same row can therefore change shape between two calls, from stock's
     shape to ours. It is rare: it needs a keyset-ref guard on a row no index names.
-  `…ByPublicKey`, `balance(...)` (the holders list), `node(id:)` and `Block.minerAccount`
-  stay store-only: stock's holders list has no such rows. `enabled = false` turns it off.
+  `Block.minerAccount` reads the node on a miss too (one chain, see Blocks).
+  `…ByPublicKey`, `balance(...)` (the holders list) and `node(id:)` stay store-only: stock's holders list has no such rows. `enabled = false` turns it off.
   `fungibleChainAccounts` with `chainIds` absent (also a declared variable sent without a
   value) or `[]` lists every chain's row, and answers `[]`, not `null`, when there is none;
   with `chainIds` set the rows come in the order asked (each chain once), as stock lists them;

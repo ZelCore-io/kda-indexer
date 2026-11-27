@@ -141,24 +141,24 @@ impl Block {
             )
         })
     }
-    /// The miner's `coin` account on this chain (its current reconciled row).
+    /// The miner's `coin` account on this chain, as stock answers it: the current row (stored,
+    /// else one node read on the miss), or balance 0 with a `raw: "null"` guard when the chain
+    /// has none ([`super::account::miner_chain_account`]). A block whose minerData carries no
+    /// account string has no miner to name (stock fails its schema check there too).
     async fn miner_account(&self, ctx: &Context<'_>) -> Result<FungibleChainAccount> {
-        let b = self.b.clone();
-        gql(ctx)
+        let (m, chain) = (self.b.miner_account, self.b.chain);
+        let name = gql(ctx)
             .state()?
-            .read(move |view| {
-                let d = view.dict();
-                let name = d
-                    .name(DictKind::Account, b.miner_account)
-                    .map(|n| n.to_string());
-                match name {
-                    Some(a) => super::account::chain_account_in(view, &a, b.chain, "coin"),
-                    None => Ok(None),
-                }
-            })
+            .read(move |view| Ok(view.dict().name(DictKind::Account, m).map(str::to_owned)))
             .await
             .map_err(from_api)?
-            .ok_or_else(|| err(Code::NotSupported, "the miner account has no balance row"))
+            .ok_or_else(|| {
+                err(
+                    Code::NotSupported,
+                    "this block's minerData names no account",
+                )
+            })?;
+        super::account::miner_chain_account(ctx, name, chain, "coin").await
     }
     /// Adjacent blocks, ascending by chain id.
     async fn neighbors(&self) -> Vec<BlockNeighbor> {
