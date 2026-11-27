@@ -105,8 +105,13 @@ pub const NOT_FUNGIBLE_AFTER: u32 = 3;
 /// Seed rows read per refill, per batch slot.
 const SEED_WINDOW: usize = 16;
 /// Percent of each batch [`refill`] reserves for the newest tail marks per chain (PR #66
-/// review I1).
+/// review I1). A refill window keeps it per batch ([`RefillWindow::next_batch`]).
 const TIP_SHARE_PCT: usize = 25;
+
+/// The tip share of a batch of `n` keys: [`TIP_SHARE_PCT`] of `n`.
+fn tip_share(n: usize) -> usize {
+    n * TIP_SHARE_PCT / 100
+}
 /// `BalanceDirty` rows per read txn during a refill.
 const SCAN_CHUNK: usize = 100_000;
 const IDLE: Duration = Duration::from_secs(2);
@@ -388,9 +393,20 @@ pub fn refill_with(
     share: usize,
     back: &HashMap<[u8; 9], Mark>,
 ) -> Result<Vec<Dirty>> {
+    refill_tip(hot, n, share, tip_share(n), back)
+}
+
+/// [`refill_with`] with a tip share of `tip_n` keys (at most `n`).
+fn refill_tip(
+    hot: &HotStore,
+    n: usize,
+    share: usize,
+    tip_n: usize,
+    back: &HashMap<[u8; 9], Mark>,
+) -> Result<Vec<Dirty>> {
     let share = share.max(1);
     let coin = balances::coin_module(&hot.ro()?)?;
-    let tip_n = n * TIP_SHARE_PCT / 100;
+    let tip_n = tip_n.min(n);
     let mut coin_rows = Heap::new();
     let mut by_module: HashMap<u32, Heap> = HashMap::new();
     let mut tip_coin: TipHeaps = BTreeMap::new();
@@ -508,10 +524,11 @@ pub const MAX_REFILL_WINDOW: usize = 32;
 /// reads it.
 pub const WINDOW_MAX_AGE: Duration = Duration::from_secs(5);
 
-/// The refill of `k` batches at once: [`refill_with`] for `k × n` keys and `k × share` per
-/// module. One refill walks all of `BalanceDirty` whatever `n` is, so a window spreads that
-/// walk over `k` batches. Its order is [`refill_with`]'s: the tip share first, then the old
-/// backlog, the seed backlog last.
+/// The refill of `k` batches at once: [`refill_with`] for `k × n` keys, `k × share` per
+/// module and `k` batches' tip shares. One refill walks all of `BalanceDirty` whatever `n`
+/// is, so a window spreads that walk over `k` batches. Its order is [`refill_with`]'s: the tip
+/// share first, then the old backlog, the seed backlog last; [`RefillWindow`] hands each
+/// batch one tip share and the rest from the backlog.
 pub fn refill_window(
     hot: &HotStore,
     n: usize,
@@ -520,22 +537,28 @@ pub fn refill_window(
     back: &HashMap<[u8; 9], Mark>,
 ) -> Result<Vec<Dirty>> {
     let k = k.clamp(1, MAX_REFILL_WINDOW);
-    refill_with(
+    refill_tip(
         hot,
         n.saturating_mul(k),
         share.max(1).saturating_mul(k),
+        tip_share(n).saturating_mul(k),
         back,
     )
 }
 
-/// The keys of one refill window ([`refill_window`]), handed out a batch at a time. Every
-/// key keeps the exact mark read at refill, so compare-and-clear still deletes only that
-/// mark: a key the tail marks again while the window is in use keeps its new mark and is read
-/// again later. The window is due for a refill once it is used up or [`WINDOW_MAX_AGE`] old.
+/// The keys of one refill window ([`refill_window`]), handed out a batch at a time: the tip
+/// share keys and the rest in two queues, so every batch takes at most its own tip share
+/// ([`TIP_SHARE_PCT`] of the batch) and fills up from the rest, oldest first (PR #70 handed
+/// out the window's whole tip share first: batches of tip keys only). Every key keeps the
+/// exact mark read at refill, so compare-and-clear still deletes only that mark: a key the
+/// tail marks again while the window is in use keeps its new mark and is read again later.
+/// The window is due for a refill once it is used up or [`WINDOW_MAX_AGE`] old.
 #[derive(Debug, Default)]
 pub struct RefillWindow {
-    keys: Vec<Dirty>,
-    pos: usize,
+    tip: Vec<Dirty>,
+    tip_pos: usize,
+    rest: Vec<Dirty>,
+    rest_pos: usize,
     taken: Option<Instant>,
 }
 
@@ -543,7 +566,7 @@ impl RefillWindow {
     /// Whether to refill before the next batch: no keys left, or the marks were read
     /// `max_age` or longer before `now`.
     pub fn due(&self, now: Instant, max_age: Duration) -> bool {
-        self.pos >= self.keys.len()
+        self.left() == 0
             || self
                 .taken
                 .is_none_or(|t| now.saturating_duration_since(t) >= max_age)
@@ -551,8 +574,9 @@ impl RefillWindow {
 
     /// A new window: `keys` as refilled, its age counted from `at` (the end of the refill).
     pub fn set(&mut self, keys: Vec<Dirty>, at: Instant) {
-        self.keys = keys;
-        self.pos = 0;
+        (self.tip, self.rest) = keys.into_iter().partition(|d| d.tip);
+        self.tip_pos = 0;
+        self.rest_pos = 0;
         self.taken = Some(at);
     }
 
@@ -564,17 +588,30 @@ impl RefillWindow {
         self.set(keys, at);
     }
 
-    /// The next batch: up to `n` keys, in the window's order.
+    /// The next batch: up to `n` keys. At most the tip share of `n` tip keys first, then the
+    /// rest in the window's order; when the rest runs out, more tip keys fill the batch, but
+    /// those surplus keys are marked `tip: false` (like a per-batch refill's: they go through
+    /// [`ReadPool::pick_batch`], not the primary).
     pub fn next_batch(&mut self, n: usize) -> Vec<Dirty> {
-        let end = self.pos.saturating_add(n.max(1)).min(self.keys.len());
-        let out = self.keys[self.pos..end].to_vec();
-        self.pos = end;
+        let n = n.max(1);
+        let tip_left = self.tip.len() - self.tip_pos;
+        let rest_left = self.rest.len() - self.rest_pos;
+        let rest = rest_left.min(n - tip_share(n).min(tip_left));
+        let tip = tip_left.min(n - rest);
+        let mut out = Vec::with_capacity(tip + rest);
+        out.extend_from_slice(&self.tip[self.tip_pos..self.tip_pos + tip]);
+        for d in out.iter_mut().skip(tip_share(n)) {
+            d.tip = false;
+        }
+        out.extend_from_slice(&self.rest[self.rest_pos..self.rest_pos + rest]);
+        self.tip_pos += tip;
+        self.rest_pos += rest;
         out
     }
 
     /// Keys not handed out yet.
     pub fn left(&self) -> usize {
-        self.keys.len() - self.pos
+        (self.tip.len() - self.tip_pos) + (self.rest.len() - self.rest_pos)
     }
 
     /// Drop the window (a seed pass rewrote the marks): the next batch refills.
