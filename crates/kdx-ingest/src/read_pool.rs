@@ -2,8 +2,9 @@
 //! several chainweb nodes, each with its own `/local` rate and concurrency caps
 //! (`balances.local_rps` ≤ `MAX_LOCAL_RPS` per node, `balances.local_concurrency`), with
 //! health and failover: a node is skipped for [`COOLDOWN`] when it gives a transport or HTTP
-//! error, a Pact failure (it is not the primary), or answers from a tip more than
-//! [`LAG_BLOCKS`] below or above our tail.
+//! error, answers from a tip more than [`LAG_BLOCKS`] below or above our tail, or (not the
+//! primary) does not know a module the primary knows, answers from another branch or names no
+//! block hash. A Pact failure alone skips no node (it may be the contract's own).
 //!
 //! Trust: every read node is trusted for state exactly like `node.url`. The reconciler's
 //! branch check (`branch_of`) binds only the block an answer *claims* (its height and
@@ -135,6 +136,11 @@ impl ReadPool {
             .find(|&i| self.nodes[i].client.free_slots() > 0)
             .or_else(|| up.next())
             .or_else(|| self.pick(tried))
+    }
+
+    /// Whether node `i` is up (not skipped).
+    pub fn is_up(&self, i: usize) -> bool {
+        self.nodes[i].is_up(Instant::now())
     }
 
     /// Skip node `i` for [`COOLDOWN`].
