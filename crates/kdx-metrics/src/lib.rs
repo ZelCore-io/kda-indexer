@@ -91,7 +91,7 @@ pub struct Metrics {
     /// Duration of one `/local` reconcile call (`result` as above).
     pub balance_reconcile_seconds: Hist,
     /// Balance `/local` reads per read node (`node` = n0, n1, … in `balances.local_urls`
-    /// order; `result` = ok | absent | error | invalid | node_error | lagging).
+    /// order; `result` = ok | absent | error | invalid | node_error | lagging | ahead).
     pub balance_local_node_calls: Count,
     /// Balance keys answered per read node (`node`); its rate is the node's rows/s.
     pub balance_local_node_keys: Count,
@@ -375,7 +375,7 @@ impl Metrics {
         );
         let balance_local_node_calls = reg!(
             "kdx_balance_local_node_calls",
-            "Balance /local reads per read node (node, result ok|absent|error|invalid|node_error|lagging)",
+            "Balance /local reads per read node (node, result ok|absent|error|invalid|node_error|lagging|ahead)",
             Count::default()
         );
         let balance_local_node_keys = reg!(

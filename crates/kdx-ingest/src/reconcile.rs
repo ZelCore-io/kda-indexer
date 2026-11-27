@@ -82,7 +82,9 @@ use kdx_hot::balances::{
 };
 use kdx_hot::tables::block_key;
 use kdx_hot::{checkpoint, HotStore, RwTxn, Stage, Table, Txn};
-use kdx_node::local::{Details, Local, LocalClient, LocalError, LocalOpts, LocalResult};
+use kdx_node::local::{
+    BatchEntry, Details, Local, LocalClient, LocalError, LocalOpts, LocalResult,
+};
 use kdx_node::{NodeClient, NodeError};
 use kdx_types::record::decode_block;
 use kdx_types::{DictKind, Hash32};
@@ -499,6 +501,7 @@ struct Item {
 }
 
 /// A `details` success.
+#[derive(Clone)]
 struct Answer {
     details: Details,
     /// The tip height the node read.
@@ -509,6 +512,7 @@ struct Answer {
     resolved: Option<(String, Option<Value>)>,
 }
 
+#[derive(Clone)]
 enum Outcome {
     Found(Box<Answer>),
     Absent(u32),
@@ -644,6 +648,12 @@ fn lagging(height: u64, tail: u32) -> bool {
     height.saturating_add(u64::from(LAG_BLOCKS)) < u64::from(tail)
 }
 
+/// The answer was read more than [`LAG_BLOCKS`] above our tail on its chain: we hold no header
+/// there yet, so it cannot be branch-checked (`Branch::Unknown`).
+fn ahead(height: u64, tail: u32) -> bool {
+    height > u64::from(tail).saturating_add(u64::from(LAG_BLOCKS))
+}
+
 /// The result label of one read-node call, for its metrics.
 fn node_label<T>(r: &LocalResult<T>) -> &'static str {
     match r {
@@ -655,10 +665,26 @@ fn node_label<T>(r: &LocalResult<T>) -> &'static str {
     }
 }
 
-/// Send one read through the pool with failover: a node error or a lagging answer marks the
-/// node down and the read goes to the next node; once every node was tried, the last lagging
-/// answer (still exact, only old) or the last node error stands. Returns the result, the
-/// seconds of the call that stands and the index of the node that answered.
+/// Whether an answer from node `primary` (true: `node.url`) decides the key here. `Absent`
+/// carries no block identity, and a Pact failure or an unusable answer from another node may
+/// be that node's own lag (a module it does not know yet): those are asked of the primary,
+/// and never drop a mark or count toward the not-fungible verdict (PR #67 review I2).
+fn decided_by<T>(r: &LocalResult<T>, primary: bool) -> bool {
+    primary
+        || !matches!(
+            r,
+            Ok(Local::Absent) | Err(LocalError::Failure(_) | LocalError::Invalid(_))
+        )
+}
+
+/// Send one read through the pool with failover: a node error, or an answer more than
+/// [`LAG_BLOCKS`] below our tail, marks the node down and the read goes to the next node;
+/// once every node was tried, the last lagging answer (still exact, only old) or the last node
+/// error stands. An answer more than [`LAG_BLOCKS`] above our tail, or a Pact failure from a
+/// node other than the primary, marks that node down too and is returned at once (the
+/// failure is then asked of the primary, [`decided_by`]).
+/// Returns the result, the seconds of the call that stands and the index of the node that
+/// answered.
 async fn pooled<T, F, Fut>(
     pool: &ReadPool,
     tail: u32,
@@ -691,6 +717,20 @@ where
                 pool.mark_down(i, "lagging");
                 last = Some((r, secs, i));
             }
+            Ok(Local::Found { height, .. }) if ahead(*height, tail) => {
+                // Not tried elsewhere: while our tail catches up every node is ahead, and the
+                // answer (unchecked, stored unverified and read again) costs one call, not N.
+                m.balance_local_node(&node.label, "ahead", 0);
+                pool.mark_down(i, "ahead");
+                return (r, secs, i);
+            }
+            Err(LocalError::Failure(_)) if !node.primary => {
+                // A secondary that cannot resolve a module the primary knows (it lags) is
+                // skipped for a while; the key is read again on the primary.
+                m.balance_local_node(&node.label, "error", 0);
+                pool.mark_down(i, "pact failure");
+                return (r, secs, i);
+            }
             _ => {
                 let answered = match &r {
                     Ok(Local::Found { .. }) => keys,
@@ -712,127 +752,140 @@ where
     })
 }
 
-/// One key read on its own through the pool. An `Absent` answer carries no block identity
-/// (the node sends no `metaData`), so one from a node other than the primary is asked again
-/// of the primary (`local`, `node.url`): absent rows are exactly as the single-node reconciler
-/// writes them.
+/// One key read on its own on the primary (`local`, `node.url`).
+async fn read_primary(local: &LocalClient, it: &Item) -> Outcome {
+    let (Some(acct), Some(module)) = (&it.account_name, &it.module_name) else {
+        return Outcome::Skipped;
+    };
+    let (r, secs) = local.details_timed(it.chain, module, acct).await;
+    let out = outcome_of(local, it, r).await;
+    kdx_metrics::get().balance_reconcile(out.label(), secs);
+    out
+}
+
+/// One key read on its own through the pool. What a node other than the primary cannot
+/// decide ([`decided_by`]: `Absent`, a Pact failure, an unusable answer) is asked again of
+/// the primary (`local`, `node.url`): absent rows, dropped marks and the not-fungible verdict
+/// are exactly the single-node reconciler's.
 async fn read_single(local: &LocalClient, pool: &ReadPool, it: &Item) -> Outcome {
     let (Some(acct), Some(module)) = (&it.account_name, &it.module_name) else {
         return Outcome::Skipped;
     };
-    let (mut r, mut secs, i) = pooled(pool, it.tail, 1, |c| async move {
+    let (r, secs, i) = pooled(pool, it.tail, 1, |c| async move {
         c.details_timed(it.chain, module, acct).await
     })
     .await;
-    if matches!(r, Ok(Local::Absent)) && !pool.node(i).primary {
-        (r, secs) = local.details_timed(it.chain, module, acct).await;
+    if !decided_by(&r, pool.node(i).primary) {
+        return read_primary(local, it).await;
     }
     let out = outcome_of(local, it, r).await;
     kdx_metrics::get().balance_reconcile(out.label(), secs);
     out
 }
 
-type Chunk<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(usize, Outcome)>> + Send + 'a>>;
+/// One outcome for every item of `idx` (the same key, listed more than once in a batch).
+fn fan(idx: &[usize], o: Outcome) -> Vec<(usize, Outcome)> {
+    idx.iter().map(|&k| (k, o.clone())).collect()
+}
 
-/// Read the keys `idx` of `items` (one chain, one module) in one batched `details` call. An
-/// answer gives every key the same block (height and hash), checked per key like a single
-/// answer. When some key has no row the node fails the call without naming it: the keys are
-/// split in halves and each half read again (down to single reads, which tell `Absent` from a
-/// failure exactly as before). Any other failure, an unusable answer or a refused call reads
-/// the keys one by one; an unusable entry reads that key alone.
-fn read_chunk<'a>(
-    local: &'a LocalClient,
-    pool: &'a ReadPool,
-    items: &'a [Item],
-    idx: Vec<usize>,
-) -> Chunk<'a> {
-    Box::pin(async move {
-        if idx.len() == 1 {
-            return vec![(idx[0], read_single(local, pool, &items[idx[0]]).await)];
-        }
-        let first = &items[idx[0]];
-        let module = first.module_name.as_deref().unwrap_or("");
-        let accts: Vec<&str> = idx
-            .iter()
-            .map(|&k| items[k].account_name.as_deref().unwrap_or(""))
-            .collect();
-        let n = idx.len() as u64;
-        let (r, secs, _) = pooled(pool, first.tail, n, |c| {
-            let accts = accts.clone();
-            async move { c.details_many(first.chain, module, &accts).await }
-        })
-        .await;
-        let singles = |keys: Vec<usize>| {
-            join_all(
-                keys.into_iter()
-                    .map(|k| async move { (k, read_single(local, pool, &items[k]).await) }),
-            )
-        };
-        match r {
-            Ok(Local::Found {
-                value,
-                height,
-                prev_hash,
-            }) => {
-                let mut again = Vec::new();
-                let mut ok = Vec::new();
-                for (&k, e) in idx.iter().zip(value) {
-                    match e {
-                        Ok(d) => ok.push((k, d)),
-                        Err(why) => {
-                            tracing::debug!(
-                                chain = first.chain,
-                                module,
-                                why,
-                                "details batch entry unusable; read alone"
-                            );
-                            again.push(k);
-                        }
+/// Read the keys of `keys` (one chain, one module; each entry the item indexes of one key,
+/// so a key is asked once) in one batched `details` call ([`LocalClient::details_many`], the
+/// `try` form). An answer gives every key the same block (height and hash), checked per key
+/// like a single answer. A present entry counts only when it names the key asked and parses;
+/// any other entry is read alone through the pool. A `try` marker is never taken as absent,
+/// for any module: that key is read alone on the primary, and that read decides, as before.
+/// A failed call, an unusable answer or a refused call reads the keys one by one.
+async fn read_chunk(
+    local: &LocalClient,
+    pool: &ReadPool,
+    items: &[Item],
+    keys: Vec<Vec<usize>>,
+) -> Vec<(usize, Outcome)> {
+    if keys.len() == 1 {
+        let o = read_single(local, pool, &items[keys[0][0]]).await;
+        return fan(&keys[0], o);
+    }
+    let first = &items[keys[0][0]];
+    let module = first.module_name.as_deref().unwrap_or("");
+    let accts: Vec<&str> = keys
+        .iter()
+        .map(|k| items[k[0]].account_name.as_deref().unwrap_or(""))
+        .collect();
+    let n = keys.len() as u64;
+    let (r, secs, _) = pooled(pool, first.tail, n, |c| {
+        let accts = accts.clone();
+        async move { c.details_many(first.chain, module, &accts).await }
+    })
+    .await;
+    let singles = |ks: Vec<Vec<usize>>| {
+        join_all(ks.into_iter().map(|k| async move {
+            let o = read_single(local, pool, &items[k[0]]).await;
+            fan(&k, o)
+        }))
+    };
+    match r {
+        Ok(Local::Found {
+            value,
+            height,
+            prev_hash,
+        }) => {
+            let (mut ok, mut again, mut on_primary) = (Vec::new(), Vec::new(), Vec::new());
+            for (k, e) in keys.into_iter().zip(value) {
+                match e {
+                    BatchEntry::Found(d) => ok.push((k, d)),
+                    BatchEntry::Marker => on_primary.push(k),
+                    BatchEntry::Unusable(why) => {
+                        tracing::debug!(
+                            chain = first.chain,
+                            module,
+                            why,
+                            "details batch entry unusable; read alone"
+                        );
+                        again.push(k);
                     }
                 }
-                let prev = prev_hash.as_ref();
-                let mut out: Vec<(usize, Outcome)> =
-                    join_all(ok.into_iter().map(|(k, d)| async move {
-                        let o = found(local, &items[k], d, height, prev.cloned()).await;
-                        kdx_metrics::get().balance_reconcile(o.label(), secs);
-                        (k, o)
-                    }))
-                    .await;
-                out.extend(singles(again).await);
-                out
             }
-            Ok(Local::Absent) => {
-                let mut idx = idx;
-                let back = idx.split_off(idx.len() / 2);
-                let (a, b) = futures::join!(
-                    read_chunk(local, pool, items, idx),
-                    read_chunk(local, pool, items, back)
-                );
-                a.into_iter().chain(b).collect()
-            }
-            Err(LocalError::Node(e)) => {
-                tracing::debug!(error = %e, "details batch: node error on every read node, kept dirty");
-                idx.into_iter()
-                    .map(|k| {
-                        kdx_metrics::get().balance_reconcile("error", secs);
-                        (k, Outcome::NodeError)
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                tracing::debug!(chain = first.chain, module, error = %e, "details batch failed; keys read one by one");
-                singles(idx).await
-            }
+            let prev = prev_hash.as_ref();
+            let (a, b, c) = futures::join!(
+                join_all(ok.into_iter().map(|(k, d)| async move {
+                    let o = found(local, &items[k[0]], d, height, prev.cloned()).await;
+                    kdx_metrics::get().balance_reconcile(o.label(), secs);
+                    fan(&k, o)
+                })),
+                singles(again),
+                join_all(on_primary.into_iter().map(|k| async move {
+                    let o = read_primary(local, &items[k[0]]).await;
+                    fan(&k, o)
+                })),
+            );
+            a.into_iter().chain(b).chain(c).flatten().collect()
         }
-    })
+        Err(LocalError::Node(e)) => {
+            tracing::debug!(error = %e, "details batch: node error on every read node, kept dirty");
+            keys.into_iter()
+                .flatten()
+                .map(|k| {
+                    kdx_metrics::get().balance_reconcile("error", secs);
+                    (k, Outcome::NodeError)
+                })
+                .collect()
+        }
+        other => {
+            if let Err(e) = &other {
+                tracing::debug!(chain = first.chain, module, error = %e, "details batch failed; keys read one by one");
+            }
+            singles(keys).await.into_iter().flatten().collect()
+        }
+    }
 }
 
 /// [`call`] for every item through the read pool: keys of one chain and module go in batched
-/// calls of `pool.batch_keys` ([`read_chunk`]), spread over the pool's nodes.
+/// calls of `pool.batch_keys` distinct keys ([`read_chunk`]), spread over the pool's nodes. A
+/// key listed twice (a tail and a seed mark) is asked once and both items get its outcome.
 async fn call_pooled(local: &LocalClient, pool: &ReadPool, items: &[Item]) -> Vec<Outcome> {
     let mut out: Vec<Option<Outcome>> = (0..items.len()).map(|_| None).collect();
-    let mut groups: BTreeMap<(u8, u32), Vec<usize>> = BTreeMap::new();
+    type Group = (HashMap<u32, usize>, Vec<Vec<usize>>);
+    let mut groups: BTreeMap<(u8, u32), Group> = BTreeMap::new();
     for (k, it) in items.iter().enumerate() {
         if let Some(l) = it.skip {
             kdx_metrics::get().balance_reconcile(l, 0.0);
@@ -840,12 +893,19 @@ async fn call_pooled(local: &LocalClient, pool: &ReadPool, items: &[Item]) -> Ve
         } else if it.account_name.is_none() || it.module_name.is_none() {
             out[k] = Some(Outcome::Skipped);
         } else {
-            groups.entry((it.chain, it.module)).or_default().push(k);
+            let (seen, keys) = groups.entry((it.chain, it.module)).or_default();
+            match seen.get(&it.account) {
+                Some(&p) => keys[p].push(k),
+                None => {
+                    seen.insert(it.account, keys.len());
+                    keys.push(vec![k]);
+                }
+            }
         }
     }
-    let chunks = groups.into_values().flat_map(|g| {
+    let chunks = groups.into_values().flat_map(|(_, g)| {
         g.chunks(pool.batch_keys)
-            .map(<[usize]>::to_vec)
+            .map(<[Vec<usize>]>::to_vec)
             .collect::<Vec<_>>()
     });
     for (k, o) in join_all(chunks.map(|c| read_chunk(local, pool, items, c)))
@@ -958,11 +1018,32 @@ fn admit(txn: &mut RwTxn<'_>, it: &Item, coin: Option<u32>, caps: &Caps) -> Resu
     }
 }
 
-/// Write one answer: row, guard keys (trusted modules only, I-6), holders, row count.
+/// I3 (PR #67 review): whether the row held was read at a later block than `as_of`, on our
+/// branch. A lagging read node (up to [`LAG_BLOCKS`] behind, more as a last resort) can answer
+/// from an older block than an earlier answer; that row is kept and the key is marked again,
+/// so a later read decides. The mark is not cleared by the older answer: after a reorg the
+/// newer row may be from an orphaned block, and only a read at or above its height replaces
+/// it. An unverified row never holds: it may come from another branch or from a node ahead of
+/// our headers, and a checked answer replaces it.
+fn holds_newer(txn: &impl Txn, it: &Item, as_of: u32) -> Result<bool> {
+    Ok(txn
+        .get(Table::Balances, &it.d.key)?
+        .and_then(|v| BalanceRow::decode(&v))
+        .is_some_and(|o| o.as_of > as_of && !o.unverified))
+}
+
+/// Write one answer: row, guard keys (trusted modules only, I-6), holders, row count. Never
+/// over a verified row read at a later block ([`holds_newer`]): that row is kept.
 fn write_row(txn: &mut RwTxn<'_>, it: &Item, new: BalanceRow, coin: Option<u32>) -> Result<()> {
     let old = txn
         .get(Table::Balances, &it.d.key)?
         .and_then(|v| BalanceRow::decode(&v));
+    if old
+        .as_ref()
+        .is_some_and(|o| o.as_of > new.as_of && !o.unverified)
+    {
+        return Ok(());
+    }
     let old_keys = match &old {
         Some(o) if !o.absent => stored_guard_keys(txn, &o.guard, it.chain)?,
         _ => vec![],
@@ -1326,13 +1407,21 @@ pub async fn reconcile_batch_with(
                 } = *a;
                 let branch = branch_of(&txn, it.chain, as_of, prev_hash.as_deref())?;
                 let ours = branch == Branch::Ours;
+                // I3 (PR #67 review): a lagging read node's answer never moves a row back.
+                let newer = holds_newer(&txn, it, as_of)?;
                 // L1 (D2 review): an answer known to come from another branch does not replace
                 // a row we hold: the row (balance, guard, key index) stays and is only flagged
                 // unverified. With no row yet, or when the answer cannot be checked (no hash,
                 // node ahead of our tail), the answer is stored unverified.
                 let keep_old =
                     branch == Branch::Other && txn.get(Table::Balances, &it.d.key)?.is_some();
-                if keep_old {
+                if newer {
+                    tracing::debug!(
+                        chain = it.chain,
+                        as_of,
+                        "details answer older than the row held; row kept"
+                    );
+                } else if keep_old {
                     set_unverified(&mut txn, &it.d.key)?;
                 } else {
                     if d.guard_capped {
@@ -1373,7 +1462,13 @@ pub async fn reconcile_batch_with(
                     };
                     write_row(&mut txn, it, row, coin)?;
                 }
-                if ours {
+                if ours && newer {
+                    // I3: the row held is newer than this answer; a later read decides the
+                    // mark (to the back of the queue, like a node error, no retry count).
+                    let m =
+                        balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    st.remarked.push((it.d.key, m));
+                } else if ours {
                     clear_if_covered(&mut txn, it, as_of)?;
                 } else {
                     // D2: read on another branch (or above our tail). Served `stale`; the key
@@ -1407,8 +1502,15 @@ pub async fn reconcile_batch_with(
                     reconciled_at: now,
                     unverified: false,
                 };
-                write_row(&mut txn, it, row, coin)?;
-                clear_if_covered(&mut txn, it, as_of)?;
+                if holds_newer(&txn, it, as_of)? {
+                    // I3: never over a newer row; a later read decides the mark.
+                    let m =
+                        balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    st.remarked.push((it.d.key, m));
+                } else {
+                    write_row(&mut txn, it, row, coin)?;
+                    clear_if_covered(&mut txn, it, as_of)?;
+                }
                 st.absent += 1;
                 st.answered.insert(it.module);
             }
@@ -4144,17 +4246,23 @@ pub(crate) mod tests {
         use super::*;
 
         /// A mock node. `/local` answers by account: `ghost…` has no row (Pact's absent
-        /// failure; in a batch the whole call fails), `fails` is a Pact failure, `bad` is an
-        /// answer with no balance, `gc` has the guard key in `gc_key`, any other account
-        /// `balance` with key `k1`. Module `free.nod` has no `details` (every call fails),
+        /// failure; in a `try` batch that entry is the marker), `fails` is a Pact failure (a
+        /// marker in a batch), `bad` is an answer with no balance, `liar` (non-coin) returns the
+        /// marker shape itself, `gc` has the guard key in `gc_key`, any other account `balance`
+        /// with key `k1`. Module `free.nod` has no `details` and `fail_module` is unknown to
+        /// this node (every call fails, batches whole), `no_echo` answers without `account`,
         /// `free.tok` is the one module listing fungible-v2. `down`: HTTP 503 for everything.
-        /// Every success reads height 10 on block `prev`.
+        /// Every success reads height `height` (default 10) on block `prev`.
         pub(crate) struct Mock {
             pub prev: Mutex<String>,
             pub balance: &'static str,
             pub gc_key: Mutex<&'static str>,
             pub down: std::sync::atomic::AtomicBool,
+            pub height: std::sync::atomic::AtomicU64,
+            pub fail_module: Mutex<Option<&'static str>>,
+            pub no_echo: Mutex<Option<&'static str>>,
             pub batch_calls: AtomicUsize,
+            pub batch_accounts: AtomicUsize,
             pub single_calls: AtomicUsize,
         }
 
@@ -4165,7 +4273,11 @@ pub(crate) mod tests {
                     balance,
                     gc_key: Mutex::new("k1"),
                     down: Default::default(),
+                    height: 10.into(),
+                    fail_module: Mutex::new(None),
+                    no_echo: Mutex::new(None),
                     batch_calls: AtomicUsize::new(0),
+                    batch_accounts: AtomicUsize::new(0),
                     single_calls: AtomicUsize::new(0),
                 })
             }
@@ -4175,8 +4287,8 @@ pub(crate) mod tests {
             }
 
             fn entry(&self, module: &str, acct: &str) -> Result<Value, &'static str> {
-                if module == "free.nod" {
-                    return Err("Cannot resolve free.nod.details");
+                if module == "free.nod" || *self.fail_module.lock().unwrap() == Some(module) {
+                    return Err("Cannot resolve module");
                 }
                 if acct.starts_with("ghost") {
                     return Err("No value found in table coin_coin-table for key: ghost");
@@ -4186,6 +4298,9 @@ pub(crate) mod tests {
                 }
                 if acct == "bad" {
                     return Ok(json!({"account": acct, "guard": null}));
+                }
+                if acct == "liar" && module != "coin" {
+                    return Ok(json!({"account": acct, "absent": true}));
                 }
                 let key = if acct == "gc" {
                     *self.gc_key.lock().unwrap()
@@ -4197,17 +4312,20 @@ pub(crate) mod tests {
                 } else {
                     "7.25"
                 };
-                Ok(
-                    json!({"account": acct, "balance": bal.parse::<f64>().unwrap(),
-                          "guard": {"keys": [key], "pred": "keys-all"}}),
-                )
+                let mut v = json!({"account": acct, "balance": bal.parse::<f64>().unwrap(),
+                          "guard": {"keys": [key], "pred": "keys-all"}});
+                if *self.no_echo.lock().unwrap() == Some(module) {
+                    v.as_object_mut().unwrap().remove("account");
+                }
+                Ok(v)
             }
 
             fn answer(&self, cmd: &Value) -> (u16, Value) {
                 if self.down.load(Ordering::SeqCst) {
                     return (503, json!({}));
                 }
-                let meta = json!({"blockHeight": 11, "prevBlockHash": *self.prev.lock().unwrap()});
+                let meta = json!({"blockHeight": self.height.load(Ordering::SeqCst) + 1,
+                                  "prevBlockHash": *self.prev.lock().unwrap()});
                 let ok = |data: Value| {
                     (
                         200,
@@ -4233,15 +4351,21 @@ pub(crate) mod tests {
                 }
                 if let Some(list) = data.get("as").and_then(Value::as_array) {
                     self.batch_calls.fetch_add(1, Ordering::SeqCst);
+                    self.batch_accounts.fetch_add(list.len(), Ordering::SeqCst);
+                    // `(map (lambda (a) (try {…} (M.details a))) …)`
                     let module = code
-                        .strip_prefix("(map (")
+                        .split("} (")
+                        .nth(1)
                         .and_then(|c| c.split(".details").next())
                         .unwrap_or("");
                     let mut out = Vec::new();
                     for a in list {
-                        match self.entry(module, a.as_str().unwrap_or("")) {
+                        let a = a.as_str().unwrap_or("");
+                        match self.entry(module, a) {
                             Ok(v) => out.push(v),
-                            Err(m) => return fail(m),
+                            // An unknown module fails the whole call; `try` catches the rest.
+                            Err(m) if m.starts_with("Cannot resolve") => return fail(m),
+                            Err(_) => out.push(json!({"account": a, "absent": true})),
                         }
                     }
                     return ok(Value::Array(out));
@@ -4487,8 +4611,8 @@ pub(crate) mod tests {
             assert!(batched.4 > 0, "the batched path batches");
         }
 
-        /// A failing key fails the whole batched call: its keys are read one by one, and only
-        /// the failing key's mark is dropped. An absent key splits the call instead.
+        /// A failing key or an absent key is a `try` marker: the rest of the batch is taken and
+        /// only that key is read again, alone, on the primary, which decides it as before.
         #[tokio::test]
         async fn a_failed_batch_falls_back_to_single_reads() {
             let names: Vec<String> = (0..10).map(|i| format!("acct{i}")).collect();
@@ -4504,12 +4628,12 @@ pub(crate) mod tests {
             assert_eq!(mock.batch_calls.load(Ordering::SeqCst), 1);
             assert_eq!(
                 mock.single_calls.load(Ordering::SeqCst),
-                11,
-                "the batch read one by one"
+                1,
+                "only the failing key read alone"
             );
             assert_eq!(hot.ro().unwrap().count(Table::BalanceDirty).unwrap(), 0);
 
-            // 32 keys with one absent: split, not 32 single reads.
+            // 32 keys with one absent: one batch call and one single read, no split.
             let names: Vec<String> = (0..31).map(|i| format!("acct{i}")).collect();
             let mut accts: Vec<&str> = names.iter().map(String::as_str).collect();
             accts.push("ghost9");
@@ -4520,16 +4644,224 @@ pub(crate) mod tests {
             let pool = pool_of(&[(&local, true)], 50);
             let st = drain(&ctx, &hot, &local, Some(&pool)).await;
             assert_eq!((st.ok, st.absent, st.failures), (31, 1, 0), "{st:?}");
-            assert!(
-                mock.calls() <= 12,
-                "split down to the absent key: {} calls",
-                mock.calls()
-            );
             assert_eq!(
-                mock.single_calls.load(Ordering::SeqCst),
-                2,
-                "only the last pair alone"
+                (
+                    mock.batch_calls.load(Ordering::SeqCst),
+                    mock.single_calls.load(Ordering::SeqCst)
+                ),
+                (1, 1),
+                "the absent key alone"
             );
+        }
+
+        fn set_tail(hot: &HotStore, height: u32) {
+            let mut txn = hot.rw().unwrap();
+            kdx_hot::set_checkpoint(&mut txn, kdx_hot::Stage::Tail, 0, height, tip_hash()).unwrap();
+            txn.commit().unwrap();
+        }
+
+        fn rows_of(hot: &HotStore) -> Vec<BalanceRow> {
+            let txn = hot.ro().unwrap();
+            txn.scan_chunk(Table::Balances, None, 1000, |_| true)
+                .unwrap()
+                .into_iter()
+                .map(|(_, v)| BalanceRow::decode(&v).unwrap())
+                .collect()
+        }
+
+        fn dirty(hot: &HotStore) -> usize {
+            hot.ro().unwrap().count(Table::BalanceDirty).unwrap()
+        }
+
+        /// Absent markers in a batch from a secondary: the present keys are taken from the
+        /// batch, each marked key is read alone on the primary, and a key absent there is
+        /// written absent exactly as the single path writes it. A non-coin module that returns
+        /// the marker shape itself is read alone and never written absent.
+        #[tokio::test]
+        async fn absent_markers_are_read_again_on_the_primary() {
+            let accts = ["acct1", "ghost1", "acct2", "ghost2"];
+            let mut out = Vec::new();
+            for batched in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (ctx, hot) = store(dir.path(), &accts, &[]);
+                // Absent rows are read at our tail (Absent has no height): it covers the marks.
+                set_tail(&hot, 10);
+                let (p, sec) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+                let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(sec.clone())));
+                let pool = batched.then(|| pool_of(&[(&sc, false)], 25));
+                let st = drain(&ctx, &hot, &pc, pool.as_ref()).await;
+                assert_eq!((st.ok, st.absent), (2, 2), "{st:?}");
+                if batched {
+                    assert_eq!(sec.batch_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(sec.single_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(
+                        p.single_calls.load(Ordering::SeqCst),
+                        2,
+                        "each marker read alone on the primary"
+                    );
+                }
+                assert_eq!(dirty(&hot), 0);
+                out.push(dump(&hot));
+            }
+            assert_eq!(out[0], out[1], "absent rows as the single path writes them");
+
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &[], &["alice", "liar"]);
+            let (p, sec) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(sec.clone())));
+            let st = drain(&ctx, &hot, &pc, Some(&pool_of(&[(&sc, false)], 25))).await;
+            // free.tok: alice found, liar invalid (no balance) on the primary; free.nod fails.
+            assert_eq!((st.ok, st.absent, st.invalid), (1, 0, 1), "{st:?}");
+            assert!(rows_of(&hot).iter().all(|r| !r.absent), "never absent");
+        }
+
+        /// I2: a Pact failure only on a secondary (it does not know the module yet) neither
+        /// drops a mark nor counts toward the not-fungible verdict: the key is read on the
+        /// primary and written.
+        #[tokio::test]
+        async fn a_failure_only_on_a_secondary_is_read_on_the_primary() {
+            for batch_keys in [1, 25] {
+                let dir = tempfile::tempdir().unwrap();
+                let (ctx, hot) = store(dir.path(), &[], &["alice", "bob"]);
+                let (p, sec) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+                *sec.fail_module.lock().unwrap() = Some("free.tok");
+                let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(sec.clone())));
+                let pool = pool_of(&[(&sc, false)], batch_keys);
+                let st = drain(&ctx, &hot, &pc, Some(&pool)).await;
+                // free.tok: both found via the primary; free.nod (no `details`) fails on both.
+                assert_eq!((st.ok, st.failures), (2, 2), "{batch_keys}: {st:?}");
+                assert_eq!(
+                    st.failed_modules.len(),
+                    1,
+                    "only free.nod counts as failing"
+                );
+                assert!(!st.failed_modules.contains(&module_id(&hot, "free.tok")));
+                assert_eq!(
+                    rows_of(&hot).iter().filter(|r| r.balance == "7.25").count(),
+                    2,
+                    "free.tok rows written"
+                );
+                assert_eq!(dirty(&hot), 0, "marks cleared by the primary's answers");
+            }
+        }
+
+        fn module_id(hot: &HotStore, name: &str) -> u32 {
+            let mut txn = hot.rw().unwrap();
+            let mut d = HotDict::load(&txn).unwrap();
+            let id = d.intern(DictKind::Module, name);
+            d.persist(&mut txn).unwrap();
+            txn.commit().unwrap();
+            id
+        }
+
+        /// I3: an answer from a lagging node never moves a row back: the row read at 20 stays,
+        /// and the key is marked again so a later read decides; an answer at or above it
+        /// replaces it.
+        #[tokio::test]
+        async fn a_lagging_answer_never_moves_a_row_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &["alice"], &[]);
+            set_tail(&hot, 20);
+            for h in [15, 20, 21] {
+                put_header(&hot, 0, h, tip_hash());
+            }
+            let p = Mock::new(tip_hash(), "1.5");
+            p.height.store(20, Ordering::SeqCst);
+            let lag = Mock::new(tip_hash(), "0.5");
+            lag.height.store(15, Ordering::SeqCst);
+            let (pc, lc) = (local_at(&serve(p.clone())), local_at(&serve(lag.clone())));
+            let st = drain(&ctx, &hot, &pc, Some(&pool_of(&[(&pc, true)], 25))).await;
+            assert_eq!(st.ok, 1);
+            let r = &rows_of(&hot)[0];
+            assert_eq!((r.balance.as_str(), r.as_of), ("1.5", 20));
+
+            // The lagging node (5 blocks behind: within `LAG_BLOCKS`, so it is used).
+            mark_again(&hot, "alice", "coin");
+            let st = drain(&ctx, &hot, &pc, Some(&pool_of(&[(&lc, false)], 25))).await;
+            assert_eq!((st.ok, st.other_branch), (1, 0), "{st:?}");
+            let r = &rows_of(&hot)[0];
+            assert_eq!(
+                (r.balance.as_str(), r.as_of, r.unverified),
+                ("1.5", 20, false),
+                "the newer row stays"
+            );
+            assert_eq!(dirty(&hot), 1, "a later read decides");
+            assert_eq!(lag.calls(), 1);
+
+            // The primary moves on to 21: its answer replaces the row and clears the mark.
+            p.height.store(21, Ordering::SeqCst);
+            *p.prev.lock().unwrap() = tip_hash().to_b64url();
+            let st = drain(&ctx, &hot, &pc, Some(&pool_of(&[(&pc, true)], 25))).await;
+            assert_eq!(st.ok, 1);
+            let r = &rows_of(&hot)[0];
+            assert_eq!((r.balance.as_str(), r.as_of), ("1.5", 21));
+            assert_eq!(dirty(&hot), 0);
+        }
+
+        /// A node more than `LAG_BLOCKS` above our tail is skipped for a while: its answer
+        /// (unchecked, no header of ours there) is kept unverified and the keys read again,
+        /// and the next reads go to the other node.
+        #[tokio::test]
+        async fn a_node_far_ahead_is_skipped() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &["alice", "bob"], &[]);
+            let (p, fast) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "9.0"));
+            fast.height.store(30, Ordering::SeqCst);
+            let (pc, fc) = (local_at(&serve(p.clone())), local_at(&serve(fast.clone())));
+            let pool = pool_of(&[(&fc, false), (&pc, true)], 25);
+            let st = drain(&ctx, &hot, &pc, Some(&pool)).await;
+            assert_eq!((st.ok, st.other_branch), (2, 2), "{st:?}");
+            assert_eq!(dirty(&hot), 2, "read again");
+            for _ in 0..3 {
+                let st = drain(&ctx, &hot, &pc, Some(&pool)).await;
+                assert_eq!((st.ok, st.other_branch), (2, 0), "{st:?}");
+                mark_again(&hot, "alice", "coin");
+                mark_again(&hot, "bob", "coin");
+            }
+            assert_eq!(fast.calls(), 1, "skipped while down");
+            assert!(rows_of(&hot)
+                .iter()
+                .all(|r| r.balance == "1.5" && !r.unverified));
+        }
+
+        /// A module whose `details` does not echo `account` cannot be matched by name: every
+        /// key of it is read alone.
+        #[tokio::test]
+        async fn a_module_that_does_not_echo_the_account_is_read_key_by_key() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &[], &["alice", "bob", "erin"]);
+            let p = Mock::new(tip_hash(), "1.5");
+            *p.no_echo.lock().unwrap() = Some("free.tok");
+            let pc = local_at(&serve(p.clone()));
+            let st = drain(&ctx, &hot, &pc, Some(&pool_of(&[(&pc, true)], 25))).await;
+            assert_eq!(st.ok, 3, "{st:?}");
+            assert_eq!(
+                rows_of(&hot).iter().filter(|r| r.balance == "7.25").count(),
+                3
+            );
+            // One batch for free.tok, one for free.nod (fails whole), then 3 + 3 single reads.
+            assert_eq!(p.batch_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(p.single_calls.load(Ordering::SeqCst), 6);
+        }
+
+        /// A key listed twice in one batch (a tail and a seed mark) is asked once; both items
+        /// get its outcome.
+        #[tokio::test]
+        async fn duplicate_keys_are_asked_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &["alice", "bob", "carol"], &[]);
+            let p = Mock::new(tip_hash(), "1.5");
+            let pc = local_at(&serve(p.clone()));
+            let pool = pool_of(&[(&pc, true)], 25);
+            let keys = refill(&hot, 4096, 64).unwrap();
+            let twice: Vec<Dirty> = keys.iter().chain(&keys).copied().collect();
+            let st = reconcile_batch_with(&ctx, &pc, Some(&pool), &twice, &Caps::default())
+                .await
+                .unwrap();
+            assert_eq!(st.ok, 6, "{st:?}");
+            assert_eq!(p.batch_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(p.batch_accounts.load(Ordering::SeqCst), 3, "each key once");
+            assert_eq!(dirty(&hot), 0);
         }
 
         /// Calls spread over every read node; a node that fails is skipped and its reads go to

@@ -263,9 +263,10 @@ fn balances_opts(
             rps: b.local_rps,
             concurrency: b.local_concurrency.max(1) as usize,
         },
-        // Room for every read node's calls in flight once keys go `local_batch_keys` a call
-        // (one write txn per batch).
-        batch: (b.local_batch_keys as usize * 80).clamp(256, 4096),
+        // Room for every read node's calls in flight once keys go `local_batch_keys` a call,
+        // capped at 1,024 rows: one write txn per batch, committed after its slowest call,
+        // and the tail, the receivers pass and the tip share wait behind it (PR #67 I5).
+        batch: (b.local_batch_keys as usize * 80).clamp(256, 1024),
         seed: true,
         caps: kdx_ingest::reconcile::Caps {
             module_share: b.module_share as usize,

@@ -1,14 +1,20 @@
 //! The balance reconciler's read nodes (`balances.local_urls`): `details` reads spread over
 //! several chainweb nodes, each with its own `/local` rate and concurrency caps
 //! (`balances.local_rps` ≤ `MAX_LOCAL_RPS` per node, `balances.local_concurrency`), with
-//! health and failover: a node that gives a transport or HTTP error, or answers from a tip
-//! more than [`LAG_BLOCKS`] below our tail, is skipped for [`COOLDOWN`].
+//! health and failover: a node is skipped for [`COOLDOWN`] when it gives a transport or HTTP
+//! error, a Pact failure (it is not the primary), or answers from a tip more than
+//! [`LAG_BLOCKS`] below or above our tail.
 //!
-//! Exactness does not depend on which node answered: every answer still goes through the
-//! reconciler's branch check against our own store (`branch_of`), so a node on another fork
-//! gives `other_branch` and a retry, never a stored value. An `Absent` answer carries no block
-//! identity, so one from a node other than the primary (`node.url`) is asked again of the
-//! primary before it counts (see `reconcile::read_group`).
+//! Trust: every read node is trusted for state exactly like `node.url`. The reconciler's
+//! branch check (`branch_of`) binds only the block an answer *claims* (its height and
+//! `prevBlockHash` against our stored header); `/local` carries no state proof. The check
+//! catches a node on another fork or behind, not a node that lies about a balance or guard
+//! under a real block hash. List only nodes you run.
+//!
+//! What a non-primary node cannot decide is asked of the primary (`node.url`): an `Absent`
+//! answer (it carries no block identity), a Pact failure or an unusable answer (a lagging
+//! node may not know a new module yet), and every `try` marker of a batched read (see
+//! `reconcile::read_chunk`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use kdx_node::local::LocalClient;
 
-/// How long a node that failed or lagged is skipped.
+/// How long a node that failed, lagged or ran ahead is skipped.
 pub const COOLDOWN: Duration = Duration::from_secs(30);
 /// An answer read more than this many blocks below our tail on its chain marks its node as
-/// lagging (it is still exact, only old: the call is tried on another node first).
+/// lagging (it is still exact, only old: the call is tried on another node first); more than
+/// this many above marks it as ahead (its answers cannot be branch-checked yet).
 pub const LAG_BLOCKS: u32 = 10;
 
 /// One read node.
@@ -83,7 +90,8 @@ impl ReadPool {
         &self.nodes[i]
     }
 
-    /// The next node for a call, round robin over the nodes that are up and not in `tried`.
+    /// The next node for a call, round robin over the nodes that are up and not in `tried`,
+    /// preferring one with a free concurrency slot (a slow node then gets fewer calls).
     /// When every untried node is down, the one that comes back first (a call must still go
     /// somewhere: a lone node that failed is retried, as the single-node reconciler does).
     /// `None` once every node was tried.
@@ -91,13 +99,23 @@ impl ReadPool {
         let n = self.nodes.len();
         let now = Instant::now();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        let untried = (0..n)
+        let untried: Vec<usize> = (0..n)
             .map(|k| (start + k) % n)
-            .filter(|i| !tried.contains(i));
-        untried
-            .clone()
-            .find(|&i| self.nodes[i].is_up(now))
-            .or_else(|| untried.min_by_key(|&i| self.nodes[i].down_until()))
+            .filter(|i| !tried.contains(i))
+            .collect();
+        let mut up = untried
+            .iter()
+            .copied()
+            .filter(|&i| self.nodes[i].is_up(now));
+        up.clone()
+            .find(|&i| self.nodes[i].client.free_slots() > 0)
+            .or_else(|| up.next())
+            .or_else(|| {
+                untried
+                    .iter()
+                    .copied()
+                    .min_by_key(|&i| self.nodes[i].down_until())
+            })
     }
 
     /// Skip node `i` for [`COOLDOWN`].

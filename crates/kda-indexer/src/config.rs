@@ -927,13 +927,16 @@ pub struct BalancesConfig {
     pub local_rps: u32,
     /// `/local` calls in flight.
     pub local_concurrency: u32,
-    /// Accounts read per batched `details` call, `(map ({m}.details) (read-msg "as"))`, per
-    /// chain and module (1..=100; 1: one call a key, the old reconciler).
+    /// Accounts read per batched `details` call (the `try` form, see `kdx_node::local`), per
+    /// chain and module (1..=100; 1: one call a key, the old reconciler). A reconcile batch
+    /// is this × 80 rows, clamped to 256..=1,024 (one write transaction).
     pub local_batch_keys: u32,
     /// Chainweb nodes the reconciler spreads its `details` reads over, each with its own
     /// `local_rps` and `local_concurrency` caps. Empty (the default): `node.url` alone. List
     /// `node.url` too to keep reading from it; other passes (fungible checks, keysets, NFT
-    /// rows, key listing) and absent answers always use `node.url`.
+    /// rows, key listing), absent answers, batch markers and a secondary's failures always
+    /// use `node.url`. Every node listed is trusted for state like `node.url` (`/local` has
+    /// no state proof): list only nodes you run.
     pub local_urls: Vec<url::Url>,
     /// Dirty keys of one non-coin module that take a batch slot before the others get theirs
     /// (I-7): the fair share. Room left in a seed batch is topped up beyond it.
@@ -985,8 +988,8 @@ impl Default for BalancesConfig {
 pub const MAX_LOCAL_RPS: u32 = 50;
 
 /// Default `balances.local_batch_keys`. 25 `coin.details` reads stay far under the call's
-/// `GAS_LIMIT` (150,000) and a 1 MiB answer; `docs/operations.md` has the checks to run
-/// before raising it.
+/// `GAS_LIMIT` (150,000) and a 1 MiB answer, and took 21 ms on mainnet, the same as one key;
+/// `docs/operations.md` has the checks to run before raising it.
 pub const DEFAULT_LOCAL_BATCH_KEYS: u32 = 25;
 
 /// Most `balances.local_urls`.
