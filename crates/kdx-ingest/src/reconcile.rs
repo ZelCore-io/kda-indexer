@@ -623,8 +623,9 @@ impl RefillWindow {
 }
 
 /// Whether to walk for the next window while the batch `(len, n)` (its keys, the batch size)
-/// reads: windows of more than one batch (`k`), a full batch (a short one means the window
-/// held the whole backlog: the next window is walked when due, not ahead of time), and the
+/// reads: windows of more than one batch (`k`), a full batch (a short one is the window's
+/// last: it held the whole backlog, or fewer than `k·n` keys once the keys in flight were left
+/// out; the next window is then walked when due, not ahead of time), and the
 /// window used up or `max_age` old by the time this batch (as long as the last,
 /// `batch_secs`) ends.
 pub fn walk_ahead(
@@ -875,26 +876,33 @@ fn decided_by<T>(r: &LocalResult<T>, primary: bool) -> bool {
 /// Send one read through the pool with failover: a node error, or an answer more than
 /// [`LAG_BLOCKS`] below our tail, marks the node down and the read goes to the next node;
 /// once every node was tried, the last lagging answer (still exact, only old) or the last node
-/// error stands. An answer from a node other than the primary read above our tail (no header
-/// of ours there to check it against) also goes on to the next node; that node is marked down
-/// only when more than [`LAG_BLOCKS`] above (a node at the tip while our tail trails it by a
-/// block is healthy). The primary's answer more than [`LAG_BLOCKS`] above our tail marks it
-/// down and is returned at once. A Pact failure is returned at once and marks no node down:
+/// error stands. An answer from a node other than the primary read above the tail we hold when
+/// it arrives (`held`, a fresh read of our headers: ingest may have committed that block since
+/// the batch took `tail`) has no header of ours to check it against, so it also goes on to the
+/// next node; that node is marked down only when more than [`LAG_BLOCKS`] above `tail` (a node
+/// at the tip while our tail trails it by a block is healthy). Such an answer at a height we
+/// hold a header for by then is taken, and checked against that header at commit like any
+/// other. The chain ends at the primary when `node.url` is one of the read nodes; when it is
+/// not, it ends at the last secondary tried, whose answer stands (unchecked: it never replaces
+/// a row we hold, and the key stays queued). The primary's answer more than [`LAG_BLOCKS`]
+/// above our tail marks it down and is returned at once. A Pact failure is returned at once and marks no node down:
 /// it may be the contract's own (out of gas, an error it raises); one from a node other than
 /// the primary is asked of the primary ([`decided_by`]), and only a missing module the primary
 /// knows marks that node down ([`read_single_at`]).
 /// `batch` picks with [`ReadPool::pick_batch`], else [`ReadPool::pick`]; the nodes of `avoid`
 /// are not asked. Returns the result, the seconds of the call that stands and the index of
 /// the node that answered.
-async fn pooled<T, F, Fut>(
+async fn pooled<T, F, Fut, H>(
     pool: &ReadPool,
     tail: u32,
+    held: H,
     keys: u64,
     batch: bool,
     avoid: &[usize],
     mut send: F,
 ) -> (LocalResult<T>, f64, usize)
 where
+    H: Fn(u64) -> bool,
     F: FnMut(Arc<LocalClient>) -> Fut,
     Fut: std::future::Future<Output = (LocalResult<T>, f64)>,
 {
@@ -927,9 +935,12 @@ where
                 pool.mark_down(i, "lagging");
                 last = Some((r, secs, i));
             }
-            Ok(Local::Found { height, .. }) if !node.primary && *height > u64::from(tail) => {
-                // Unchecked (no header of ours at its height) and maybe from a branch our tail
-                // never takes: another node, the primary last, may answer on our branch.
+            Ok(Local::Found { height, .. })
+                if !node.primary && *height > u64::from(tail) && !held(*height) =>
+            {
+                // Unchecked (no header of ours at its height, even now) and maybe from a branch
+                // our tail never takes: another node, the primary last, may answer on our
+                // branch.
                 m.balance_local_node(&node.label, "ahead", 0);
                 if ahead(*height, tail) {
                     pool.mark_down(i, "ahead");
@@ -939,7 +950,7 @@ where
                     _ => Some((r, secs, i)),
                 };
             }
-            Ok(Local::Found { height, .. }) if ahead(*height, tail) => {
+            Ok(Local::Found { height, .. }) if node.primary && ahead(*height, tail) => {
                 // The primary (the node our tail follows). Not tried elsewhere: while our tail
                 // catches up every node is ahead, and the answer (unchecked, stored unverified
                 // and read again) costs one call, not N.
@@ -970,6 +981,18 @@ where
             0,
         )
     })
+}
+
+/// Whether we hold a header at `height` on `chain` now: a fresh read, so a block ingest
+/// committed after the batch took its tail counts. A store error counts as not held.
+fn holds_header(hot: &HotStore, chain: u8, height: u64) -> bool {
+    let Ok(h) = u32::try_from(height) else {
+        return false;
+    };
+    hot.ro()
+        .ok()
+        .and_then(|t| t.get(Table::Headers, &block_key(chain, h)).ok().flatten())
+        .is_some()
 }
 
 /// One key read on its own on the primary (`local`, `node.url`).
@@ -1008,6 +1031,7 @@ fn below<T>(r: &LocalResult<T>, want: u32) -> bool {
 async fn read_single_at(
     local: &LocalClient,
     pool: &ReadPool,
+    hot: &HotStore,
     it: &Item,
     want: u32,
 ) -> (Outcome, Instant) {
@@ -1015,7 +1039,8 @@ async fn read_single_at(
         return (Outcome::Skipped, Instant::now());
     };
     let send = |c: Arc<LocalClient>| async move { c.details_timed(it.chain, module, acct).await };
-    let (mut r, mut secs, i) = pooled(pool, it.tail, 1, false, &[], send).await;
+    let held = |h| holds_header(hot, it.chain, h);
+    let (mut r, mut secs, i) = pooled(pool, it.tail, held, 1, false, &[], send).await;
     let answered = Instant::now();
     let mut node = (!pool.node(i).primary).then_some(i);
     if below(&r, want) && node.is_some() {
@@ -1039,8 +1064,14 @@ async fn read_single_at(
 }
 
 /// [`read_single_at`] of the key whose items are `k`.
-async fn read_single(local: &LocalClient, pool: &ReadPool, items: &[Item], k: &[usize]) -> Outcome {
-    read_single_at(local, pool, &items[k[0]], want_of(items, k))
+async fn read_single(
+    local: &LocalClient,
+    pool: &ReadPool,
+    hot: &HotStore,
+    items: &[Item],
+    k: &[usize],
+) -> Outcome {
+    read_single_at(local, pool, hot, &items[k[0]], want_of(items, k))
         .await
         .0
 }
@@ -1069,13 +1100,20 @@ fn fan(idx: &[usize], o: Outcome) -> Vec<(usize, Outcome)> {
 async fn read_chunk(
     local: &LocalClient,
     pool: &ReadPool,
+    hot: &HotStore,
     items: &[Item],
     keys: Vec<Vec<usize>>,
     batch: bool,
 ) -> (Vec<(usize, Outcome)>, Instant) {
     if keys.len() == 1 {
-        let (o, at) =
-            read_single_at(local, pool, &items[keys[0][0]], want_of(items, &keys[0])).await;
+        let (o, at) = read_single_at(
+            local,
+            pool,
+            hot,
+            &items[keys[0][0]],
+            want_of(items, &keys[0]),
+        )
+        .await;
         return (fan(&keys[0], o), at);
     }
     let first = &items[keys[0][0]];
@@ -1085,7 +1123,8 @@ async fn read_chunk(
         .map(|k| items[k[0]].account_name.as_deref().unwrap_or(""))
         .collect();
     let n = keys.len() as u64;
-    let (r, secs, node) = pooled(pool, first.tail, n, batch, &[], |c| {
+    let held = |h| holds_header(hot, first.chain, h);
+    let (r, secs, node) = pooled(pool, first.tail, held, n, batch, &[], |c| {
         let accts = accts.clone();
         async move { c.details_many(first.chain, module, &accts).await }
     })
@@ -1093,7 +1132,7 @@ async fn read_chunk(
     let answered = Instant::now();
     let singles = |ks: Vec<Vec<usize>>| {
         join_all(ks.into_iter().map(|k| async move {
-            let o = read_single(local, pool, items, &k).await;
+            let o = read_single(local, pool, hot, items, &k).await;
             fan(&k, o)
         }))
     };
@@ -1216,6 +1255,7 @@ async fn read_chunk(
 async fn call_pooled(
     local: &LocalClient,
     pool: &ReadPool,
+    hot: &HotStore,
     items: &[Item],
 ) -> (Vec<Outcome>, Option<Instant>) {
     let mut out: Vec<Option<Outcome>> = (0..items.len()).map(|_| None).collect();
@@ -1255,7 +1295,7 @@ async fn call_pooled(
     });
     let mut first: Option<Instant> = None;
     for (outs, at) in
-        join_all(chunks.map(|(c, batch)| read_chunk(local, pool, items, c, batch))).await
+        join_all(chunks.map(|(c, batch)| read_chunk(local, pool, hot, items, c, batch))).await
     {
         first = first.max(Some(at));
         for (k, o) in outs {
@@ -1494,7 +1534,7 @@ pub struct BatchStats {
     /// Of `other_branch`: answers with no `metaData.prevBlockHash` at all.
     pub no_hash: u64,
     /// Of `ok`: answers on our branch read below the key's mark (they cannot clear it); the
-    /// key goes to the back of the queue.
+    /// key is marked again, and goes to the back of the queue unless it is a tip key.
     pub uncovered: u64,
     pub absent: u64,
     pub skipped: u64,
@@ -1783,7 +1823,7 @@ pub async fn reconcile_batch_with(
     // In-flight calls are capped by each client's semaphore (`local_concurrency`).
     let t = Instant::now();
     let (outcomes, first): (Vec<Outcome>, Option<Instant>) = match pool {
-        Some(p) => call_pooled(local, p, &items).await,
+        Some(p) => call_pooled(local, p, &ctx.hot, &items).await,
         None => (join_all(items.iter().map(|it| call(local, it))).await, None),
     };
     let end = Instant::now();
@@ -1911,11 +1951,15 @@ pub async fn reconcile_batch_with(
                         balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
                     st.remarked.push((it.d.key, m));
                 } else if ours && as_of < it.d.mark.height {
-                    // Read below the mark: it cannot clear it, so it is no progress. To the back
-                    // of the queue, like an off-branch answer (a later read decides).
+                    // Read below the mark: it cannot clear it, so it is no progress. Marked
+                    // again (a later read decides); a key of the tip share stays in it (its new
+                    // mark is the newest), any other goes to the back of the queue, like an
+                    // off-branch answer.
                     let m =
                         balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
-                    st.remarked.push((it.d.key, m));
+                    if !it.d.tip {
+                        st.remarked.push((it.d.key, m));
+                    }
                     st.uncovered += 1;
                 } else if ours {
                     clear_if_covered(&mut txn, it, as_of)?;
