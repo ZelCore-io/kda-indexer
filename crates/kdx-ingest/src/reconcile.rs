@@ -137,6 +137,9 @@ pub struct Caps {
     /// anyone can deploy one). Past it, a key with no row is dropped and the module flagged
     /// like an untrusted one at [`Caps::module_rows`].
     pub fungible_module_rows: u32,
+    /// Batches one refill window holds (`balances.refill_window_batches`, 1..=32; 1: a refill
+    /// every batch). See [`refill_window`].
+    pub refill_window_batches: usize,
 }
 
 /// Default of [`Caps::fungible_module_rows`] (F-14): 10x the largest non-coin module on
@@ -153,6 +156,7 @@ impl Default for Caps {
             history_slice_txs: crate::seed_receivers::HISTORY_SLICE_TXS,
             history_walk_threads: 0,
             fungible_module_rows: DEFAULT_FUNGIBLE_MODULE_ROWS,
+            refill_window_batches: DEFAULT_REFILL_WINDOW,
         }
     }
 }
@@ -482,6 +486,81 @@ pub fn refill_with(
     Ok(out)
 }
 
+/// Default `balances.refill_window_batches`: batches one refill window holds.
+pub const DEFAULT_REFILL_WINDOW: usize = 8;
+/// Most `balances.refill_window_batches`.
+pub const MAX_REFILL_WINDOW: usize = 32;
+/// A refill window older than this is taken again even with keys left, so a fresh tip mark
+/// waits at most about this long (a single batch took about as long before windows).
+pub const WINDOW_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// The refill of `k` batches at once: [`refill_with`] for `k × n` keys and `k × share` per
+/// module. One refill walks all of `BalanceDirty` whatever `n` is, so a window spreads that
+/// walk over `k` batches. Its order is [`refill_with`]'s: the tip share first, then the old
+/// backlog, the seed backlog last.
+pub fn refill_window(
+    hot: &HotStore,
+    n: usize,
+    share: usize,
+    k: usize,
+    back: &HashMap<[u8; 9], Mark>,
+) -> Result<Vec<Dirty>> {
+    let k = k.clamp(1, MAX_REFILL_WINDOW);
+    refill_with(
+        hot,
+        n.saturating_mul(k),
+        share.max(1).saturating_mul(k),
+        back,
+    )
+}
+
+/// The keys of one refill window ([`refill_window`]), handed out a batch at a time. Every
+/// key keeps the exact mark read at refill, so compare-and-clear still deletes only that
+/// mark: a key the tail marks again while the window is in use keeps its new mark and is read
+/// again later. The window is due for a refill once it is used up or [`WINDOW_MAX_AGE`] old.
+#[derive(Debug, Default)]
+pub struct RefillWindow {
+    keys: Vec<Dirty>,
+    pos: usize,
+    taken: Option<Instant>,
+}
+
+impl RefillWindow {
+    /// Whether to refill before the next batch: no keys left, or the marks were read
+    /// `max_age` or longer before `now`.
+    pub fn due(&self, now: Instant, max_age: Duration) -> bool {
+        self.pos >= self.keys.len()
+            || self
+                .taken
+                .is_none_or(|t| now.saturating_duration_since(t) >= max_age)
+    }
+
+    /// A new window: `keys` as refilled, its age counted from `at` (the end of the refill).
+    pub fn set(&mut self, keys: Vec<Dirty>, at: Instant) {
+        self.keys = keys;
+        self.pos = 0;
+        self.taken = Some(at);
+    }
+
+    /// The next batch: up to `n` keys, in the window's order.
+    pub fn next_batch(&mut self, n: usize) -> Vec<Dirty> {
+        let end = self.pos.saturating_add(n.max(1)).min(self.keys.len());
+        let out = self.keys[self.pos..end].to_vec();
+        self.pos = end;
+        out
+    }
+
+    /// Keys not handed out yet.
+    pub fn left(&self) -> usize {
+        self.keys.len() - self.pos
+    }
+
+    /// Drop the window (a seed pass rewrote the marks): the next batch refills.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// One dirty key with what the call needs.
 struct Item {
     d: Dirty,
@@ -689,6 +768,7 @@ async fn pooled<T, F, Fut>(
     pool: &ReadPool,
     tail: u32,
     keys: u64,
+    batch: bool,
     mut send: F,
 ) -> (LocalResult<T>, f64, usize)
 where
@@ -697,7 +777,14 @@ where
 {
     let mut tried: Vec<usize> = Vec::new();
     let mut last: Option<(LocalResult<T>, f64, usize)> = None;
-    while let Some(i) = pool.pick(&tried) {
+    let pick = |t: &[usize]| {
+        if batch {
+            pool.pick_batch(t)
+        } else {
+            pool.pick(t)
+        }
+    };
+    while let Some(i) = pick(&tried) {
         tried.push(i);
         let node = pool.node(i);
         let (r, secs) = send(node.client.clone()).await;
@@ -771,7 +858,7 @@ async fn read_single(local: &LocalClient, pool: &ReadPool, it: &Item) -> Outcome
     let (Some(acct), Some(module)) = (&it.account_name, &it.module_name) else {
         return Outcome::Skipped;
     };
-    let (r, secs, i) = pooled(pool, it.tail, 1, |c| async move {
+    let (r, secs, i) = pooled(pool, it.tail, 1, false, |c| async move {
         c.details_timed(it.chain, module, acct).await
     })
     .await;
@@ -795,15 +882,18 @@ fn fan(idx: &[usize], o: Outcome) -> Vec<(usize, Outcome)> {
 /// any other entry is read alone through the pool. A `try` marker is never taken as absent,
 /// for any module: that key is read alone on the primary, and that read decides, as before.
 /// A failed call, an unusable answer or a refused call reads the keys one by one.
+///
+/// Also returns when the chunk's first read answered: the rest of its time went to the reads
+/// it sent after (keys read alone, a `try` marker or `Absent` asked of the primary).
 async fn read_chunk(
     local: &LocalClient,
     pool: &ReadPool,
     items: &[Item],
     keys: Vec<Vec<usize>>,
-) -> Vec<(usize, Outcome)> {
+) -> (Vec<(usize, Outcome)>, Instant) {
     if keys.len() == 1 {
         let o = read_single(local, pool, &items[keys[0][0]]).await;
-        return fan(&keys[0], o);
+        return (fan(&keys[0], o), Instant::now());
     }
     let first = &items[keys[0][0]];
     let module = first.module_name.as_deref().unwrap_or("");
@@ -812,11 +902,12 @@ async fn read_chunk(
         .map(|k| items[k[0]].account_name.as_deref().unwrap_or(""))
         .collect();
     let n = keys.len() as u64;
-    let (r, secs, _) = pooled(pool, first.tail, n, |c| {
+    let (r, secs, _) = pooled(pool, first.tail, n, true, |c| {
         let accts = accts.clone();
         async move { c.details_many(first.chain, module, &accts).await }
     })
     .await;
+    let answered = Instant::now();
     let singles = |ks: Vec<Vec<usize>>| {
         join_all(ks.into_iter().map(|k| async move {
             let o = read_single(local, pool, &items[k[0]]).await;
@@ -858,23 +949,29 @@ async fn read_chunk(
                     fan(&k, o)
                 })),
             );
-            a.into_iter().chain(b).chain(c).flatten().collect()
+            let out = a.into_iter().chain(b).chain(c).flatten().collect();
+            (out, answered)
         }
         Err(LocalError::Node(e)) => {
             tracing::debug!(error = %e, "details batch: node error on every read node, kept dirty");
-            keys.into_iter()
+            let out = keys
+                .into_iter()
                 .flatten()
                 .map(|k| {
                     kdx_metrics::get().balance_reconcile("error", secs);
                     (k, Outcome::NodeError)
                 })
-                .collect()
+                .collect();
+            (out, answered)
         }
         other => {
             if let Err(e) = &other {
                 tracing::debug!(chain = first.chain, module, error = %e, "details batch failed; keys read one by one");
             }
-            singles(keys).await.into_iter().flatten().collect()
+            (
+                singles(keys).await.into_iter().flatten().collect(),
+                answered,
+            )
         }
     }
 }
@@ -882,7 +979,12 @@ async fn read_chunk(
 /// [`call`] for every item through the read pool: keys of one chain and module go in batched
 /// calls of `pool.batch_keys` distinct keys ([`read_chunk`]), spread over the pool's nodes. A
 /// key listed twice (a tail and a seed mark) is asked once and both items get its outcome.
-async fn call_pooled(local: &LocalClient, pool: &ReadPool, items: &[Item]) -> Vec<Outcome> {
+/// Also returns when the last chunk's first read answered (`None`: no chunk was read).
+async fn call_pooled(
+    local: &LocalClient,
+    pool: &ReadPool,
+    items: &[Item],
+) -> (Vec<Outcome>, Option<Instant>) {
     let mut out: Vec<Option<Outcome>> = (0..items.len()).map(|_| None).collect();
     type Group = (HashMap<u32, usize>, Vec<Vec<usize>>);
     let mut groups: BTreeMap<(u8, u32), Group> = BTreeMap::new();
@@ -908,17 +1010,19 @@ async fn call_pooled(local: &LocalClient, pool: &ReadPool, items: &[Item]) -> Ve
             .map(<[Vec<usize>]>::to_vec)
             .collect::<Vec<_>>()
     });
-    for (k, o) in join_all(chunks.map(|c| read_chunk(local, pool, items, c)))
-        .await
-        .into_iter()
-        .flatten()
-    {
-        out[k] = Some(o);
+    let mut first: Option<Instant> = None;
+    for (outs, at) in join_all(chunks.map(|c| read_chunk(local, pool, items, c))).await {
+        first = first.max(Some(at));
+        for (k, o) in outs {
+            out[k] = Some(o);
+        }
     }
     // Every key has an outcome; were one missing, it stays dirty (a node error), never dropped.
-    out.into_iter()
+    let out = out
+        .into_iter()
         .map(|o| o.unwrap_or(Outcome::NodeError))
-        .collect()
+        .collect();
+    (out, first)
 }
 
 /// Whether another trusted row of `account` (not `except`) has `pk` in its guard. Bounded by
@@ -1167,6 +1271,52 @@ pub struct BatchStats {
     pub answered: HashSet<u32>,
     /// Non-coin modules with a failed or invalid `details` call in this batch.
     pub failed_modules: HashSet<u32>,
+    /// Where the batch's time went (`kdx_balance_batch_phase_seconds`).
+    pub phases: Phases,
+}
+
+/// Seconds one reconcile batch spent per phase, each also observed in
+/// `kdx_balance_batch_phase_seconds{phase}`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Phases {
+    /// The read txn before the calls: tail heights, token rows, account and module names.
+    pub prep: f64,
+    /// The fungible checks (I-6) on the primary.
+    pub fungible: f64,
+    /// From the first `details` call to the last chunk's first (batched) answer.
+    pub reads_batched: f64,
+    /// After that, until every read ended: keys read alone, `try` markers and `Absent`
+    /// answers asked again of the primary, keyset reads.
+    pub reads_rereads: f64,
+    /// Waiting for the write txn (the tail or another writer holds it).
+    pub txn_wait: f64,
+    /// Header (`branch_of`) and held-row (`holds_newer`) reads in the write txn.
+    pub branch: f64,
+    /// Rows, guards, key index and counts written in the write txn.
+    pub write: f64,
+    /// Marks cleared (compare-and-clear) or written again in the write txn.
+    pub clear: f64,
+    /// The write txn's commit.
+    pub commit: f64,
+}
+
+impl Phases {
+    fn observe(&self) {
+        let m = kdx_metrics::get();
+        for (phase, secs) in [
+            ("prep", self.prep),
+            ("fungible", self.fungible),
+            ("reads_batched", self.reads_batched),
+            ("reads_rereads", self.reads_rereads),
+            ("txn_wait", self.txn_wait),
+            ("branch", self.branch),
+            ("write", self.write),
+            ("clear", self.clear),
+            ("commit", self.commit),
+        ] {
+            m.balance_batch_phase(phase, secs);
+        }
+    }
 }
 
 impl BatchStats {
@@ -1280,6 +1430,8 @@ pub async fn reconcile_batch_with(
     caps: &Caps,
 ) -> Result<BatchStats> {
     let now = now_unix();
+    let mut ph = Phases::default();
+    let t = Instant::now();
     let (coin, mut items) = {
         let txn = ctx.hot.ro()?;
         let coin = balances::coin_module(&txn)?;
@@ -1336,6 +1488,7 @@ pub async fn reconcile_batch_with(
         }
         (coin, v)
     };
+    ph.prep = secs_since(t);
 
     // I-6: the fungible check of each (module, chain) that needs one, before the calls.
     let mut pairs: Vec<(u32, u8, String)> = items
@@ -1345,12 +1498,14 @@ pub async fn reconcile_batch_with(
         .collect();
     pairs.sort_unstable();
     pairs.dedup();
+    let t = Instant::now();
     let answers = join_all(
         pairs
             .iter()
             .map(|(_, c, m)| local.implements_fungible(*c, m)),
     )
     .await;
+    ph.fungible = secs_since(t);
     let mut verdict: HashMap<(u32, u8), bool> = HashMap::new();
     for ((m, c, _), r) in pairs.iter().zip(answers) {
         match r {
@@ -1370,13 +1525,21 @@ pub async fn reconcile_batch_with(
     }
 
     // In-flight calls are capped by each client's semaphore (`local_concurrency`).
-    let outcomes: Vec<Outcome> = match pool {
+    let t = Instant::now();
+    let (outcomes, first): (Vec<Outcome>, Option<Instant>) = match pool {
         Some(p) => call_pooled(local, p, &items).await,
-        None => join_all(items.iter().map(|it| call(local, it))).await,
+        None => (join_all(items.iter().map(|it| call(local, it))).await, None),
     };
+    let end = Instant::now();
+    let first = first.unwrap_or(end).clamp(t, end);
+    ph.reads_batched = (first - t).as_secs_f64();
+    ph.reads_rereads = (end - first).as_secs_f64();
 
     let mut st = BatchStats::default();
+    let t = Instant::now();
     let mut txn = ctx.hot.rw()?;
+    ph.txn_wait = secs_since(t);
+    let t_write = Instant::now();
     for (&(m, c), &ok) in &verdict {
         balances::update_token(&mut txn, m, |t| {
             if now >= t.checked_at.saturating_add(caps.recheck_secs) {
@@ -1405,6 +1568,7 @@ pub async fn reconcile_batch_with(
                     prev_hash,
                     resolved,
                 } = *a;
+                let tb = Instant::now();
                 let branch = branch_of(&txn, it.chain, as_of, prev_hash.as_deref())?;
                 let ours = branch == Branch::Ours;
                 // I3 (PR #67 review): a lagging read node's answer never moves a row back.
@@ -1415,6 +1579,7 @@ pub async fn reconcile_batch_with(
                 // node ahead of our tail), the answer is stored unverified.
                 let keep_old =
                     branch == Branch::Other && txn.get(Table::Balances, &it.d.key)?.is_some();
+                ph.branch += secs_since(tb);
                 if newer {
                     tracing::debug!(
                         chain = it.chain,
@@ -1462,6 +1627,7 @@ pub async fn reconcile_batch_with(
                     };
                     write_row(&mut txn, it, row, coin)?;
                 }
+                let tc = Instant::now();
                 if ours && newer {
                     // I3: the row held is newer than this answer; a later read decides the
                     // mark (to the back of the queue, like a node error, no retry count).
@@ -1490,6 +1656,7 @@ pub async fn reconcile_batch_with(
                         st.no_hash += 1;
                     }
                 }
+                ph.clear += secs_since(tc);
                 st.ok += 1;
                 st.answered.insert(it.module);
             }
@@ -1502,14 +1669,21 @@ pub async fn reconcile_batch_with(
                     reconciled_at: now,
                     unverified: false,
                 };
-                if holds_newer(&txn, it, as_of)? {
+                let tb = Instant::now();
+                let newer = holds_newer(&txn, it, as_of)?;
+                ph.branch += secs_since(tb);
+                if newer {
                     // I3: never over a newer row; a later read decides the mark.
+                    let tc = Instant::now();
                     let m =
                         balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
                     st.remarked.push((it.d.key, m));
+                    ph.clear += secs_since(tc);
                 } else {
                     write_row(&mut txn, it, row, coin)?;
+                    let tc = Instant::now();
                     clear_if_covered(&mut txn, it, as_of)?;
+                    ph.clear += secs_since(tc);
                 }
                 st.absent += 1;
                 st.answered.insert(it.module);
@@ -1561,8 +1735,17 @@ pub async fn reconcile_batch_with(
             }
         }
     }
+    ph.write = (secs_since(t_write) - ph.branch - ph.clear).max(0.0);
+    let t = Instant::now();
     txn.commit()?;
+    ph.commit = secs_since(t);
+    ph.observe();
+    st.phases = ph;
     Ok(st)
+}
+
+fn secs_since(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64()
 }
 
 /// Count batches in a row in which every `details` call of a module failed (R-P5P9-8 #2); an
@@ -2127,12 +2310,15 @@ async fn reconcile_loop(
     let started = Instant::now();
     let mut last_log = Instant::now();
     let mut watch = BranchWatch::default();
+    let mut window = RefillWindow::default();
+    let mut refill_secs = 0.0f64;
     loop {
         if stop.is_cancelled() {
             return Ok(());
         }
         if o.seed && take_mark_gap(&ctx.hot)? {
             gap_warn();
+            window.clear();
             if !seed_pass(&ctx, &stop).await? {
                 return Ok(());
             }
@@ -2172,12 +2358,29 @@ async fn reconcile_loop(
         if det.calls() > 0 {
             tracing::debug!(?det, "nft: details read");
         }
-        let (h, n, share) = (ctx.hot.clone(), o.batch, o.caps.module_share);
-        let b = std::mem::take(&mut back);
-        let (batch, b) =
-            tokio::task::spawn_blocking(move || refill_with(&h, n, share, &b).map(|r| (r, b)))
-                .await??;
-        back = b;
+        // One walk of `BalanceDirty` per window of `refill_window_batches` batches; every
+        // batch of it still gets its own write txn, bookkeeping and backoff below.
+        if window.due(Instant::now(), WINDOW_MAX_AGE) {
+            let (h, n, share, k) = (
+                ctx.hot.clone(),
+                o.batch,
+                o.caps.module_share,
+                o.caps.refill_window_batches,
+            );
+            let b = std::mem::take(&mut back);
+            let t = Instant::now();
+            let (keys, b) = tokio::task::spawn_blocking(move || {
+                refill_window(&h, n, share, k, &b).map(|r| (r, b))
+            })
+            .await??;
+            back = b;
+            refill_secs = secs_since(t);
+            kdx_metrics::get().balance_batch_phase("refill", refill_secs);
+            // The age counts from the end of the walk: counted from its start, a walk and
+            // one slow batch would use up the age and every batch would refill again.
+            window.set(keys, Instant::now());
+        }
+        let batch = window.next_batch(o.batch);
         if batch.is_empty() {
             kdx_metrics::get()
                 .balance_dirty_rows
@@ -2205,12 +2408,16 @@ async fn reconcile_loop(
                 dirty,
                 rate = format!("{rate:.1}"),
                 wall_rate = format!("{wall:.1}"),
+                refill_secs = format!("{refill_secs:.2}"),
+                window_left = window.left(),
                 ?st,
                 "balances: reconcile"
             );
             last_log = Instant::now();
         }
+        let t = Instant::now();
         after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
+        kdx_metrics::get().balance_batch_phase("after", secs_since(t));
         note_remarked(&mut back, &batch, &st);
         let alert = watch.note(Instant::now(), &st);
         if let Some(n) = alert.no_hash {
@@ -4864,8 +5071,9 @@ pub(crate) mod tests {
             assert_eq!(dirty(&hot), 0);
         }
 
-        /// Calls spread over every read node; a node that fails is skipped and its reads go to
-        /// another node, with no node error left for the batch.
+        /// Batched calls go to the read nodes other than the primary (its budget is for the
+        /// reads only it decides); a node that fails is skipped and its reads go to another
+        /// node, with no node error left for the batch.
         #[tokio::test]
         async fn reads_spread_over_nodes_and_fail_over() {
             let names: Vec<String> = (0..40).map(|i| format!("acct{i}")).collect();
@@ -4881,8 +5089,7 @@ pub(crate) mod tests {
                 ma.batch_calls.load(Ordering::SeqCst),
                 mb.batch_calls.load(Ordering::SeqCst),
             );
-            assert_eq!(ca + cb, 10);
-            assert!(ca >= 3 && cb >= 3, "spread: {ca} / {cb}");
+            assert_eq!((ca, cb), (0, 10), "batched reads spare the primary");
 
             // The first node is down: everything is read on the second.
             let dir = tempfile::tempdir().unwrap();
@@ -5180,3 +5387,7 @@ mod miner_rows {
             .is_some()
     }
 }
+
+#[cfg(test)]
+#[path = "reconcile_drain_tests.rs"]
+mod drain_tests;

@@ -962,6 +962,11 @@ pub struct BalancesConfig {
     /// Worker threads that read and decode the D3 history walk's frozen slices (marks are
     /// still applied in TxNum order, one write txn per slice). 0: the cores less 2, at least 1.
     pub history_walk_threads: u32,
+    /// Reconcile batches one refill takes keys for (1..=32; 1: a refill every batch). The
+    /// refill walks all of `BalanceDirty` whatever its size, so a window of several batches
+    /// spends that walk once for all of them; every batch keeps its own write txn. A window
+    /// is taken again after 5 s even with keys left, so a fresh tip mark waits at most that.
+    pub refill_window_batches: u32,
 }
 
 impl Default for BalancesConfig {
@@ -980,6 +985,7 @@ impl Default for BalancesConfig {
             key_modules: vec!["coin".to_owned()],
             keylist_skip: vec!["free.crankk01".to_owned()],
             history_walk_threads: 0,
+            refill_window_batches: kdx_ingest::reconcile::DEFAULT_REFILL_WINDOW as u32,
         }
     }
 }
@@ -1036,6 +1042,13 @@ impl BalancesConfig {
                 && self.recheck_hours >= 1,
             "balances.module_share, module_rows, fungible_module_rows, account_rows and \
              recheck_hours must be >= 1"
+        );
+        anyhow::ensure!(
+            (1..=kdx_ingest::reconcile::MAX_REFILL_WINDOW as u32)
+                .contains(&self.refill_window_batches),
+            "balances.refill_window_batches must be in 1..={} (got {})",
+            kdx_ingest::reconcile::MAX_REFILL_WINDOW,
+            self.refill_window_batches
         );
         anyhow::ensure!(
             self.history_walk_threads <= 256,
@@ -1356,6 +1369,21 @@ mod balances_tests {
     fn balances_values_are_validated() {
         let ok = BalancesConfig::default();
         assert!(ok.validate().is_ok());
+        assert_eq!(ok.refill_window_batches, 8);
+        for k in [0, 33] {
+            let bad = BalancesConfig {
+                refill_window_batches: k,
+                ..ok.clone()
+            };
+            assert!(bad.validate().is_err(), "refill_window_batches {k}");
+        }
+        for k in [1, 32] {
+            let fine = BalancesConfig {
+                refill_window_batches: k,
+                ..ok.clone()
+            };
+            assert!(fine.validate().is_ok(), "refill_window_batches {k}");
+        }
         assert_eq!(ok.key_modules, ["coin"]);
         assert_eq!(ok.keylist_skip, ["free.crankk01"]);
         let wide = BalancesConfig {

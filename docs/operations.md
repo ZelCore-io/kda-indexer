@@ -856,6 +856,19 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
   receivers pass wait behind, and tip marks (the tip share of the batch) wait for the whole
   round. Watch `kdx_balance_reconcile_seconds` and the tail's lag when raising
   `local_batch_keys`.
+- **Refill window** (`refill_window_batches`, 1..=32, default 8): picking a batch walks all of
+  `BalanceDirty` (seconds on a 10M-row backlog, whatever the batch size), so one walk takes
+  keys for this many batches at once. Each batch of the window keeps its own write
+  transaction, bookkeeping and backoff, and clears only the exact mark it read, so a key the
+  tail marks again meanwhile is read again later. The window is taken again once used up or
+  5 s old, so a fresh tip mark waits at most about 5 s; the tip share leads every window. 1
+  walks the table before every batch (the behaviour before windows). The INFO line
+  `balances: reconcile` shows `refill_secs` (the last walk) and `window_left`, and its `st`
+  carries `phases`, the last batch's seconds per phase; `kdx_balance_batch_phase_seconds{phase}`
+  has them all: `refill`, `prep`, `fungible`, `reads_batched` (until the last chunk's batched
+  answer), `reads_rereads` (keys read alone after it: `try` markers and absent answers asked
+  of `node.url`, at most `local_rps` a second), `txn_wait`, `branch`, `write`, `clear`,
+  `commit` and `after`.
 - **Read nodes** (`local_urls`, at most 8): the `details` reads are spread round robin over
   these chainweb service APIs, each with its own `local_rps` (≤ 50) and `local_concurrency`
   caps, so N nodes give N times the budget, and up to N × `local_concurrency` `/local` calls
@@ -893,6 +906,7 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
 local_rps = 50
 local_concurrency = 8
 local_batch_keys = 25
+refill_window_batches = 8
 # node.url first; the others are extra chainweb nodes reachable from this host.
 local_urls = [
   "http://127.0.0.1:1848",

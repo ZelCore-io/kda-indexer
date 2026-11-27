@@ -90,6 +90,10 @@ pub struct Metrics {
     pub balance_reconcile: Count,
     /// Duration of one `/local` reconcile call (`result` as above).
     pub balance_reconcile_seconds: Hist,
+    /// Time one reconcile batch (or the loop around it) spends per phase: `refill`, `prep`,
+    /// `fungible`, `reads_batched`, `reads_rereads`, `txn_wait`, `branch`, `write`, `clear`,
+    /// `commit`, `after`.
+    pub balance_batch_phase_seconds: Hist,
     /// Balance `/local` reads per read node (`node` = n0, n1, … in `balances.local_urls`
     /// order; `result` = ok | absent | error | invalid | node_error | lagging | ahead).
     pub balance_local_node_calls: Count,
@@ -373,6 +377,12 @@ impl Metrics {
             "Balance reconcile call duration (result ok|absent|error|skipped)",
             hist(seconds)
         );
+        let balance_batch_phase_seconds = reg!(
+            "kdx_balance_batch_phase_seconds",
+            "Balance reconcile batch time per phase (refill|prep|fungible|reads_batched|\
+             reads_rereads|txn_wait|branch|write|clear|commit|after)",
+            hist(seconds)
+        );
         let balance_local_node_calls = reg!(
             "kdx_balance_local_node_calls",
             "Balance /local reads per read node (node, result ok|absent|error|invalid|node_error|lagging|ahead)",
@@ -492,6 +502,7 @@ impl Metrics {
             balance_receivers_pass_failed,
             balance_reconcile,
             balance_reconcile_seconds,
+            balance_batch_phase_seconds,
             balance_local_node_calls,
             balance_local_node_keys,
             balance_local_node_up,
@@ -615,6 +626,13 @@ impl Metrics {
         self.balance_reconcile.get_or_create(&l).inc();
         self.balance_reconcile_seconds
             .get_or_create(&l)
+            .observe(secs);
+    }
+
+    /// Seconds one reconcile batch phase took (see `balance_batch_phase_seconds`).
+    pub fn balance_batch_phase(&self, phase: &'static str, secs: f64) {
+        self.balance_batch_phase_seconds
+            .get_or_create(&vec![("phase", phase.into())])
             .observe(secs);
     }
 
