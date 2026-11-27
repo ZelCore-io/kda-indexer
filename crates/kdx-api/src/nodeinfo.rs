@@ -36,7 +36,7 @@ pub struct NodeFacts {
     pub genesis_heights: Vec<(String, i64)>,
     /// `nodePackageVersion`.
     pub package_version: String,
-    /// `nodeServiceDate` text, `None` when the node sends `null`.
+    /// `nodeServiceDate` text, `None` when the node sends `null` or omits it.
     pub service_date: Option<String>,
     /// `nodeLatestBehaviorHeight`.
     pub latest_behavior_height: i64,
@@ -65,10 +65,12 @@ impl NodeFacts {
                 Some((a[0].as_str()?.to_owned(), a[1].as_i64()?))
             })
             .collect::<Option<Vec<_>>>()?;
-        let service_date = match v.get("nodeServiceDate")? {
-            Value::Null => None,
-            Value::String(s) => Some(s.clone()),
-            _ => return None,
+        // `nodeServiceDate` is nullable in stock's schema; chainweb-node 3.2.1 omits it, so an
+        // absent key is `None` like `null` (any other type still rejects the answer).
+        let service_date = match v.get("nodeServiceDate") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return None,
         };
         // Checked as stock checks it, though `networkId` comes from the config.
         text("nodeVersion")?;
@@ -145,6 +147,21 @@ mod tests {
         assert_eq!(NodeFacts::from_info(&v).unwrap().service_date, None);
     }
 
+    /// chainweb-node 3.2.1 omits `nodeServiceDate`: the answer still parses, every other
+    /// field is served and the date is `None`.
+    #[test]
+    fn an_answer_without_node_service_date_still_parses() {
+        let mut v = mainnet_info();
+        v.as_object_mut().unwrap().remove("nodeServiceDate");
+        let f = NodeFacts::from_info(&v).expect("parses without nodeServiceDate");
+        assert_eq!(f.service_date, None);
+        assert_eq!(f.api_version, "0.0");
+        assert_eq!(f.package_version, "2.29");
+        assert_eq!(f.number_of_chains, 20);
+        assert_eq!(f.latest_behavior_height, 5_785_924);
+        assert!(store(&SharedFacts::empty(), &v));
+    }
+
     #[test]
     fn a_missing_or_mistyped_field_keeps_the_last_good_answer() {
         let slot = SharedFacts::empty();
@@ -166,7 +183,12 @@ mod tests {
             assert_eq!(slot.load_full().unwrap(), good, "{k}");
             let mut v = mainnet_info();
             v.as_object_mut().unwrap().remove(k);
-            assert!(NodeFacts::from_info(&v).is_none(), "{k} absent");
+            // `nodeServiceDate` is the one nullable field: absent is `None`, not a reject.
+            assert_eq!(
+                NodeFacts::from_info(&v).is_none(),
+                k != "nodeServiceDate",
+                "{k} absent"
+            );
         }
         assert!(NodeFacts::from_info(&json!([])).is_none());
     }

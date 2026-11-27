@@ -443,6 +443,22 @@ mod tests {
         assert_eq!(v["networkInfo"]["apiVersion"], "0.1");
     }
 
+    /// A `/info` without `nodeServiceDate` (chainweb-node 3.2.1) serves every other node
+    /// field and a `null` date, with no error.
+    #[tokio::test]
+    async fn an_info_without_node_service_date_serves_the_other_fields() {
+        let mut n = mainnet_info();
+        n.as_object_mut().unwrap().remove("nodeServiceDate");
+        let r = run_node(Some(n)).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let v = serde_json::to_value(&r.data).unwrap();
+        assert!(v["networkInfo"]["nodeServiceDate"].is_null());
+        assert_eq!(v["networkInfo"]["nodePackageVersion"], "2.29");
+        assert_eq!(v["networkInfo"]["numberOfChains"], 20);
+        assert_eq!(v["networkInfo"]["nodeLatestBehaviorHeight"], 5785924);
+        assert_eq!(v["networkInfo"]["nodeChains"].as_array().unwrap().len(), 4);
+    }
+
     /// Before the first good `/info` answer each node field is `null` with `NOT_AVAILABLE`
     /// beside it, the six non-null ones too (`NOT_AVAILABLE` nulls in place, #62), and
     /// `nodeServiceDate`; the other fields still answer and `apiVersion` is `"0.0"`.
