@@ -68,6 +68,9 @@ pub struct Metrics {
     pub disk_free_bytes: Gauge,
     pub mdbx_commit_seconds: Histogram,
     pub http_requests: Count,
+    /// `[api.request_log]` lines per result: `written`, `dropped` (queue full: lines),
+    /// `dropped_bytes` (queue full: bytes) or `error` (the write failed).
+    pub request_log_lines: Count,
     pub http_request_seconds: Hist,
     pub search_rejected: Count,
     /// Payload Merkle check per ingested block: `result` = verified | mismatch_legacy |
@@ -270,6 +273,11 @@ impl Metrics {
         let http_requests = reg!(
             "kdx_http_requests",
             "HTTP requests per api, route template and status",
+            Count::default()
+        );
+        let request_log_lines = reg!(
+            "kdx_request_log_lines",
+            "Request log lines per result (written, dropped or dropped_bytes on a full queue, error)",
             Count::default()
         );
         let http_request_seconds = reg!(
@@ -490,6 +498,7 @@ impl Metrics {
             disk_free_bytes,
             mdbx_commit_seconds,
             http_requests,
+            request_log_lines,
             http_request_seconds,
             search_rejected,
             merkle_blocks,
@@ -695,6 +704,25 @@ impl Metrics {
                 .get_or_create(&l)
                 .set(i64::try_from(n.saturating_sub(indexed)).unwrap_or(i64::MAX));
         }
+    }
+
+    /// One request log line with `result` (`written`, `dropped`, `error`).
+    pub fn request_log(&self, result: &'static str) {
+        self.request_log_lines
+            .get_or_create(&vec![("result", result.to_string())])
+            .inc();
+    }
+
+    /// Lowest and highest indexed tip over the chains last sampled (None before the first
+    /// sample).
+    pub fn indexed_tip_range(&self) -> Option<(i64, i64)> {
+        let hs: Vec<i64> = (0..20u8)
+            .filter_map(|c| {
+                let l: Labels = vec![("chain", c.to_string())];
+                self.indexed_tip_height.get(&l).map(|g| g.get())
+            })
+            .collect();
+        Some((*hs.iter().min()?, *hs.iter().max()?))
     }
 
     /// Largest chain lag last sampled (None before the first sample with known node tips).

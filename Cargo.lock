@@ -1770,6 +1770,7 @@ name = "kdx-compare"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-graphql-parser",
  "axum",
  "bytes",
  "clap",

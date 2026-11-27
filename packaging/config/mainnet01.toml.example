@@ -58,6 +58,17 @@ read_threads = 4          # concurrent store reads (half for heavy lists, a quar
 ready_max_lag = 20        # /readyz: max blocks a chain may lag the node (a halted chain is never ready)
 max_event_lists = 256     # event-name lists one event query may expand to
 
+# [api.request_log]           # opt-in: one JSON line per compat/GraphQL request (docs/operations.md)
+# enabled = false
+# path = "requests/requests.jsonl"   # relative = under the data dir (writable under the unit)
+# max_mb = 256                # rotate at this size into .1 (newest) .. .<keep>
+# keep = 8
+# sample_rate = 1.0           # share of requests logged (every n-th)
+# max_body_bytes = 16384      # a larger GraphQL body is not written, only its length
+# queue = 8192                # lines waiting for the writer; more are dropped and counted
+# queue_mb = 8                # bytes waiting for the writer; more are dropped and counted
+# client_ip = "hash"          # "hash" (keyed per process) or "omit"; never the raw address
+
 
 [graphql]
 # GraphQL limits (docs/graphql.md); the listener address is api.graphql. All optional.

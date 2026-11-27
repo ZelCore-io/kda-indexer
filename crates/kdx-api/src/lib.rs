@@ -10,6 +10,7 @@ pub mod limits;
 pub mod native;
 pub mod nodeinfo;
 pub mod openapi;
+pub mod reqlog;
 pub mod sampler;
 pub mod search;
 pub mod server;

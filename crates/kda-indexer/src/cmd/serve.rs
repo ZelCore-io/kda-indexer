@@ -161,10 +161,15 @@ pub fn api(
         max_results: cfg.search.max_results as usize,
     };
     let search = kdx_api::search::SearchCtx::new(settings, Some(kdx_search::search_dir(data_dir)));
-    let api = Api::new(store, cfg.api.settings(&cfg.network)?, tips)
+    let mut api = Api::new(store, cfg.api.settings(&cfg.network)?, tips)
         .docs_enabled(cfg.api.docs_enabled)
         .native_routes(kdx_api::native::router(search.clone()))
         .compat_routes(kdx_api::compat::router(search.clone()));
+    if cfg.api.request_log.enabled {
+        let s = cfg.api.request_log.settings(data_dir);
+        tracing::info!(path = %s.path.display(), sample_rate = s.sample_rate, "request log on");
+        api = api.request_log(kdx_api::reqlog::RequestLog::start(s)?);
+    }
     api.state()
         .set_key_modules(cfg.balances.key_modules.clone());
     // GraphQL (spec §5.3) on `api.graphql`; subscriptions come from the committed-block feed

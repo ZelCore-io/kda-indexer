@@ -49,6 +49,16 @@ enum Cmd {
         #[arg(long, hide = true)]
         mutate: Option<String>,
     },
+    /// Hourly validation: replay logged requests (JSON lines on stdin: `{"id", "path"}` for a
+    /// REST path, `{"id", "query", "variables"}` for a GraphQL document) through every
+    /// configured pair, with the normalisers, allowlist, node oracles and target rate caps of
+    /// `run`. Prints one verdict line per item (`{"id", "skip", "outcomes": [{"class",
+    /// "allowlist", "record"?}]}`), in completion order.
+    ReplayBatch {
+        /// Items compared at the same time (each target keeps its own rate cap).
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
+    },
     /// Import an HAProxy HTTP log into a replay TSV.
     ReplayImport {
         #[arg(long)]
@@ -259,6 +269,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Ok(())
+        }
+        Cmd::ReplayBatch { concurrency } => {
+            let mut items = Vec::new();
+            for (n, line) in std::io::stdin().lines().enumerate() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let it: kdx_compare::run::BatchItem =
+                    serde_json::from_str(&line).with_context(|| format!("stdin line {}", n + 1))?;
+                items.push(it);
+            }
+            let mut out = std::io::stdout();
+            kdx_compare::run::replay_batch(cfg, items, concurrency, &mut out).await
         }
         Cmd::ReplayImport { haproxy, out } => {
             let (lines, kept, distinct) = replay::import(&haproxy, &out)?;

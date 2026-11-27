@@ -149,6 +149,8 @@ pub struct ApiState {
     /// The `/stats` count cache: the process-wide one (GraphQL `networkInfo` shares it); a
     /// test injects its own (FV-6).
     pub(crate) stats_cache: &'static crate::compat::stats::CountCache,
+    /// `[api.request_log]` when on ([`Api::request_log`]).
+    request_log: std::sync::OnceLock<crate::reqlog::RequestLog>,
 }
 
 tokio::task_local! {
@@ -302,6 +304,12 @@ impl ApiState {
     /// burst (R-P5P9-57).
     pub fn allow_ip_borrowing(&self, ip: std::net::IpAddr, n: u32, borrow: u32) -> bool {
         self.limiter.allow_n_borrowing(ip, n, borrow)
+    }
+
+    /// The request log, when `[api.request_log]` is on (the GraphQL handler hands it the
+    /// POST body only then).
+    pub fn request_log(&self) -> Option<&crate::reqlog::RequestLog> {
+        self.request_log.get()
     }
 
     /// The client IP of a request (`trusted_proxies` applied, as the guard).
@@ -850,6 +858,7 @@ impl Api {
             key_modules: std::sync::OnceLock::new(),
             graphql_extra: std::sync::OnceLock::new(),
             stats_cache: &crate::compat::stats::CACHE,
+            request_log: std::sync::OnceLock::new(),
             in_flight: Arc::new(Semaphore::new(settings.max_in_flight.max(1))),
             limiter: RateLimiter::new(settings.rate_per_ip, settings.rate_burst),
             store,
@@ -898,6 +907,12 @@ impl Api {
     /// [`WRITE_IDLE_TIMEOUT`]).
     pub fn write_idle_timeout(mut self, d: Duration) -> Api {
         self.write_idle = d;
+        self
+    }
+
+    /// Log the compat and GraphQL listeners' requests to `log` (`[api.request_log]`).
+    pub fn request_log(self, log: crate::reqlog::RequestLog) -> Api {
+        let _ = self.state.request_log.set(log);
         self
     }
 
@@ -967,6 +982,21 @@ impl Api {
                 .allow_methods(Any)
                 .allow_headers(Any),
         );
+        // The request log wraps the whole listener (CORS, guard and all), so it records what
+        // the client got.
+        let (compat, graphql) = match st.request_log() {
+            Some(log) => (
+                compat.layer(middleware::from_fn_with_state(
+                    ("compat", log.clone(), st.clone()),
+                    crate::reqlog::layer,
+                )),
+                graphql.layer(middleware::from_fn_with_state(
+                    ("graphql", log.clone(), st.clone()),
+                    crate::reqlog::layer,
+                )),
+            ),
+            None => (compat, graphql),
+        };
         let admin = admin::router()
             .layer(middleware::from_fn_with_state(st.clone(), admin_guard))
             .layer(middleware::from_fn_with_state("admin", track))
@@ -1167,6 +1197,102 @@ pub(crate) mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// `[api.request_log]`: the compat and GraphQL listeners log one line per request (the
+    /// GraphQL body from the handler's response extension, the client hashed), the native
+    /// listener none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_log_covers_compat_and_graphql_only() {
+        use crate::reqlog::{ClientIp, RequestLog, Settings};
+        let (d, store) = crate::testutil::store();
+        let path = d.path().join("log").join("requests.jsonl");
+        let log = RequestLog::start(Settings {
+            path: path.clone(),
+            max_bytes: 1 << 20,
+            keep: 1,
+            sample_rate: 1.0,
+            max_body_bytes: 4096,
+            queue: 16,
+            queue_max_bytes: 1 << 20,
+            client_ip: ClientIp::Hash,
+        })
+        .unwrap();
+        let ok = || async { "ok" };
+        let gql_log = log.clone();
+        let gql = move |body: axum::body::Bytes| async move {
+            let mut r = "{}".into_response();
+            r.extensions_mut().insert(gql_log.graphql_body(&body));
+            r
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let api = Api::new(store, settings(4), TipWatch::default())
+            .native_routes(Router::new().route("/n", axum::routing::get(ok)))
+            .compat_routes(Router::new().route("/txs/c/{a}", axum::routing::get(ok)))
+            .graphql_routes(Router::new().route("/graphql", axum::routing::post(gql)))
+            .request_log(log.clone())
+            .on_bound(move |a| {
+                let _ = tx.send(a.to_vec());
+            });
+        let binds = Binds {
+            native: vec!["127.0.0.1:0".parse().unwrap()],
+            compat: vec!["127.0.0.1:0".parse().unwrap()],
+            graphql: vec!["127.0.0.1:0".parse().unwrap()],
+            ..Binds::default()
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(api.serve(binds, stop.clone()));
+        let addrs = rx.await.unwrap();
+        let at = |n: &str| addrs.iter().find(|(k, _)| *k == n).unwrap().1;
+        let (native, compat, graphql) = (at("native"), at("compat"), at("graphql"));
+        let body = r#"{"query":"query { lastBlockHeight }","variables":{}}"#;
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let send = |a: SocketAddr, req: String| {
+                let mut c = std::net::TcpStream::connect(a).unwrap();
+                c.write_all(req.as_bytes()).unwrap();
+                let mut s = String::new();
+                let _ = c.read_to_string(&mut s);
+                assert!(s.starts_with("HTTP/1.1 200"), "{s}");
+            };
+            send(native, "GET /n HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".into());
+            send(
+                compat,
+                "GET /txs/c/k%3Aab?limit=5 HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n".into(),
+            );
+            send(
+                graphql,
+                format!(
+                    "POST /graphql HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            );
+        })
+        .await
+        .unwrap();
+        let t0 = Instant::now();
+        while log.counts().0 < 2 && t0.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(log.counts(), (2, 0));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        let c = lines.iter().find(|v| v["listener"] == "compat").unwrap();
+        assert_eq!(c["method"], "GET");
+        assert_eq!(c["uri"], "/txs/c/k%3Aab?limit=5");
+        assert_eq!(c["route"], "/txs/c/{a}");
+        assert_eq!(c["status"], 200);
+        assert_eq!(c["client"].as_str().unwrap().len(), 16);
+        let g = lines.iter().find(|v| v["listener"] == "graphql").unwrap();
+        assert_eq!(g["gql"]["query"], "query { lastBlockHeight }");
+        assert!(!text.contains("127.0.0.1") && !text.contains("203.0.113.9"));
+        stop.cancel();
+        task.await.unwrap().unwrap();
     }
 
     /// F-08 (triage check): a client that stops reading a whole-body response does not hold

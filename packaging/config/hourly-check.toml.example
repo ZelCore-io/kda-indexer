@@ -1,0 +1,66 @@
+# scripts/hourly_check.py (installed as /usr/share/kda-indexer/compare/hourly_check.py):
+# the hourly answer check after a cutover (docs/operations.md "Hourly validation").
+# Run it a few minutes past each hour for the previous hour:
+#   python3 /usr/share/kda-indexer/compare/hourly_check.py --config /etc/kda-indexer/hourly-check.toml
+# Exit 0 = pass, 1 = fail, 2 = could not run or busy, 3 = inconclusive. Output: a summary on stdout and
+# <out_dir>/hourly-<YYYY-MM-DDTHH>.json.
+
+# The indexer's request log ([api.request_log] path, resolved under the data dir).
+log = "/opt/coins/data/kadena/kda-indexer/mainnet01/requests/requests.jsonl"
+
+# kda-compare and a compare config for the replay. Its pairs decide what each request is
+# compared with; its targets carry the stock rate caps (see "The compare config" below).
+compare_bin = "/usr/bin/kda-compare"
+compare_config = "/etc/kda-indexer/compare-hourly.toml"
+
+native_url = "http://127.0.0.1:31361"   # /status: our tip and hash per chain
+admin_url = "http://127.0.0.1:31369"    # /metrics: halted chains, lag, 5xx, drain
+node_url = "http://127.0.0.1:31351"     # the node's cut and headers
+network = "mainnet01"
+unit = "kda-indexer-mainnet01"          # restarts (NRestarts, MainPID); "" to skip
+out_dir = "/var/lib/kda-indexer/hourly"
+
+budget = 2000            # requests replayed per hour at most
+per_route = 300          # per route at most, after one of every distinct query shape
+concurrency = 2          # requests compared at the same time (each target keeps its rate cap)
+deadline_minutes = 50    # one deadline for the whole run, re-check included; the rest is not-run
+recheck_delay_s = 30     # a differing request is asked again once after this
+ready_max_lag = 20       # api.ready_max_lag
+max_5xx_share = 0.005    # per route, with at least min_5xx answers
+min_5xx = 2
+min_compared_share = 0.6 # inconclusive (exit 3) below this share of the sample compared ...
+min_compared = 200       # ... or below this many, whichever is higher
+
+# The compare config (/etc/kda-indexer/compare-hourly.toml), in the format of
+# compare.toml.example, with the stock caps: chainweb-data 1 r/s, kda-txs and the GraphQL
+# indexer 2 r/s (the GraphQL oracle is capped at 1 r/s by kda-compare whatever is set).
+# rate_rps is the shared bucket of targets without their own rate.
+#
+#   network = "mainnet01"
+#   rate_rps = 4.0
+#   allowlist = "/usr/share/kda-indexer/compare/allowlist.toml"
+#   out_dir = "/var/lib/kda-indexer/hourly/compare"
+#   pairs = [["compat", "cwd"], ["compat", "kdatxs"], ["compat", "node"], ["gql", "oracle"]]
+#   [node]
+#   url = "http://127.0.0.1:31351"
+#   [targets.compat]
+#   url = "http://127.0.0.1:31362"
+#   kind = "kda_indexer_compat"
+#   [targets.cwd]
+#   url = "http://<chainweb-data host>:31352"
+#   kind = "chainweb_data"
+#   rate_rps = 1.0
+#   [targets.kdatxs]
+#   url = "http://<kda-txs host>:9876"
+#   kind = "kda_txs"
+#   rate_rps = 2.0
+#   [targets.gql]
+#   url = "http://127.0.0.1:31363/graphql"
+#   kind = "kda_indexer_graphql"
+#   [targets.oracle]
+#   url = "https://<graphql indexer host>/graphql"
+#   kind = "graphql_oracle"
+#   max_height = <height>   # required: the oracle's stall height minus a margin
+#   rate_rps = 1.0
+#   [graphql]
+#   own_ops_dir = "/usr/share/kda-indexer/compare/graphql"

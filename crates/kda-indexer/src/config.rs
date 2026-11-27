@@ -340,6 +340,107 @@ pub struct ApiConfig {
     pub ready_max_lag: u32,
     /// Most event-name lists one event query expands to.
     pub max_event_lists: usize,
+    /// Opt-in request log of the compat and GraphQL listeners (off by default).
+    pub request_log: RequestLogConfig,
+}
+
+/// `[api.request_log]`: one JSON line per served compat or GraphQL request, for the hourly
+/// answer check after a cutover (operations.md "Request log").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RequestLogConfig {
+    pub enabled: bool,
+    /// The log file; a relative path is under the data dir. Rotated files get `.1` (newest)
+    /// to `.<keep>`.
+    pub path: PathBuf,
+    /// Rotate when the current file reaches this many MB.
+    pub max_mb: u64,
+    /// Rotated files kept (0 = truncate instead).
+    pub keep: u32,
+    /// Share of requests logged, 0.0 to 1.0 (every n-th request).
+    pub sample_rate: f64,
+    /// A GraphQL POST body larger than this is not written (its length is).
+    pub max_body_bytes: usize,
+    /// Lines waiting for the writer at most; more are dropped and counted.
+    pub queue: usize,
+    /// MB waiting for the writer at most (bodies and URIs); more are dropped and counted.
+    pub queue_mb: u64,
+    /// `hash` (keyed per process) or `omit`. The raw address is never written.
+    pub client_ip: String,
+}
+
+impl Default for RequestLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from("requests/requests.jsonl"),
+            max_mb: 256,
+            keep: 8,
+            sample_rate: 1.0,
+            max_body_bytes: 16 * 1024,
+            queue: 8192,
+            queue_mb: 8,
+            client_ip: "hash".into(),
+        }
+    }
+}
+
+/// Most rotated request log files (`api.request_log.keep`): every rotation renames them all.
+pub const MAX_REQUEST_LOG_KEEP: u32 = 1000;
+
+impl RequestLogConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.sample_rate),
+            "api.request_log.sample_rate must be between 0.0 and 1.0"
+        );
+        anyhow::ensure!(
+            self.max_mb >= 1,
+            "api.request_log.max_mb must be at least 1"
+        );
+        anyhow::ensure!(self.queue >= 1, "api.request_log.queue must be at least 1");
+        anyhow::ensure!(
+            (1..=1024).contains(&self.queue_mb),
+            "api.request_log.queue_mb must be between 1 and 1024"
+        );
+        anyhow::ensure!(
+            self.keep <= MAX_REQUEST_LOG_KEEP,
+            "api.request_log.keep must be at most {MAX_REQUEST_LOG_KEEP}"
+        );
+        anyhow::ensure!(
+            u64::try_from(self.max_body_bytes).unwrap_or(u64::MAX) <= self.queue_mb << 20,
+            "api.request_log.max_body_bytes must be at most queue_mb ({} MB)",
+            self.queue_mb
+        );
+        anyhow::ensure!(
+            matches!(self.client_ip.as_str(), "hash" | "omit"),
+            "api.request_log.client_ip must be \"hash\" or \"omit\""
+        );
+        anyhow::ensure!(
+            !self.path.as_os_str().is_empty(),
+            "api.request_log.path must not be empty"
+        );
+        Ok(())
+    }
+
+    /// The writer's settings, with a relative `path` under `data_dir`.
+    pub fn settings(&self, data_dir: &std::path::Path) -> kdx_api::reqlog::Settings {
+        kdx_api::reqlog::Settings {
+            path: data_dir.join(&self.path),
+            max_bytes: self.max_mb.saturating_mul(1 << 20),
+            keep: self.keep,
+            sample_rate: self.sample_rate,
+            max_body_bytes: self.max_body_bytes,
+            queue: self.queue,
+            queue_max_bytes: usize::try_from(self.queue_mb.saturating_mul(1 << 20))
+                .unwrap_or(usize::MAX),
+            client_ip: if self.client_ip == "omit" {
+                kdx_api::reqlog::ClientIp::Omit
+            } else {
+                kdx_api::reqlog::ClientIp::Hash
+            },
+        }
+    }
 }
 
 impl Default for ApiConfig {
@@ -361,6 +462,7 @@ impl Default for ApiConfig {
             read_threads: 4,
             ready_max_lag: 20,
             max_event_lists: 256,
+            request_log: RequestLogConfig::default(),
         }
     }
 }
@@ -1189,6 +1291,7 @@ impl Config {
         );
         anyhow::ensure!(b.dict_samples > 0, "backfill.dict_samples must be > 0");
         self.balances.validate()?;
+        self.api.request_log.validate()?;
         self.graphql.validate()?;
         self.dex_usd.validate()?;
         let s = &self.search;
@@ -1472,6 +1575,59 @@ mod api_tests {
 
     fn api(text: &str) -> anyhow::Result<ApiConfig> {
         Ok(toml::from_str::<ApiConfig>(text)?)
+    }
+
+    /// `[api.request_log]` is off by default, takes its keys, resolves a relative path under
+    /// the data dir, and refuses out-of-range values and unknown keys.
+    #[test]
+    fn request_log_is_off_by_default_and_checked() {
+        let d = api("").unwrap().request_log;
+        assert!(!d.enabled);
+        assert!(d.validate().is_ok());
+        let a = api(r#"
+            [request_log]
+            enabled = true
+            path = "log/req.jsonl"
+            max_mb = 64
+            keep = 3
+            sample_rate = 0.5
+            client_ip = "omit"
+        "#)
+        .unwrap()
+        .request_log;
+        assert!(a.enabled && a.validate().is_ok());
+        let s = a.settings(Path::new("/data"));
+        assert_eq!(s.path, Path::new("/data/log/req.jsonl"));
+        assert_eq!(s.max_bytes, 64 << 20);
+        assert_eq!(s.queue_max_bytes, 8 << 20);
+        assert_eq!(s.client_ip, kdx_api::reqlog::ClientIp::Omit);
+        let abs = api("[request_log]\npath = \"/var/tmp/r.jsonl\"")
+            .unwrap()
+            .request_log;
+        assert_eq!(
+            abs.settings(Path::new("/data")).path,
+            Path::new("/var/tmp/r.jsonl")
+        );
+        for bad in [
+            "sample_rate = 1.5",
+            "sample_rate = -0.1",
+            "max_mb = 0",
+            "queue = 0",
+            "queue_mb = 0",
+            "client_ip = \"raw\"",
+            "path = \"\"",
+            "keep = 1001",
+            "max_body_bytes = 8388609",
+            "queue_mb = 1\nmax_body_bytes = 1048577",
+        ] {
+            let c = api(&format!("[request_log]\n{bad}")).unwrap().request_log;
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        assert!(api("[request_log]\nheaders = true").is_err());
+        for ok in ["keep = 1000", "max_body_bytes = 8388608"] {
+            let c = api(&format!("[request_log]\n{ok}")).unwrap().request_log;
+            assert!(c.validate().is_ok(), "{ok}");
+        }
     }
 
     /// Task 10: a listener takes one address or an array; every address is in `Binds`.

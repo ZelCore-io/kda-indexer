@@ -2,8 +2,9 @@
 
 This page shows how to put kda-indexer's compat API behind an existing HAProxy that already
 sends the chainweb-data routes (`/txs/*`, `/stats`, `/coins`) to chainweb-data and `/v1/txs`
-to the old wallet-history service, and how to move those routes to kda-indexer **one step at a
-time**, each step with a rollback that takes under a minute.
+to the old wallet-history service, and how to move those routes to kda-indexer: **all at once
+in one step** (the default, section 3), or one route group at a time (section 3a). Either way the
+rollback takes under a minute.
 
 Names in angle brackets are placeholders:
 
@@ -118,10 +119,43 @@ backend kdx_compat
 - `observe layer4 … on-error mark-down` takes a server out after connection errors without
   waiting for three failed checks.
 
-## 3. One step = one ACL and one `use_backend` line
+## 3. The cutover: every route in one step (default)
 
-Each step adds a named ACL for its paths and one `use_backend` line to the frontend that
-serves these routes today. The first step also adds the shared method ACL:
+One change moves every route at once: the method ACL, the route ACLs and one `use_backend`
+line, added to the frontend that serves these routes today, above its existing rules:
+
+```haproxy
+    # kda-indexer cutover (single step). Keep every kdx line above the existing use_backend lines.
+    acl kdx_read method GET HEAD OPTIONS
+    acl kdx_routes path /txs/tx /txs/txs /txs/recent /stats /coins /txs/events /txs/search /v1/txs
+    acl kdx_routes path_reg ^/txs/account/[^/]+$
+    acl kdx_routes path_beg /v1/txs/
+    use_backend kdx_compat if kdx_read kdx_routes { nbsrv(kdx_compat) gt 0 }
+```
+
+Three ACL lines with the same name are ORed: the routes are exactly those of steps 1 to 5 in
+section 3a, with the same matching rules (below). The rollback is deleting the one
+`use_backend` line (section 4); the ACL lines may stay.
+
+After the reload, check the moved routes at 15 minutes, 1 hour and every hour for the first
+24 hours (section 4 and the hourly validation in [operations.md](operations.md)): with every
+route moved at once there is no earlier step's canary to lean on, so the hourly answer check
+against the old services (which keep running) is what catches a wrong answer.
+
+If the balancer also carries the GraphQL path to the old GraphQL indexer, move it in the same
+change with its own backend (section 7):
+
+```haproxy
+    acl kdx_gql path /graphql
+    use_backend kdx_graphql if kdx_gql { nbsrv(kdx_graphql) gt 0 }
+```
+
+GraphQL is POST as well as GET (and the websocket upgrade), so this rule has no method ACL.
+
+## 3a. Alternative: one step per route group
+
+To move the routes in five steps instead, each with a 24 h canary, each step adds a named ACL
+for its paths and one `use_backend` line. The first step also adds the shared method ACL:
 
 ```haproxy
     # kda-indexer cutover. Keep every kdx line above the existing use_backend lines.
@@ -167,7 +201,7 @@ any server line in the old `/v1` backend that has nothing listening behind it.
 
 ## 4. Apply, check, roll back
 
-**Apply** (on `<lb>`):
+**Apply** (on `<lb>`; for the single step, `N` is `all` and the lines are section 3's):
 
 ```sh
 cp -a /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.before-kdx-stepN
@@ -199,7 +233,19 @@ before each reload.
 | Wallet history | a fixed list of about 20 known accounts, requested through the balancer and compared with chainweb-data direct (`kda-compare once <path>`) | any failure |
 | Indexer health | `kdx_chain_lag_blocks`, `kdx_chain_halted`, the unit's restarts | a halted chain or the lag alert |
 
-**Roll back** a step: delete that step's `use_backend` line (its ACL lines may stay), then
+**Roll back** the single step: delete its `use_backend` line on a candidate copy, check it,
+install it and reload (every route goes back to the old backends at once):
+
+```sh
+cp /etc/haproxy/haproxy.cfg /tmp/haproxy.cand
+sed -i '/^ *use_backend kdx_compat if kdx_read kdx_routes /d' /tmp/haproxy.cand
+haproxy -c -f /tmp/haproxy.cand && install -m 644 /tmp/haproxy.cand /etc/haproxy/haproxy.cfg && systemctl reload haproxy
+```
+
+With GraphQL moved too, delete its `use_backend kdx_graphql` line in the same `sed`
+(`-e '/^ *use_backend kdx_graphql if kdx_gql /d'`).
+
+**Roll back** a step of the per-step variant: delete that step's `use_backend` line (its ACL lines may stay), then
 
 ```sh
 haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy
@@ -250,7 +296,21 @@ Rollback: delete the line and reload, then stop and disable the unit on that hos
 
 The GraphQL listener (`api.graphql`, `/graphql` for POST, GET and the websocket upgrade) is a
 separate port. If clients reach it through the balancer, give it its own backend with the
-same health check and a `timeout tunnel` long enough for subscriptions (for example `1h`).
+same health check and a `timeout tunnel` long enough for subscriptions (for example `1h`):
+
+```haproxy
+backend kdx_graphql
+    mode http
+    balance leastconn
+    option forwardfor
+    option httpchk GET /readyz
+    http-check expect status 200
+    timeout server 40s
+    timeout tunnel 1h
+    default-server check port 31369 inter 5s fall 3 rise 6 observe layer4 error-limit 3 on-error mark-down
+    server kdx1 <indexer-1-private-ip>:31363
+```
+
 Clients that call it directly are re-pointed in their own configuration; rolling back is
 pointing them back.
 
@@ -281,7 +341,22 @@ defaults
 
 frontend public
     bind 127.0.0.1:8080
-    # kda-indexer cutover: steps 1 to 5, above the existing rules
+    # kda-indexer cutover, single step (section 3), above the existing rules
+    acl kdx_read method GET HEAD OPTIONS
+    acl kdx_routes path /txs/tx /txs/txs /txs/recent /stats /coins /txs/events /txs/search /v1/txs
+    acl kdx_routes path_reg ^/txs/account/[^/]+$
+    acl kdx_routes path_beg /v1/txs/
+    use_backend kdx_compat if kdx_read kdx_routes { nbsrv(kdx_compat) gt 0 }
+    # existing rules
+    acl old_cwd path_beg /txs /coins /stats
+    acl old_v1 path_beg /v1
+    use_backend chainweb_data if old_cwd
+    use_backend wallet_history if old_v1
+    default_backend chainweb_data
+
+frontend public_per_step
+    bind 127.0.0.1:8081
+    # the per-step variant (section 3a): steps 1 to 5, above the existing rules
     acl kdx_read method GET HEAD OPTIONS
     acl kdx_step1 path /txs/tx /txs/txs
     acl kdx_step2 path_reg ^/txs/account/[^/]+$
