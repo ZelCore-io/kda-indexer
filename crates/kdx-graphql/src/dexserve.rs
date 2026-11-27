@@ -685,6 +685,39 @@ fn check_n(n: Option<i32>) -> ApiResult<()> {
     }
 }
 
+/// The rows [`stock_page`] serves (stock's `getPaginationParams`): a cursor takes its own
+/// count (`after` with `first`, `before` with `last`), the other count is ignored, and a
+/// count of 0 or none is the default page. So `after` with `last: 1` serves the default page,
+/// as stock serves it. The read budget ([`crate::limits::budget`]) prices the page with this
+/// same function, so the price cannot drift from what is served.
+pub fn stock_page_rows(
+    first: Option<i64>,
+    last: Option<i64>,
+    after: bool,
+    before: bool,
+    default: u64,
+) -> u64 {
+    let n = |x: Option<i64>| x.filter(|v| *v > 0).map_or(default, |v| v as u64);
+    if after {
+        n(first)
+    } else if before {
+        n(last)
+    } else if first.is_some_and(|f| f > 0) || last.is_none_or(|l| l <= 0) {
+        n(first)
+    } else {
+        n(last)
+    }
+}
+
+/// The rows [`pool_transactions`] serves: `first`, else `last`, else the default page (a
+/// count of 0 is none), whatever the cursors. Priced with this same function.
+pub fn pool_tx_rows(first: Option<i64>, last: Option<i64>, default: u64) -> u64 {
+    first
+        .filter(|n| *n > 0)
+        .or(last.filter(|n| *n > 0))
+        .map_or(default, |n| n as u64)
+}
+
 /// Stock's `getPaginationParams` + `getPageInfo` over `items` sorted by rank descending
 /// (default page `default`).
 pub fn stock_page<T: Clone>(
@@ -697,24 +730,28 @@ pub fn stock_page<T: Clone>(
 ) -> ApiResult<(Vec<(String, T)>, PageInfo)> {
     check_n(first)?;
     check_n(last)?;
-    let n = |x: Option<i32>| x.filter(|v| *v > 0).map_or(default, |v| v as usize);
+    // The page plus one probe row.
+    let l = stock_page_rows(
+        first.map(i64::from),
+        last.map(i64::from),
+        after.is_some(),
+        before.is_some(),
+        default as u64,
+    ) as usize
+        + 1;
     let (limit, desc, rows): (usize, bool, Vec<&(u128, T)>) = if let Some(a) = after {
         let a = parse_int(a).unwrap_or(0);
-        let l = n(first) + 1;
         (l, true, items.iter().filter(|r| r.0 < a).take(l).collect())
     } else if let Some(bf) = before {
         let bf = parse_int(bf).unwrap_or(0);
-        let l = n(last) + 1;
         (
             l,
             false,
             items.iter().rev().filter(|r| r.0 > bf).take(l).collect(),
         )
     } else if first.is_some_and(|f| f > 0) || last.is_none_or(|l| l <= 0) {
-        let l = n(first) + 1;
         (l, true, items.iter().take(l).collect())
     } else {
-        let l = n(last) + 1;
         (l, false, items.iter().rev().take(l).collect())
     };
     let shown = limit - 1;
@@ -960,11 +997,7 @@ pub fn pool_transactions(
     if p.status.poisoned {
         return Err(unavailable(pair_id));
     }
-    let limit = a
-        .first
-        .filter(|n| *n > 0)
-        .or(a.last.filter(|n| *n > 0))
-        .unwrap_or(10) as usize;
+    let limit = pool_tx_rows(a.first.map(i64::from), a.last.map(i64::from), 10) as usize;
     let desc = a.last.is_none_or(|n| n <= 0) || a.first.is_some_and(|n| n > 0);
     let mut got: Vec<(u128, StoredEvent)> = Vec::new();
     let mut total = 0i64;

@@ -240,8 +240,20 @@ rows a request reads. It prices a page as served, with the same function the res
 page with: as asked up to 1,000; absent, `first: 0` or `last: 0` without a cursor at
 `default_page` (20), at every nesting level; with a cursor the count as given (`after` with
 `first: 0` costs 0). Stock's DEX lists (`pools`, `tokens`, `liquidityPositions`,
-`poolTransactions`, `Pool.transactions`) serve their default page for `first: 0` or `last: 0`
-with a cursor too, as stock does, and are priced at that page. A page variable bound to nothing, a subscription's `quantity` and the ids
+`poolTransactions`, `Pool.transactions`) read their pages with stock's DEX
+`getPaginationParams`, not the rules above, and are priced with the same functions their
+resolvers serve with (`dexserve::stock_page_rows` and `dexserve::pool_tx_rows`): a count of 0
+is the default page with a cursor too; in `pools`, `tokens` and `liquidityPositions` a cursor
+takes its own count and ignores the other, so `after` with `last: 1` (or `before` with
+`first: 1`, or both cursors with only `last`) serves the default page, as stock serves it, and
+is priced at that page; `poolTransactions` and `Pool.transactions` serve `first`, else `last`,
+else their default page of 10, whatever the cursors. These mismatched shapes are answered as
+stock answers them (not refused as in the other connections), so a client sees stock's rows;
+only their price follows the rows. A DEX list's default page is priced at the larger of its
+own (20 for `pools` and `tokens`, 10 for the others) and `default_page`. `Pool.transactions`
+with no argument of its own (absent, `null`, or a variable with no value, which reaches the
+resolver as `null`) serves the page given to `pool(...)` and is priced at that page. A DEX
+cursor bound to a variable with no value is priced at the larger of with and without it. A page variable bound to nothing, a subscription's `quantity` and the ids
 of `nodes` are priced at the most served (1,000). An account's NFT holdings are read when the
 account resolves, so `nonFungibleAccount`, `nonFungibleChainAccount` and every NFT id given to
 `node`/`nodes` (or an id only a variable gives) cost 10,000 rows (one details read each)

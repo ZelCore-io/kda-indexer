@@ -80,16 +80,25 @@ const PAGED: &[&str] = &[
 ];
 
 /// Stock's DEX lists (`Query.pools`, `liquidityPositions`, `poolTransactions`, `tokens`, and
-/// `Pool.transactions`, also when it serves the page of `Query.pool`): a page of 0 is their
-/// default page, cursor or not.
-fn dex_list(name: &str, parent: Option<&str>) -> bool {
-    match parent {
-        Some("Query") => matches!(
-            name,
-            "pools" | "liquidityPositions" | "poolTransactions" | "tokens"
-        ),
-        Some("Pool") => name == "transactions",
-        _ => false,
+/// `Pool.transactions`, also when it serves the page of `Query.pool`), each with its default
+/// page. Their pages follow stock's DEX `getPaginationParams`, not the generic connections':
+/// see [`crate::dexserve::stock_page_rows`] and [`crate::dexserve::pool_tx_rows`].
+#[derive(Clone, Copy)]
+enum DexList {
+    /// `pools`, `tokens`, `liquidityPositions` ([`crate::dexserve::stock_page`]).
+    Stock(u64),
+    /// `poolTransactions`, `Pool.transactions`.
+    PoolTxs(u64),
+}
+
+fn dex_list(name: &str, parent: Option<&str>) -> Option<DexList> {
+    match (parent, name) {
+        (Some("Query"), "pools" | "tokens") => Some(DexList::Stock(20)),
+        (Some("Query"), "liquidityPositions") => Some(DexList::Stock(10)),
+        (Some("Query"), "poolTransactions") | (Some("Pool"), "transactions") => {
+            Some(DexList::PoolTxs(10))
+        }
+        _ => None,
     }
 }
 
@@ -583,8 +592,40 @@ impl<'a> Walk<'a> {
             .any(|a| match self.arg(f, a) {
                 Arg::Absent => false,
                 Arg::Val(v) => v != Value::Null,
-                Arg::Unbound => true,
+                // A variable with no value and no default reaches the resolver as null, so
+                // the field takes `pool`'s arguments: priced from there.
+                Arg::Unbound => false,
             })
+    }
+
+    /// The rows a DEX list serves for `f`'s arguments, the default page at least
+    /// `default_page`. A cursor bound to an unbound variable is priced at the larger of with
+    /// and without it.
+    fn dex_rows(&self, f: &'a Field, list: DexList, first: Option<i64>, last: Option<i64>) -> u64 {
+        let cursor = |a: &str| match self.arg(f, a) {
+            Arg::Absent => vec![false],
+            Arg::Val(v) => vec![v != Value::Null],
+            Arg::Unbound => vec![false, true],
+        };
+        let def = |d: u64| d.max(self.s.default_page as u64);
+        match list {
+            DexList::PoolTxs(d) => crate::dexserve::pool_tx_rows(first, last, def(d)),
+            DexList::Stock(d) => {
+                let mut rows = 0;
+                for after in cursor("after") {
+                    for before in cursor("before") {
+                        rows = rows.max(crate::dexserve::stock_page_rows(
+                            first,
+                            last,
+                            after,
+                            before,
+                            def(d),
+                        ));
+                    }
+                }
+                rows
+            }
+        }
     }
 
     fn multiplier(&mut self, f: &'a Field, parent: Option<&str>) -> u64 {
@@ -621,13 +662,6 @@ impl<'a> Walk<'a> {
         }
         let first = fa.val().and_then(Self::int);
         let last = la.val().and_then(Self::int);
-        // Stock's DEX lists serve their default page for `first: 0` / `last: 0`, with a
-        // cursor or without (their `getPaginationParams`): priced so (M-1).
-        let (first, last) = if dex_list(name, parent) {
-            (first.filter(|n| *n > 0), last.filter(|n| *n > 0))
-        } else {
-            (first, last)
-        };
         let asked = |n: Option<i64>| n.map_or(0, |n| n.max(0) as u64);
         let q = match self.arg(f, "quantity") {
             Arg::Val(v) => Self::int(&v),
@@ -639,6 +673,12 @@ impl<'a> Walk<'a> {
             .max(asked(first))
             .max(asked(last))
             .max(asked(q));
+        // Stock's DEX lists size a page their own way (a zero count is the default page with
+        // a cursor too, and a cursor takes its own count, so `after` with `last: 1` is the
+        // default page): priced with the functions their resolvers serve with.
+        if let Some(list) = dex_list(name, parent) {
+            return self.dex_rows(f, list, first, last).min(cap as u64);
+        }
         if first.is_some() || last.is_some() {
             // As served (part E, B1): `0` without a cursor is the default page, with one 0.
             // A cursor bound to an unbound variable counts as absent (the higher price).
