@@ -304,7 +304,7 @@ fn module_skip(txn: &impl Txn, module: u32, coin: u32, key: &[u8; 9]) -> Result<
 
 /// A verified `Balances` row read at or above `height`: it already reflects the credit, so it
 /// needs no re-read (review H1). Older or unverified rows are marked like absent keys.
-fn fresh_row(v: Option<&[u8]>, height: u32) -> bool {
+pub(crate) fn fresh_row(v: Option<&[u8]>, height: u32) -> bool {
     v.and_then(balances::BalanceRow::decode)
         .is_some_and(|r| !r.unverified && r.as_of >= height)
 }

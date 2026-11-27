@@ -827,9 +827,18 @@ in `exec.code`; at any height, the receiver of a `coin.transfer-crosschain` fini
 already has a `Balances` row is skipped (the tail keeps it correct). Fork heights are per
 network; a network this build has no heights for uses mainnet01's and logs a warning.
 
-- **It blocks the reconcile loop while it walks the segments**: the tail's dirty rows wait until
-  it ends (minutes to a few hours on mainnet, plus one `/local` read per marked row afterwards).
-  Its progress is logged every 1M txs.
+- **It runs beside the reconcile loop**, in the service's receivers task (D1, then D3, then
+  both again an hour after the round ended). The loop starts right after the posting seed, so
+  the tail's, the seed's and the GraphQL miss feed's dirty rows are reconciled while the pass
+  walks the segments (minutes to a few hours on mainnet); the rows it marks are read as the
+  loop reaches them. Before this change the pass ran inline and held every `Balances` and
+  `KeyAccounts` write until it ended. Its progress is logged every 1M txs, and the gauge
+  `kdx_balance_receivers_pass{rules="d1"}` is 1 while it walks.
+- The pass and the loop may touch the same row in either order: a row the loop read at or
+  above the credit's height is skipped, and a mark the pass writes after the loop read the
+  old one survives the loop's compare-and-clear, so the row is read again. The final value is
+  exact either way. A failed pass is logged (`balances: receivers pass failed`) and retried a
+  minute later from its cursor; it does not stop the loop.
 - Count it first, read-only (no lock, beside the service):
   `reconcile-balances --seed --dry-run` prints `candidates`, `new_accounts`, `skipped_existing`
   and `dirty_inserted` (rows it would mark). The posting seed does not run.
@@ -859,7 +868,11 @@ the hourly pass, which interns it.
 The token receivers pass marks the same rows for stored history, with its own flag
 (`Meta balances_seed_token_receivers`), cursor and error count, and the same mechanics as D1
 (resumable, `stop` polled per chunk, refused until the backfill is complete and the tail has
-started). It walks every stored height, not only those below coin v3. Each row is marked at the
+started, run beside the reconcile loop in the same receivers task right after D1). It walks
+every stored height, not only those below coin v3. On a fresh store that first walk takes
+hours; the loop reconciles the tail's marks (miners included) and the seed backlog meanwhile,
+and `kdx_balance_receivers_pass{rules="d3"}` is 1 while it walks (`--status`:
+`seed_token_receivers_in_progress`). A restart resumes it from its cursor; no reindex. Each row is marked at the
 height of the latest tx that names it, like a posting; a verified `Balances` row is skipped only
 when it was read at or above that height (`as_of`), so a row read before the credit is re-read.
 After the first walk it is pending again whenever the tail grew, and the service's hourly
@@ -1168,7 +1181,8 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
 - `n_4e470a97222514a8662dd1219000a0431451b0ee.ledger` (a v2-shaped ledger in a principal
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
-- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
+- Metrics: `kdx_balance_dirty_rows`, `kdx_balance_receivers_pass{rules="d1|d3"}` (1 while a
+  receivers pass walks), `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 
