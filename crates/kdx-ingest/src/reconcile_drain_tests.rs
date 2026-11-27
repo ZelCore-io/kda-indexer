@@ -289,6 +289,32 @@ struct BenchNode {
     kinds: [AtomicUsize; 4],
     /// Keys asked in batched `details` calls.
     batched_keys: AtomicUsize,
+    /// What the node answers besides its defaults (read-node tests).
+    knobs: Mutex<Knobs>,
+}
+
+/// A bench node's answers: the height it read (`as_of`), its `prevBlockHash` (empty: none),
+/// the balance of every present account, and a Pact failure for every batched or one-key
+/// `details` call (`None`: answered).
+#[derive(Clone)]
+struct Knobs {
+    as_of: u64,
+    prev: String,
+    balance: f64,
+    batch_fail: Option<String>,
+    single_fail: Option<String>,
+}
+
+impl Default for Knobs {
+    fn default() -> Knobs {
+        Knobs {
+            as_of: 10,
+            prev: tip_hash().to_b64url(),
+            balance: 1.5,
+            batch_fail: None,
+            single_fail: None,
+        }
+    }
 }
 
 impl BenchNode {
@@ -300,7 +326,15 @@ impl BenchNode {
             calls: AtomicUsize::new(0),
             kinds: Default::default(),
             batched_keys: AtomicUsize::new(0),
+            knobs: Mutex::new(Knobs::default()),
         })
+    }
+
+    /// A node with no delay and no absent account that answers `knobs`.
+    fn with(knobs: Knobs) -> Arc<BenchNode> {
+        let n = BenchNode::new(Duration::ZERO, 0, 0);
+        *n.knobs.lock().unwrap() = knobs;
+        n
     }
 
     fn absent(&self, acct: &str) -> bool {
@@ -316,12 +350,18 @@ impl BenchNode {
     fn answer(&self, cmd: &Value) -> Value {
         self.calls.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(self.delay);
-        let meta = json!({"blockHeight": 11, "prevBlockHash": tip_hash().to_b64url()});
+        let kn = self.knobs.lock().unwrap().clone();
+        let meta = if kn.prev.is_empty() {
+            json!({"blockHeight": kn.as_of + 1})
+        } else {
+            json!({"blockHeight": kn.as_of + 1, "prevBlockHash": kn.prev})
+        };
+        let fail = |m: &str| json!({"result": {"status": "failure", "error": {"message": m}}, "metaData": meta});
         let data = cmd
             .pointer("/payload/exec/data")
             .cloned()
             .unwrap_or(Value::Null);
-        let entry = |a: &str| json!({"account": a, "balance": 1.5, "guard": {"keys": ["k1"], "pred": "keys-all"}});
+        let entry = |a: &str| json!({"account": a, "balance": kn.balance, "guard": {"keys": ["k1"], "pred": "keys-all"}});
         let ok = |d: Value| json!({"result": {"status": "success", "data": d}, "metaData": meta});
         let kind = if data.get("m").is_some() {
             2
@@ -335,6 +375,12 @@ impl BenchNode {
         self.kinds[kind].fetch_add(1, Ordering::Relaxed);
         if data.get("m").is_some() {
             return ok(json!(true));
+        }
+        if let (Some(m), Some(_)) = (&kn.batch_fail, data.get("as")) {
+            return fail(m);
+        }
+        if let (Some(m), Some(_)) = (&kn.single_fail, data.get("a")) {
+            return fail(m);
         }
         if let Some(list) = data.get("as").and_then(Value::as_array) {
             self.batched_keys.fetch_add(list.len(), Ordering::Relaxed);
@@ -528,13 +574,7 @@ async fn drain(
             break;
         }
         r.tip_max = r.tip_max.max(batch.iter().filter(|d| d.tip).count());
-        let next = (k > 1
-            && (w.left() == 0
-                || w.due(
-                    Instant::now() + Duration::from_secs_f64(batch_secs),
-                    max_age,
-                )))
-        .then(|| refill(&back));
+        let next = walk_ahead(&w, (batch.len(), n), k, batch_secs, max_age).then(|| refill(&back));
         let t0 = Instant::now();
         let st = reconcile_batch_with(ctx, primary, Some(pool), &batch, caps)
             .await
@@ -548,7 +588,7 @@ async fn drain(
             r.refills += 1;
             w.set_without(keys, ended, &batch);
         }
-        r.done += st.ok + st.absent + st.skipped + st.failures + st.dropped;
+        r.done += done_keys(&st);
         r.batches += 1;
         let t = &mut r.tot;
         t.ok += st.ok;
@@ -920,4 +960,313 @@ async fn drain_bench() {
             ph.commit / b,
         );
     }
+}
+
+// Read nodes other than the primary (`balances.local_urls`).
+
+/// A pool over `nodes`, the first the primary when `primary` (else `node.url` is not listed),
+/// batched reads of 25 keys, and the primary's client (the first node's when listed, else a
+/// node of its own at our tip).
+fn read_pool(nodes: &[Arc<BenchNode>], primary: bool) -> (Arc<LocalClient>, ReadPool) {
+    let clients: Vec<Arc<LocalClient>> = nodes
+        .iter()
+        .map(|n| bench_client(&serve(n.clone()), 0))
+        .collect();
+    let pool = ReadPool::new(
+        clients
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ReadNode::new(format!("n{i}"), c.clone(), primary && i == 0))
+            .collect(),
+        25,
+    );
+    let local = if primary {
+        clients[0].clone()
+    } else {
+        bench_client(&serve(BenchNode::with(Knobs::default())), 0)
+    };
+    (local, pool)
+}
+
+/// A client of a node that refuses every connection (a transport error).
+fn dead_client() -> Arc<LocalClient> {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    bench_client(&format!("http://127.0.0.1:{port}"), 0)
+}
+
+/// Our tail at 10 on chain 0 and `n` `coin` keys (`a0..`) marked there at `mark`, each with a
+/// verified row read at 9 holding 9.9 when `rows`; the batch of them, not tip keys (they go to
+/// [`ReadPool::pick_batch`]).
+fn keys_at(dir: &std::path::Path, n: usize, mark: u32, rows: bool) -> (Arc<HotStore>, Vec<Dirty>) {
+    let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
+    tail_at_10(&hot, 1);
+    let mut txn = hot.rw().unwrap();
+    let mut dict = HotDict::load(&txn).unwrap();
+    let coin = dict.intern(DictKind::Module, "coin");
+    let ids: Vec<u32> = (0..n)
+        .map(|i| dict.intern(DictKind::Account, &format!("a{i}")))
+        .collect();
+    dict.persist(&mut txn).unwrap();
+    for &a in &ids {
+        balances::mark_dirty(&mut txn, a, coin, 0, mark).unwrap();
+        if rows {
+            let row = BalanceRow {
+                absent: false,
+                balance: "9.9".into(),
+                guard: [0; 16],
+                as_of: 9,
+                reconciled_at: 0,
+                unverified: false,
+            };
+            txn.put(
+                Table::Balances,
+                &balances::bal_key(a, coin, 0),
+                &row.encode(),
+            )
+            .unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    let batch = refill(&hot, n, n)
+        .unwrap()
+        .into_iter()
+        .map(|d| Dirty { tip: false, ..d })
+        .collect();
+    (hot, batch)
+}
+
+fn row(hot: &HotStore, d: &Dirty) -> BalanceRow {
+    BalanceRow::decode(
+        &hot.ro()
+            .unwrap()
+            .get(Table::Balances, &d.key)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn ctx_of(dir: &std::path::Path, hot: &Arc<HotStore>) -> Ctx {
+    client_on(dir, hot, Arc::new(Mutex::new(tip_hash().to_b64url()))).0
+}
+
+/// A Pact failure from a secondary is no sign that it lags: a batch over the gas limit, or one
+/// key whose contract fails, says nothing about the node. The node stays up, the batch is read
+/// key by key and every key is decided (here by the primary).
+#[tokio::test]
+async fn a_pact_failure_on_a_secondary_keeps_it_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, batch) = keys_at(dir.path(), 30, 10, false);
+    let failing = BenchNode::with(Knobs {
+        batch_fail: Some("Gas limit (150000) exceeded: 150001".into()),
+        single_fail: Some("boom".into()),
+        ..Knobs::default()
+    });
+    let (local, pool) = read_pool(&[BenchNode::with(Knobs::default()), failing], true);
+    let ctx = ctx_of(dir.path(), &hot);
+    let st = reconcile_batch_with(&ctx, &local, Some(&pool), &batch, &Caps::default())
+        .await
+        .unwrap();
+    assert_eq!(st.ok, 30, "{st:?}");
+    assert!(pool.is_up(1), "a Pact failure took the secondary out");
+    assert!(batch.iter().all(|d| mark_now(&hot, &d.key).is_none()));
+}
+
+/// A secondary that does not know a module the primary knows (it lags behind a deploy) is
+/// skipped for a while; its keys are decided by the primary.
+#[tokio::test]
+async fn a_secondary_missing_a_module_the_primary_knows_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, batch) = keys_at(dir.path(), 30, 10, false);
+    let lagging = BenchNode::with(Knobs {
+        batch_fail: Some("Cannot find module: coin".into()),
+        single_fail: Some("Cannot find module: coin".into()),
+        ..Knobs::default()
+    });
+    let (local, pool) = read_pool(&[BenchNode::with(Knobs::default()), lagging], true);
+    let ctx = ctx_of(dir.path(), &hot);
+    let st = reconcile_batch_with(&ctx, &local, Some(&pool), &batch, &Caps::default())
+        .await
+        .unwrap();
+    assert_eq!(st.ok, 30, "{st:?}");
+    assert!(!pool.is_up(1));
+    assert!(batch.iter().all(|d| mark_now(&hot, &d.key).is_none()));
+}
+
+/// A secondary that read above our tail (we hold no header there to check it) is not taken
+/// while another node can answer: the read goes on to the primary, whose answer on our branch
+/// is stored verified and clears the marks.
+#[tokio::test]
+async fn a_secondary_above_our_tail_fails_over_to_the_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, batch) = keys_at(dir.path(), 30, 10, true);
+    let ahead = BenchNode::with(Knobs {
+        as_of: 12,
+        prev: Hash32([0x22; 32]).to_b64url(),
+        balance: 7.0,
+        ..Knobs::default()
+    });
+    let (local, pool) = read_pool(&[BenchNode::with(Knobs::default()), ahead], true);
+    let ctx = ctx_of(dir.path(), &hot);
+    let st = reconcile_batch_with(&ctx, &local, Some(&pool), &batch, &Caps::default())
+        .await
+        .unwrap();
+    assert_eq!((st.ok, st.other_branch), (30, 0), "{st:?}");
+    for d in &batch {
+        let r = row(&hot, d);
+        assert_eq!(
+            (r.balance.as_str(), r.as_of, r.unverified),
+            ("1.5", 10, false)
+        );
+        assert!(mark_now(&hot, &d.key).is_none());
+    }
+}
+
+/// When only a secondary above our tail answers (the primary is unreachable), its unchecked
+/// answer never replaces a verified row: the row stays as it was and the key stays queued.
+#[tokio::test]
+async fn a_secondary_above_our_tail_never_replaces_a_verified_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, batch) = keys_at(dir.path(), 30, 10, true);
+    let ahead = serve(BenchNode::with(Knobs {
+        as_of: 12,
+        prev: Hash32([0x22; 32]).to_b64url(),
+        balance: 7.0,
+        ..Knobs::default()
+    }));
+    let dead = dead_client();
+    let pool = ReadPool::new(
+        vec![
+            ReadNode::new("n0".into(), dead.clone(), true),
+            ReadNode::new("n1".into(), bench_client(&ahead, 0), false),
+        ],
+        25,
+    );
+    let ctx = ctx_of(dir.path(), &hot);
+    let st = reconcile_batch_with(&ctx, &dead, Some(&pool), &batch, &Caps::default())
+        .await
+        .unwrap();
+    assert_eq!(st.other_branch, 30, "{st:?}");
+    for d in &batch {
+        let r = row(&hot, d);
+        assert_eq!(
+            (r.balance.as_str(), r.as_of, r.unverified),
+            ("9.9", 9, false)
+        );
+        assert!(mark_now(&hot, &d.key).is_some());
+    }
+}
+
+/// A secondary that answers from another branch at a height we hold, or with no block hash,
+/// is skipped for a while (it is on a fork or cannot be checked); the rows are kept.
+#[tokio::test]
+async fn a_secondary_off_our_branch_is_skipped() {
+    for prev in [Hash32([0x22; 32]).to_b64url(), String::new()] {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, batch) = keys_at(dir.path(), 30, 10, true);
+        let forked = BenchNode::with(Knobs {
+            prev,
+            balance: 7.0,
+            ..Knobs::default()
+        });
+        let (local, pool) = read_pool(&[BenchNode::with(Knobs::default()), forked], true);
+        let ctx = ctx_of(dir.path(), &hot);
+        let st = reconcile_batch_with(&ctx, &local, Some(&pool), &batch, &Caps::default())
+            .await
+            .unwrap();
+        assert_eq!(st.other_branch, 30, "{st:?}");
+        assert!(!pool.is_up(1));
+        for d in &batch {
+            assert_eq!(row(&hot, d).balance, "9.9");
+            assert!(mark_now(&hot, &d.key).is_some());
+        }
+    }
+}
+
+/// Answers of secondaries a few blocks behind (within `LAG_BLOCKS`) cannot clear a fresh mark;
+/// the keys are read again on the primary, even when `node.url` is not one of the read nodes.
+#[tokio::test]
+async fn a_lagging_secondary_answer_is_read_again_on_the_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, batch) = keys_at(dir.path(), 30, 10, false);
+    let h8 = Hash32([0x08; 32]);
+    put_header(&hot, 0, 8, h8);
+    let behind = || {
+        BenchNode::with(Knobs {
+            as_of: 8,
+            prev: h8.to_b64url(),
+            ..Knobs::default()
+        })
+    };
+    let (local, pool) = read_pool(&[behind(), behind()], false);
+    let ctx = ctx_of(dir.path(), &hot);
+    let st = reconcile_batch_with(&ctx, &local, Some(&pool), &batch, &Caps::default())
+        .await
+        .unwrap();
+    assert_eq!(st.ok, 30, "{st:?}");
+    for d in &batch {
+        assert_eq!(row(&hot, d).as_of, 10);
+        assert!(mark_now(&hot, &d.key).is_none());
+    }
+}
+
+/// An answer on our branch read below the key's mark cannot clear it: the key goes to the back
+/// of the queue, and a batch of nothing else pauses like an off-branch one.
+#[tokio::test]
+async fn an_answer_below_the_mark_is_not_counted_as_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, batch) = keys_at(dir.path(), 3, 10, false);
+    let h8 = Hash32([0x08; 32]);
+    put_header(&hot, 0, 8, h8);
+    let node = BenchNode::with(Knobs {
+        as_of: 8,
+        prev: h8.to_b64url(),
+        ..Knobs::default()
+    });
+    let local = bench_client(&serve(node), 0);
+    let ctx = ctx_of(dir.path(), &hot);
+    let st = reconcile_batch_with(&ctx, &local, None, &batch, &Caps::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        (st.remarked.len(), st.uncovered, done_keys(&st)),
+        (3, 3, 0),
+        "{st:?}"
+    );
+    assert!(off_branch_pause(&st).is_some(), "{st:?}");
+    assert!(batch.iter().all(|d| mark_now(&hot, &d.key).is_some()));
+}
+
+/// A refill walked while a batch was in flight leaves out that batch's keys only with the mark
+/// the batch read: a key the tail marked again meanwhile stays in the new window.
+#[test]
+fn a_refill_during_a_batch_keeps_a_newer_mark_of_a_batch_key() {
+    let d = |key: u8, height: u32, seq: u64| Dirty {
+        key: [key; 9],
+        mark: Mark { height, seq },
+        seed: false,
+        tip: false,
+    };
+    let mut w = RefillWindow::default();
+    w.set_without(
+        vec![d(1, 11, 7), d(2, 10, 2)],
+        Instant::now(),
+        &[d(1, 10, 1), d(2, 10, 2)],
+    );
+    assert_eq!(w.next_batch(10), vec![d(1, 11, 7)]);
+}
+
+/// The next window is walked during a batch only when the batch is full: a short batch means
+/// the window held the whole backlog (steady tailing), and walking again at once would only
+/// double the scans.
+#[test]
+fn a_short_batch_walks_no_window_ahead() {
+    let w = RefillWindow::default();
+    assert!(walk_ahead(&w, (64, 64), 8, 0.0, WINDOW_MAX_AGE));
+    assert!(!walk_ahead(&w, (63, 64), 8, 0.0, WINDOW_MAX_AGE));
+    assert!(!walk_ahead(&w, (64, 64), 1, 0.0, WINDOW_MAX_AGE));
 }
