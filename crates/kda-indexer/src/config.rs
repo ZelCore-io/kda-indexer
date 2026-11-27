@@ -965,7 +965,8 @@ pub struct BalancesConfig {
     /// Reconcile batches one refill takes keys for (1..=32; 1: a refill every batch). The
     /// refill walks all of `BalanceDirty` whatever its size, so a window of several batches
     /// spends that walk once for all of them; every batch keeps its own write txn. A window
-    /// is taken again after 5 s even with keys left, so a fresh tip mark waits at most that.
+    /// is taken again 5 s after its walk ended even with keys left, so a fresh tip mark waits
+    /// at most about 5 s plus two walks and two batches (see docs/operations.md).
     pub refill_window_batches: u32,
 }
 

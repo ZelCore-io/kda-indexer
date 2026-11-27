@@ -226,6 +226,10 @@ pub struct Dirty {
     pub key: [u8; 9],
     pub mark: Mark,
     pub seed: bool,
+    /// Taken for the tip share ([`refill_with`] step 0): its batched read goes through
+    /// [`ReadPool::pick`], which can choose the primary, not [`ReadPool::pick_batch`], so a
+    /// secondary a few blocks behind does not hold a fresh tip mark back (PR #70 review I1).
+    pub tip: bool,
 }
 
 impl Dirty {
@@ -274,7 +278,12 @@ fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, share: us
                     break;
                 }
                 if let Some(&(mark, key)) = l.get(i) {
-                    out.push(Dirty { key, mark, seed });
+                    out.push(Dirty {
+                        key,
+                        mark,
+                        seed,
+                        tip: false,
+                    });
                     any = true;
                 }
             }
@@ -337,6 +346,7 @@ fn tip_deal(
                 key,
                 mark,
                 seed: false,
+                tip: true,
             });
         }
         if !any {
@@ -434,6 +444,7 @@ pub fn refill_with(
                 key,
                 mark,
                 seed: false,
+                tip: false,
             }),
     );
     // A module's rows in the tip count against its `share`.
@@ -469,6 +480,7 @@ pub fn refill_with(
                         key,
                         mark,
                         seed: true,
+                        tip: false,
                     });
                 }
             } else {
@@ -490,8 +502,10 @@ pub fn refill_with(
 pub const DEFAULT_REFILL_WINDOW: usize = 8;
 /// Most `balances.refill_window_batches`.
 pub const MAX_REFILL_WINDOW: usize = 32;
-/// A refill window older than this is taken again even with keys left, so a fresh tip mark
-/// waits at most about this long (a single batch took about as long before windows).
+/// A refill window older than this (counted from the end of its walk) is taken again even
+/// with keys left. A tip mark made just after a walk passed its key waits at most about this
+/// long plus that walk, the next walk or the batch it overlaps (the longer) and the batch that
+/// reads it.
 pub const WINDOW_MAX_AGE: Duration = Duration::from_secs(5);
 
 /// The refill of `k` batches at once: [`refill_with`] for `k × n` keys and `k × share` per
@@ -569,21 +583,26 @@ impl RefillWindow {
     }
 }
 
-/// [`refill_window`] on a blocking thread: the keys, and the seconds the walk took (also
-/// observed as the `refill` phase).
+/// One walk of [`spawn_refill`]: the keys, the seconds the walk took and when it ended (the
+/// window's age counts from there, PR #70 review M1).
+pub type Refilled = (Vec<Dirty>, f64, Instant);
+
+/// [`refill_window`] on a blocking thread: the keys, the seconds the walk took (also
+/// observed as the `refill` phase) and when the walk ended.
 pub fn spawn_refill(
     hot: Arc<HotStore>,
     n: usize,
     share: usize,
     k: usize,
     back: HashMap<[u8; 9], Mark>,
-) -> tokio::task::JoinHandle<Result<(Vec<Dirty>, f64)>> {
+) -> tokio::task::JoinHandle<Result<Refilled>> {
     tokio::task::spawn_blocking(move || {
         let t = Instant::now();
         let keys = refill_window(&hot, n, share, k, &back)?;
-        let secs = secs_since(t);
+        let ended = Instant::now();
+        let secs = ended.saturating_duration_since(t).as_secs_f64();
         kdx_metrics::get().balance_batch_phase("refill", secs);
-        Ok((keys, secs))
+        Ok((keys, secs, ended))
     })
 }
 
@@ -788,20 +807,22 @@ fn decided_by<T>(r: &LocalResult<T>, primary: bool) -> bool {
 /// error stands. An answer more than [`LAG_BLOCKS`] above our tail, or a Pact failure from a
 /// node other than the primary, marks that node down too and is returned at once (the
 /// failure is then asked of the primary, [`decided_by`]).
-/// Returns the result, the seconds of the call that stands and the index of the node that
-/// answered.
+/// `batch` picks with [`ReadPool::pick_batch`], else [`ReadPool::pick`]; the nodes of `avoid`
+/// are not asked. Returns the result, the seconds of the call that stands and the index of
+/// the node that answered.
 async fn pooled<T, F, Fut>(
     pool: &ReadPool,
     tail: u32,
     keys: u64,
     batch: bool,
+    avoid: &[usize],
     mut send: F,
 ) -> (LocalResult<T>, f64, usize)
 where
     F: FnMut(Arc<LocalClient>) -> Fut,
     Fut: std::future::Future<Output = (LocalResult<T>, f64)>,
 {
-    let mut tried: Vec<usize> = Vec::new();
+    let mut tried: Vec<usize> = avoid.to_vec();
     let mut last: Option<(LocalResult<T>, f64, usize)> = None;
     let pick = |t: &[usize]| {
         if batch {
@@ -876,24 +897,60 @@ async fn read_primary(local: &LocalClient, it: &Item) -> Outcome {
     out
 }
 
-/// One key read on its own through the pool. What a node other than the primary cannot
-/// decide ([`decided_by`]: `Absent`, a Pact failure, an unusable answer) is asked again of
-/// the primary (`local`, `node.url`): absent rows, dropped marks and the not-fungible verdict
-/// are exactly the single-node reconciler's.
-async fn read_single(local: &LocalClient, pool: &ReadPool, it: &Item) -> Outcome {
+/// The highest mark height of the items of one key (a tail and a seed mark of it): an answer
+/// below it cannot clear every mark of the key.
+fn want_of(items: &[Item], k: &[usize]) -> u32 {
+    k.iter().map(|&i| items[i].d.mark.height).max().unwrap_or(0)
+}
+
+/// Whether `r` is an answer read below height `want` (it cannot clear a mark at `want`).
+fn below<T>(r: &LocalResult<T>, want: u32) -> bool {
+    matches!(r, Ok(Local::Found { height, .. }) if *height < u64::from(want))
+}
+
+/// One key read on its own through the pool ([`ReadPool::pick`]), not on the nodes of
+/// `avoid`. What a node other than the primary cannot decide ([`decided_by`]: `Absent`, a
+/// Pact failure, an unusable answer) is asked again of the primary (`local`, `node.url`):
+/// absent rows, dropped marks and the not-fungible verdict are exactly the single-node
+/// reconciler's. An answer from another node read below `want` (it lags, within
+/// [`LAG_BLOCKS`]) is asked once more of the other nodes, so a fresh mark is not held back by
+/// that node's lag (PR #70 review I1); a node error there keeps the first answer.
+///
+/// Also returns when the first read answered (the rest went to re-reads, PR #70 review M2).
+async fn read_single_at(
+    local: &LocalClient,
+    pool: &ReadPool,
+    it: &Item,
+    want: u32,
+    avoid: &[usize],
+) -> (Outcome, Instant) {
     let (Some(acct), Some(module)) = (&it.account_name, &it.module_name) else {
-        return Outcome::Skipped;
+        return (Outcome::Skipped, Instant::now());
     };
-    let (r, secs, i) = pooled(pool, it.tail, 1, false, |c| async move {
-        c.details_timed(it.chain, module, acct).await
-    })
-    .await;
+    let send = |c: Arc<LocalClient>| async move { c.details_timed(it.chain, module, acct).await };
+    let (mut r, mut secs, mut i) = pooled(pool, it.tail, 1, false, avoid, send).await;
+    let answered = Instant::now();
+    if below(&r, want) && !pool.node(i).primary {
+        let mut avoid = avoid.to_vec();
+        avoid.push(i);
+        let again = pooled(pool, it.tail, 1, false, &avoid, send).await;
+        if !matches!(again.0, Err(LocalError::Node(_))) {
+            (r, secs, i) = again;
+        }
+    }
     if !decided_by(&r, pool.node(i).primary) {
-        return read_primary(local, it).await;
+        return (read_primary(local, it).await, answered);
     }
     let out = outcome_of(local, it, r).await;
     kdx_metrics::get().balance_reconcile(out.label(), secs);
-    out
+    (out, answered)
+}
+
+/// [`read_single_at`] of the key whose items are `k`.
+async fn read_single(local: &LocalClient, pool: &ReadPool, items: &[Item], k: &[usize]) -> Outcome {
+    read_single_at(local, pool, &items[k[0]], want_of(items, k), &[])
+        .await
+        .0
 }
 
 /// One outcome for every item of `idx` (the same key, listed more than once in a batch).
@@ -909,6 +966,12 @@ fn fan(idx: &[usize], o: Outcome) -> Vec<(usize, Outcome)> {
 /// for any module: that key is read alone on the primary, and that read decides, as before.
 /// A failed call, an unusable answer or a refused call reads the keys one by one.
 ///
+/// `batch` sends the call through [`ReadPool::pick_batch`] (the nodes other than the
+/// primary), else through [`ReadPool::pick`] (the tip share, [`Dirty::tip`]). A key whose
+/// mark the answer cannot clear (the answering node, not the primary, read below it) is read
+/// once more alone through [`ReadPool::pick`], not on that node, so it can reach the primary
+/// (PR #70 review I1); a node error there keeps the batched answer.
+///
 /// Also returns when the chunk's first read answered: the rest of its time went to the reads
 /// it sent after (keys read alone, a `try` marker or `Absent` asked of the primary).
 async fn read_chunk(
@@ -916,10 +979,18 @@ async fn read_chunk(
     pool: &ReadPool,
     items: &[Item],
     keys: Vec<Vec<usize>>,
+    batch: bool,
 ) -> (Vec<(usize, Outcome)>, Instant) {
     if keys.len() == 1 {
-        let o = read_single(local, pool, &items[keys[0][0]]).await;
-        return (fan(&keys[0], o), Instant::now());
+        let (o, at) = read_single_at(
+            local,
+            pool,
+            &items[keys[0][0]],
+            want_of(items, &keys[0]),
+            &[],
+        )
+        .await;
+        return (fan(&keys[0], o), at);
     }
     let first = &items[keys[0][0]];
     let module = first.module_name.as_deref().unwrap_or("");
@@ -928,7 +999,7 @@ async fn read_chunk(
         .map(|k| items[k[0]].account_name.as_deref().unwrap_or(""))
         .collect();
     let n = keys.len() as u64;
-    let (r, secs, _) = pooled(pool, first.tail, n, true, |c| {
+    let (r, secs, node) = pooled(pool, first.tail, n, batch, &[], |c| {
         let accts = accts.clone();
         async move { c.details_many(first.chain, module, &accts).await }
     })
@@ -936,7 +1007,7 @@ async fn read_chunk(
     let answered = Instant::now();
     let singles = |ks: Vec<Vec<usize>>| {
         join_all(ks.into_iter().map(|k| async move {
-            let o = read_single(local, pool, &items[k[0]]).await;
+            let o = read_single(local, pool, items, &k).await;
             fan(&k, o)
         }))
     };
@@ -947,8 +1018,13 @@ async fn read_chunk(
             prev_hash,
         }) => {
             let (mut ok, mut again, mut on_primary) = (Vec::new(), Vec::new(), Vec::new());
+            let mut resend = Vec::new();
+            let lags = !pool.node(node).primary;
             for (k, e) in keys.into_iter().zip(value) {
                 match e {
+                    BatchEntry::Found(d) if lags && height < u64::from(want_of(items, &k)) => {
+                        resend.push((k, d))
+                    }
                     BatchEntry::Found(d) => ok.push((k, d)),
                     BatchEntry::Marker => on_primary.push(k),
                     BatchEntry::Unusable(why) => {
@@ -963,19 +1039,30 @@ async fn read_chunk(
                 }
             }
             let prev = prev_hash.as_ref();
-            let (a, b, c) = futures::join!(
-                join_all(ok.into_iter().map(|(k, d)| async move {
-                    let o = found(local, &items[k[0]], d, height, prev.cloned()).await;
-                    kdx_metrics::get().balance_reconcile(o.label(), secs);
-                    fan(&k, o)
-                })),
+            let take = |k: Vec<usize>, d: Details| async move {
+                let o = found(local, &items[k[0]], d, height, prev.cloned()).await;
+                kdx_metrics::get().balance_reconcile(o.label(), secs);
+                fan(&k, o)
+            };
+            let (a, b, c, e) = futures::join!(
+                join_all(ok.into_iter().map(|(k, d)| take(k, d))),
                 singles(again),
                 join_all(on_primary.into_iter().map(|k| async move {
                     let o = read_primary(local, &items[k[0]]).await;
                     fan(&k, o)
                 })),
+                join_all(resend.into_iter().map(|(k, d)| async move {
+                    let it = &items[k[0]];
+                    match read_single_at(local, pool, it, want_of(items, &k), &[node])
+                        .await
+                        .0
+                    {
+                        Outcome::NodeError => take(k, d).await,
+                        o => fan(&k, o),
+                    }
+                })),
             );
-            let out = a.into_iter().chain(b).chain(c).flatten().collect();
+            let out = a.into_iter().chain(b).chain(c).chain(e).flatten().collect();
             (out, answered)
         }
         Err(LocalError::Node(e)) => {
@@ -1031,13 +1118,25 @@ async fn call_pooled(
             }
         }
     }
+    // The tip share's keys (a key with a tip item) go in their own chunks, through
+    // `ReadPool::pick` (PR #70 review I1); the rest through `ReadPool::pick_batch`.
     let chunks = groups.into_values().flat_map(|(_, g)| {
-        g.chunks(pool.batch_keys)
-            .map(<[Vec<usize>]>::to_vec)
-            .collect::<Vec<_>>()
+        let (tip, rest): (Vec<_>, Vec<_>) = g
+            .into_iter()
+            .partition(|k| k.iter().any(|&i| items[i].d.tip));
+        let cut = |ks: Vec<Vec<usize>>, batch: bool| {
+            ks.chunks(pool.batch_keys)
+                .map(|c| (c.to_vec(), batch))
+                .collect::<Vec<_>>()
+        };
+        let mut out = cut(tip, false);
+        out.extend(cut(rest, true));
+        out
     });
     let mut first: Option<Instant> = None;
-    for (outs, at) in join_all(chunks.map(|c| read_chunk(local, pool, items, c))).await {
+    for (outs, at) in
+        join_all(chunks.map(|(c, batch)| read_chunk(local, pool, items, c, batch))).await
+    {
         first = first.max(Some(at));
         for (k, o) in outs {
             out[k] = Some(o);
@@ -2396,12 +2495,20 @@ async fn reconcile_loop(
                 back.clone(),
             )
         };
+        // PR #70 review M5: no walk and no slice once stopping (a failed dictionary reload
+        // in `discovery_step` cancels `stop` and carries on to here).
+        if stop.is_cancelled() {
+            return Ok(());
+        }
         if window.due(Instant::now(), WINDOW_MAX_AGE) {
-            let (keys, secs) = refill(&back).await??;
+            let (keys, secs, ended) = refill(&back).await??;
             refill_secs = secs;
             // The age counts from the end of the walk: counted from its start, a walk and
             // one slow batch would use up the age and every batch would refill again.
-            window.set(keys, Instant::now());
+            window.set(keys, ended);
+            if stop.is_cancelled() {
+                return Ok(());
+            }
         }
         let batch = window.next_batch(o.batch);
         if batch.is_empty() {
@@ -2421,42 +2528,55 @@ async fn reconcile_loop(
         // next one while this batch reads. The new window leaves out this batch's keys (with a
         // window of one batch it would be that batch again: refilled after it, as before).
         let next = (o.caps.refill_window_batches > 1
+            && !stop.is_cancelled()
             && (window.left() == 0
                 || window.due(
                     Instant::now() + Duration::from_secs_f64(batch_secs),
                     WINDOW_MAX_AGE,
                 )))
         .then(|| refill(&back));
-        let t0 = Instant::now();
-        let st = reconcile_batch_with(&ctx, &local, Some(pool), &batch, &o.caps).await?;
-        batch_secs = secs_since(t0);
-        let k = st.ok + st.absent + st.skipped + st.failures + st.dropped;
-        done += k;
-        let r = k as f64 / t0.elapsed().as_secs_f64().max(1e-3);
-        rate = if rate == 0.0 { r } else { 0.8 * rate + 0.2 * r };
-        let wall = wall_rate(done, started.elapsed());
-        let dirty = heartbeat(&ctx, done, rate, wall)?;
-        if last_log.elapsed() > Duration::from_secs(60) {
-            tracing::info!(
-                done,
-                dirty,
-                rate = format!("{rate:.1}"),
-                wall_rate = format!("{wall:.1}"),
-                refill_secs = format!("{refill_secs:.2}"),
-                window_left = window.left(),
-                ?st,
-                "balances: reconcile"
-            );
-            last_log = Instant::now();
+        // The batch and its bookkeeping; the walk spawned above is awaited whatever they
+        // return, so it never outlives the loop (PR #70 review M5: a `?` here used to drop its
+        // handle and leave the walk running).
+        let res: Result<BatchStats> = async {
+            let t0 = Instant::now();
+            let st = reconcile_batch_with(&ctx, &local, Some(pool), &batch, &o.caps).await?;
+            batch_secs = secs_since(t0);
+            let k = st.ok + st.absent + st.skipped + st.failures + st.dropped;
+            done += k;
+            let r = k as f64 / t0.elapsed().as_secs_f64().max(1e-3);
+            rate = if rate == 0.0 { r } else { 0.8 * rate + 0.2 * r };
+            let wall = wall_rate(done, started.elapsed());
+            let dirty = heartbeat(&ctx, done, rate, wall)?;
+            if last_log.elapsed() > Duration::from_secs(60) {
+                tracing::info!(
+                    done,
+                    dirty,
+                    rate = format!("{rate:.1}"),
+                    wall_rate = format!("{wall:.1}"),
+                    refill_secs = format!("{refill_secs:.2}"),
+                    window_left = window.left(),
+                    ?st,
+                    "balances: reconcile"
+                );
+                last_log = Instant::now();
+            }
+            let t = Instant::now();
+            after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
+            kdx_metrics::get().balance_batch_phase("after", secs_since(t));
+            note_remarked(&mut back, &batch, &st);
+            Ok(st)
         }
-        let t = Instant::now();
-        after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
-        kdx_metrics::get().balance_batch_phase("after", secs_since(t));
-        note_remarked(&mut back, &batch, &st);
-        if let Some(next) = next {
-            let (keys, secs) = next.await??;
+        .await;
+        let fresh = match next {
+            Some(next) => Some(next.await),
+            None => None,
+        };
+        let st = res?;
+        if let Some(fresh) = fresh {
+            let (keys, secs, ended) = fresh??;
             refill_secs = secs;
-            window.set_without(keys, Instant::now(), &batch);
+            window.set_without(keys, ended, &batch);
         }
         let alert = watch.note(Instant::now(), &st);
         if let Some(n) = alert.no_hash {
@@ -4510,6 +4630,8 @@ pub(crate) mod tests {
             pub batch_calls: AtomicUsize,
             pub batch_accounts: AtomicUsize,
             pub single_calls: AtomicUsize,
+            /// Milliseconds every answer waits.
+            pub delay_ms: std::sync::atomic::AtomicU64,
         }
 
         impl Mock {
@@ -4525,6 +4647,7 @@ pub(crate) mod tests {
                     batch_calls: AtomicUsize::new(0),
                     batch_accounts: AtomicUsize::new(0),
                     single_calls: AtomicUsize::new(0),
+                    delay_ms: 0.into(),
                 })
             }
 
@@ -4567,6 +4690,7 @@ pub(crate) mod tests {
             }
 
             fn answer(&self, cmd: &Value) -> (u16, Value) {
+                std::thread::sleep(Duration::from_millis(self.delay_ms.load(Ordering::SeqCst)));
                 if self.down.load(Ordering::SeqCst) {
                     return (503, json!({}));
                 }
@@ -5122,13 +5246,38 @@ pub(crate) mod tests {
             let (ma, mb) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
             let (a, b) = (local_at(&serve(ma.clone())), local_at(&serve(mb.clone())));
             let pool = pool_of(&[(&a, true), (&b, false)], 4);
-            let st = drain(&ctx, &hot, &a, Some(&pool)).await;
+            // Keys outside the tip share (the tip share goes through `pick`, PR #70 I1).
+            let keys: Vec<Dirty> = refill(&hot, 4096, 64)
+                .unwrap()
+                .into_iter()
+                .map(|d| Dirty { tip: false, ..d })
+                .collect();
+            let st = reconcile_batch_with(&ctx, &a, Some(&pool), &keys, &Caps::default())
+                .await
+                .unwrap();
             assert_eq!(st.ok, 40, "{st:?}");
             let (ca, cb) = (
                 ma.batch_calls.load(Ordering::SeqCst),
                 mb.batch_calls.load(Ordering::SeqCst),
             );
             assert_eq!((ca, cb), (0, 10), "batched reads spare the primary");
+            // The tip share is spread over every node, the primary too.
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &accts, &[]);
+            let (ma, mb) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            let (a, b) = (local_at(&serve(ma.clone())), local_at(&serve(mb.clone())));
+            let pool = pool_of(&[(&a, true), (&b, false)], 4);
+            let keys = refill(&hot, 4096, 64).unwrap();
+            assert!(keys.iter().all(|d| d.tip), "40 keys fit the tip share");
+            let st = reconcile_batch_with(&ctx, &a, Some(&pool), &keys, &Caps::default())
+                .await
+                .unwrap();
+            assert_eq!(st.ok, 40, "{st:?}");
+            assert!(
+                ma.batch_calls.load(Ordering::SeqCst) > 0
+                    && mb.batch_calls.load(Ordering::SeqCst) > 0,
+                "tip share over both nodes"
+            );
 
             // The first node is down: everything is read on the second.
             let dir = tempfile::tempdir().unwrap();
@@ -5226,6 +5375,160 @@ pub(crate) mod tests {
                 ),
                 (1, 1)
             );
+        }
+        /// `count` coin accounts `acct0…`; with `ghosts`, every fourth one absent (`ghost…`:
+        /// here the tail checkpoint is unset, so an absent answer's `as_of` is 0 and its mark
+        /// stays).
+        fn accounts(count: usize, ghosts: bool) -> Vec<String> {
+            (0..count)
+                .map(|i| {
+                    if ghosts && i % 4 == 3 {
+                        format!("ghost{i}")
+                    } else {
+                        format!("acct{i}")
+                    }
+                })
+                .collect()
+        }
+
+        /// The loop's options for these tests: `batch` keys a batch, windows of `k` batches.
+        fn loop_opts(batch: usize, k: usize) -> ReconcileOpts {
+            ReconcileOpts {
+                local: LocalOpts {
+                    rps: 0,
+                    concurrency: 8,
+                },
+                batch,
+                seed: false,
+                caps: Caps {
+                    refill_window_batches: k,
+                    ..Caps::default()
+                },
+                keylist_skip: Vec::new(),
+                batch_keys: 4,
+                read_nodes: ReadNodes::default(),
+            }
+        }
+
+        /// PR #70 review I1: a secondary 3 blocks behind (within `LAG_BLOCKS`, so still up)
+        /// does not hold fresh marks back. Every key of one window is cleared within that
+        /// window: the tip share is read through `pick`, and keys a batched answer from the
+        /// secondary could not clear are read again off that node.
+        #[tokio::test]
+        async fn a_secondary_a_few_blocks_behind_does_not_hold_fresh_marks() {
+            let names = accounts(24, false);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &names, &[]);
+            put_header(&hot, 0, 7, tip_hash());
+            let (p, sec) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            sec.height.store(7, Ordering::SeqCst);
+            let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(sec.clone())));
+            let pool = pool_of(&[(&pc, true), (&sc, false)], 4);
+            let keys = refill_window(&hot, 8, 64, 2, &HashMap::new()).unwrap();
+            assert_eq!(keys.len(), 16);
+            assert!(keys.iter().any(|d| d.tip) && keys.iter().any(|d| !d.tip));
+            let mut w = RefillWindow::default();
+            w.set(keys.clone(), Instant::now());
+            loop {
+                let batch = w.next_batch(8);
+                if batch.is_empty() {
+                    break;
+                }
+                reconcile_batch_with(&ctx, &pc, Some(&pool), &batch, &Caps::default())
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                sec.batch_calls.load(Ordering::SeqCst) > 0,
+                "the secondary took batched reads"
+            );
+            for d in &keys {
+                assert_eq!(super::mark_of(&hot, &d.key), None, "{d:?} still dirty");
+            }
+            assert_eq!(
+                dirty(&hot),
+                24 - 16,
+                "only keys outside the window are left"
+            );
+        }
+
+        /// PR #70 review M6: the real `reconcile_loop`, with windows of 4 batches and a
+        /// secondary, drains a table to exactly the rows single reads on one node write.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_loop_drains_a_table_with_a_refill_window() {
+            let names = accounts(40, true);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            // Reference: single reads on one node.
+            let rd = tempfile::tempdir().unwrap();
+            let (rctx, rhot) = store(rd.path(), &names, &[]);
+            let rl = local_at(&serve(Mock::new(tip_hash(), "1.5")));
+            for _ in 0..10 {
+                drain(&rctx, &rhot, &rl, None).await;
+            }
+            assert_eq!(dirty(&rhot), 10, "only the absent keys' marks stay");
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &names, &[]);
+            let (p, sec) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(sec.clone())));
+            let pool = pool_of(&[(&pc, true), (&sc, false)], 4);
+            let (ctx, stop) = (Arc::new(ctx), CancellationToken::new());
+            let o = loop_opts(8, 4);
+            let run = reconcile_loop(&ctx, &pc, &pool, &o, &stop, Duration::from_secs(60), None);
+            let want = dump(&rhot);
+            let watch = async {
+                until("the loop writes the rows single reads write", || {
+                    dump(&hot) == want
+                })
+                .await;
+                stop.cancel();
+            };
+            let (r, ()) = tokio::join!(run, watch);
+            r.unwrap();
+            assert!(
+                sec.batch_calls.load(Ordering::SeqCst) > 0,
+                "the secondary read"
+            );
+            assert!(
+                p.single_calls.load(Ordering::SeqCst) > 0,
+                "absent asked of the primary"
+            );
+            assert_eq!(dump(&hot), want);
+        }
+
+        /// PR #70 review M5: a stop while a batch reads and the next window's walk is spawned
+        /// ends the loop with no walk left behind (nothing else holds the store).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stop_during_a_prefetch_leaves_no_walk_behind() {
+            let names = accounts(40, true);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, hot) = store(dir.path(), &names, &[]);
+            let (p, sec) = (Mock::new(tip_hash(), "1.5"), Mock::new(tip_hash(), "1.5"));
+            sec.delay_ms.store(300, Ordering::SeqCst);
+            p.delay_ms.store(300, Ordering::SeqCst);
+            let (pc, sc) = (local_at(&serve(p.clone())), local_at(&serve(sec.clone())));
+            let pool = pool_of(&[(&pc, true), (&sc, false)], 4);
+            let (ctx, stop) = (Arc::new(ctx), CancellationToken::new());
+            let held = Arc::strong_count(&hot);
+            // Windows of 2 batches: the second batch of each window spawns the next walk.
+            let o = loop_opts(8, 2);
+            let run = reconcile_loop(&ctx, &pc, &pool, &o, &stop, Duration::from_secs(60), None);
+            let watch = async {
+                // The first batch is in; the second (with the walk spawned) is reading.
+                until("the first batch", || dirty(&hot) <= 32).await;
+                stop.cancel();
+            };
+            let t = Instant::now();
+            let (r, ()) = tokio::join!(run, watch);
+            r.unwrap();
+            assert!(t.elapsed() < Duration::from_secs(15), "ended promptly");
+            assert_eq!(
+                Arc::strong_count(&hot),
+                held,
+                "no walk holds the store after the loop"
+            );
+            assert!(dirty(&hot) > 0, "stopped before the table drained");
         }
     }
 }

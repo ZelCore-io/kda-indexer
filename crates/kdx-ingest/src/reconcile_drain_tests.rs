@@ -134,7 +134,8 @@ async fn key_marked_again_during_window_keeps_new_mark() {
         vec![Dirty {
             key: again.key,
             mark: new,
-            seed: false
+            seed: false,
+            tip: true,
         }]
     );
 }
@@ -188,6 +189,7 @@ fn window_is_due_when_used_up_or_old() {
         key: [i; 9],
         mark: Mark { height: 1, seq: 1 },
         seed: false,
+        tip: false,
     };
     w.set(vec![d(1), d(2), d(3)], t);
     assert!(!w.due(t, WINDOW_MAX_AGE));
@@ -366,6 +368,11 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// per phase. The table (`KDX_DRAIN_ROWS`, 2,000,000) is kept in `KDX_DRAIN_DIR` (a temp dir
 /// by default) for the next run.
 ///
+/// It mirrors `reconcile_loop`'s steps (refill, prefetch, batch, `after_batch`,
+/// `note_remarked`, `set_without`) rather than calling the loop, so a change to the loop's
+/// order must be copied here; `the_loop_drains_a_table_with_a_refill_window` runs the loop
+/// itself.
+///
 /// `cargo test --release -p kdx-ingest drain_bench -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "bench: run by name"]
@@ -480,10 +487,10 @@ async fn drain_bench() {
         // `reconcile_loop`'s refill, batch and bookkeeping steps.
         while start.elapsed() < Duration::from_secs(secs) {
             if w.due(Instant::now(), WINDOW_MAX_AGE) {
-                let (keys, s) = refill(&back).await.unwrap().unwrap();
+                let (keys, s, ended) = refill(&back).await.unwrap().unwrap();
                 refill_secs += s;
                 refills += 1;
-                w.set(keys, Instant::now());
+                w.set(keys, ended);
             }
             let batch = w.next_batch(1024);
             if batch.is_empty() {
@@ -504,10 +511,10 @@ async fn drain_bench() {
             after_batch(&hot, &mut fails, &mut retries, &batch, &st).unwrap();
             note_remarked(&mut back, &batch, &st);
             if let Some(next) = next {
-                let (keys, s) = next.await.unwrap().unwrap();
+                let (keys, s, ended) = next.await.unwrap().unwrap();
                 refill_secs += s;
                 refills += 1;
-                w.set_without(keys, Instant::now(), &batch);
+                w.set_without(keys, ended, &batch);
             }
             done += st.ok + st.absent + st.skipped + st.failures + st.dropped;
             batches += 1;

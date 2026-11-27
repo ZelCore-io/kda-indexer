@@ -119,17 +119,21 @@ impl ReadPool {
     }
 
     /// [`Self::pick`] for a batched `details` read: a node other than the primary that is up
-    /// and not in `tried`, round robin, even with no free slot (the call waits for one there).
-    /// The primary's `local_rps` is the budget of the reads only it decides (`try` markers,
-    /// absent answers, fungible checks, keysets); a batch it took would hold up about 25
-    /// of those. With no such node, [`Self::pick`].
+    /// and not in `tried`, round robin, preferring one with a free concurrency slot (a slow
+    /// node then gets fewer calls), else the first such node even with no free slot (the call
+    /// waits for one there). The primary's `local_rps` is the budget of the reads only it
+    /// decides (`try` markers, absent answers, fungible checks, keysets); a batch it took
+    /// would hold up about 25 of those. With no such node, [`Self::pick`].
     pub fn pick_batch(&self, tried: &[usize]) -> Option<usize> {
         let n = self.nodes.len();
         let now = Instant::now();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        (0..n)
+        let mut up = (0..n)
             .map(|k| (start + k) % n)
-            .find(|&i| !tried.contains(&i) && !self.nodes[i].primary && self.nodes[i].is_up(now))
+            .filter(|&i| !tried.contains(&i) && !self.nodes[i].primary && self.nodes[i].is_up(now));
+        up.clone()
+            .find(|&i| self.nodes[i].client.free_slots() > 0)
+            .or_else(|| up.next())
             .or_else(|| self.pick(tried))
     }
 

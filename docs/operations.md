@@ -861,13 +861,19 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
   keys for this many batches at once. Each batch of the window keeps its own write
   transaction, bookkeeping and backoff, and clears only the exact mark it read, so a key the
   tail marks again meanwhile is read again later. The window is taken again once used up or
-  5 s old (counted from the end of its walk), so a fresh tip mark waits at most about 5 s
-  plus a batch; the tip share leads every window. The next window's walk runs while the
-  window's last batch reads, and leaves that batch's keys out. 1 walks the table before every
-  batch (the behaviour before windows). Batched `details` calls go to the `local_urls` nodes
-  other than `node.url` while one is up: `node.url`'s `local_rps` is the budget of the reads
-  only it decides, and one absent key costs one call there, so with about 12% absent keys
-  the drain tops out near `local_rps` / 0.12 keys a second (about 400). The INFO line
+  5 s old (counted from the end of its walk), and the tip share leads every window. The next
+  window's walk runs while the window's last batch reads, and leaves that batch's keys out.
+  So a tip mark made just after a walk passed its key waits at most about that walk, 5 s, the
+  next walk or the batch it overlaps (the longer of the two) and the batch that reads it: a
+  few seconds past 5 s on a large backlog. 1 walks the table before every batch (the
+  behaviour before windows). Batched `details` calls go to the `local_urls` nodes other than
+  `node.url` while one is up (one with a free slot first): `node.url`'s `local_rps` is the
+  budget of the reads only it decides, and one absent key costs one call there, so with about
+  12% absent keys the drain tops out near `local_rps` / 0.12 keys a second (about 400). Two
+  exceptions keep a node a few blocks behind (within the 10-block lag limit, so still up) from
+  holding fresh marks back: the tip share's batched calls are spread over every node,
+  `node.url` included, and a key a batched answer read below its mark is read once more
+  alone on another node (`node.url` included). The INFO line
   `balances: reconcile` shows `refill_secs` (the last walk) and `window_left`, and its `st`
   carries `phases`, the last batch's seconds per phase; `kdx_balance_batch_phase_seconds{phase}`
   has them all: `refill`, `prep`, `fungible`, `reads_batched` (until the last chunk's batched
