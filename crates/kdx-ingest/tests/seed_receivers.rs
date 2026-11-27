@@ -2069,3 +2069,65 @@ fn a_coin_rewalk_begins_at_the_events_fork_and_marks_created_accounts() {
         .unwrap()
         .is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------
+// PR #66 review C1: a resumed first pass clears only the rewalk keys of the tokens it walked
+// from 0.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_token_tracked_between_resumes_of_the_first_pass_keeps_its_history_walk() {
+    let pool = pool();
+    let all: Vec<usize> = (0..24).collect();
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path(), 2, 1000, 2);
+    apply_linear(&c, &pool, &branch(&all, 0, 0, 0), 5);
+    // Height 24: free.late mints to LATE_ACC with no TRANSFER (untracked); filler after it.
+    let cmd = json!({"payload": {"exec": {"code": "(free.late.mint)", "data": {}}},
+        "meta": {"sender": SENDER}});
+    let evs = json!([event("free.late", "MINT", json!([LATE_ACC, 5.0]))]);
+    commit_block(&c, block_of(24, vec![d3_tx(6000, cmd, evs, Value::Null)]));
+    for b in 25..36 {
+        commit_block(&c, block_of(b, vec![xchain_finish(b, "coin", SENDER)]));
+    }
+    while kdx_ingest::freezer::tick(&c).unwrap().is_some() {}
+    clear_marks(&c);
+    let (mint, end) = frozen_txnum_at(&c, 25);
+    assert!(mint < end, "the mint is frozen");
+    let mut o = d3_opts(false);
+    o.history_inline = false;
+    o.chunk = 1;
+    // The first attempt stops once its cursor is past the mint.
+    let past = || {
+        let txn = c.hot.ro().unwrap();
+        txn.meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_CURSOR)
+            .unwrap()
+            .is_some_and(|v| u64::from_be_bytes(v[4..12].try_into().unwrap()) >= mint)
+    };
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &past).unwrap();
+    assert!(rep.stopped && rep.from == 0, "{rep:?}");
+    // free.late is tracked between the attempts (a confirmed discovery, by the reconcile loop).
+    let q = vec![("free.late".to_owned(), 0u8, 24u32)];
+    seed_receivers::check_discovered(&c.hot, &c.dict, &q, &[Some(true)]).unwrap();
+    assert!(rewalk_names(&c).contains(&"free.late".to_owned()));
+    // Tokens the first attempt tracked itself are queued too (not in its start list).
+    // The resumed attempt walks free.late only from its cursor: the mint stays unmarked...
+    let rep = seed_receivers::run(&c.hot, &c.dict, &c.segdir, &o, &|| false).unwrap();
+    assert!(!rep.stopped && rep.from == 0, "{rep:?}");
+    assert!(!dirty_in(&c, LATE_ACC, "free.late"));
+    // ...so its rewalk key survives, and the history walk marks the mint.
+    assert!(rewalk_names(&c).contains(&"free.late".to_owned()));
+    seq_walk(&c, &o, 1);
+    assert!(dirty_in(&c, LATE_ACC, "free.late"));
+    assert!(rewalk_names(&c).is_empty());
+}
+
+fn rewalk_names(c: &kdx_ingest::Ctx) -> Vec<String> {
+    let txn = c.hot.ro().unwrap();
+    let d = kdx_hot::HotDict::load(&txn).unwrap();
+    balances::rewalk_pending(&txn)
+        .unwrap()
+        .into_iter()
+        .map(|m| d.name(DictKind::Module, m).unwrap().to_owned())
+        .collect()
+}
