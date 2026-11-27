@@ -311,8 +311,10 @@ The G4 replay of real traffic (below) met most of these classes again; its
 - A stock-issued cursor or `next` token is refused once at the cutover; the client restarts
   from the first page ([graphql.md](graphql.md#ids-and-cursors),
   [load-balancer.md](load-balancer.md#4-apply-check-roll-back)).
-- Stock root fields outside Kadena's schema (`pools`, `dexMetrics`, `tokenPrices`) are not
-  served, so introspection answers differ ([graphql.md](graphql.md#schema)).
+- Stock root fields outside Kadena's schema (`pools`, `dexMetrics`, `tokenPrices` and the
+  other DEX fields) are served from the Sushi ledger ([graphql.md](graphql.md#sushi-dex)), so
+  introspection lists them beside Kadena's schema and the ZelCore extensions
+  ([graphql.md](graphql.md#schema)).
 - Holders (`balance(module:)`): stock stringifies a non-string account of a marmalade
   `MINT`/`TRANSFER`/`RECONCILE` row in its SQL insert; ours keeps only string accounts (no
   such event is known on mainnet). Token ids follow stock (any truthy value).
