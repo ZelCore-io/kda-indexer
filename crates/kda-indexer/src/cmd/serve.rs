@@ -224,10 +224,11 @@ fn miss_reader(
             concurrency: m.max_in_flight.max(1) as usize,
         },
     ));
+    let settings = m.settings(gs.pact.chains);
     Ok(Some(Arc::new(kdx_graphql::miss::MissReader::new(
-        kdx_graphql::miss::MissReader::local_details(local),
+        kdx_graphql::miss::MissReader::local_details(local, settings.timeout),
         sink,
-        m.settings(gs.pact.chains),
+        settings,
     ))))
 }
 

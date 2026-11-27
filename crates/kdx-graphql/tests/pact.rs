@@ -1200,3 +1200,39 @@ async fn no_peer_address_shares_no_bucket() {
     assert!(err_msg(&r).contains("[RATE_LIMIT]"), "{r}");
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }
+
+/// The account-miss reader sends each node read once: a 5xx answer is one request, not the
+/// client's three tries with backoff, and it fails fast (a slot held for one call only).
+#[tokio::test]
+async fn account_miss_details_are_sent_once_on_a_server_error() {
+    let (base, m) = mock(|_, _| (503, "busy".into(), Duration::ZERO)).await;
+    let node = kdx_node::NodeClient::new(&kdx_node::NodeClientConfig {
+        base,
+        network: "mainnet01".into(),
+        timeout: Duration::from_secs(5),
+        max_rps: 0,
+        concurrency: 4,
+        p2p_url: None,
+        p2p_cert_sha256: None,
+        max_body_bytes: 1 << 20,
+        max_sse_event_bytes: 1 << 16,
+    })
+    .unwrap();
+    let local = Arc::new(kdx_node::LocalClient::new(
+        node,
+        kdx_node::LocalOpts {
+            rps: 0,
+            concurrency: 4,
+        },
+    ));
+    let read = kdx_graphql::miss::MissReader::local_details(local, Duration::from_secs(2));
+    let t0 = Instant::now();
+    let r = read(0, "coin".into(), "k:ab".into()).await;
+    assert!(r.is_err());
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1, "one attempt");
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        t0.elapsed()
+    );
+}
