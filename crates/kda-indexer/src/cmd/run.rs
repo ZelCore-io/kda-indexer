@@ -62,6 +62,8 @@ pub async fn run(cfg: &Config, a: RunArgs) -> anyhow::Result<()> {
     kdx_ingest::disk::ensure_free(&data_dir, cfg.backfill.min_free_gb)?;
     let token = CancellationToken::new();
     signals(token.clone())?;
+    // A background writer whose dictionary reload failed (F-52) stops the process.
+    kdx_ingest::ctx::set_process_stop(token.clone());
     super::notify::spawn_watchdog(&[Component::Ingest, Component::Api]);
     super::notify::spawn_api_heartbeat(token.clone());
     heartbeat::beat(Component::Ingest);

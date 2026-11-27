@@ -325,7 +325,7 @@ impl Pending {
         let r = self.write(hot, &mut d, (coin, keys), cursor, rep);
         if r.is_err() {
             // Names drained from `pending` never reached MDBX: forget them (review M3).
-            *d = HotDict::load(&hot.ro()?)?;
+            crate::ctx::reload_dict(hot, &mut d)?;
         }
         r
     }
@@ -657,6 +657,17 @@ fn take(p: &mut Pending, w: &Walk, rep: &mut ReceiversReport, em: &str, row: u64
 }
 
 /// D3: the tracked fungible tokens (`Tokens`, not-fungible verdicts excluded) by name.
+/// The tokens a D3 pass walks and the queued rewalk ids it may clear at its end. A token
+/// missing from `snap` is not walked, so it keeps its key for the history walk. Every other
+/// queued id read from `txn` is a tracked token in `tokens`, or one since marked not
+/// fungible (never walked by D3; its key is cleared as before).
+fn d3_start(txn: &impl Txn, snap: &MemDict) -> Result<(HashSet<String>, Vec<u32>)> {
+    let tokens = tracked_tokens(txn, snap)?;
+    let mut rewalk = balances::rewalk_pending(txn)?;
+    rewalk.retain(|id| snap.name(DictKind::Module, *id).is_some());
+    Ok((tokens, rewalk))
+}
+
 fn tracked_tokens(txn: &impl Txn, dict: &MemDict) -> Result<HashSet<String>> {
     let mut out = HashSet::new();
     for (k, v) in txn.scan(Table::Tokens, &[], |_| true)? {
@@ -1181,16 +1192,13 @@ pub fn run(
         rules = ?o.rules,
         "balances: receivers pass started"
     );
+    // The read txn opens before the dictionary snapshot (as in `history_begin`): every
+    // token it holds was interned before it, so is in the snapshot.
+    let txn = (o.rules == Rules::D3).then(|| hot.ro()).transpose()?;
     let snap: Arc<MemDict> = Arc::new(dict.lock().unwrap_or_else(|e| e.into_inner()).mem().clone());
-    let (tokens, rewalk) = match o.rules {
-        Rules::D1 => (HashSet::new(), Vec::new()),
-        Rules::D3 => {
-            let txn = hot.ro()?;
-            (
-                tracked_tokens(&txn, &snap)?,
-                balances::rewalk_pending(&txn)?,
-            )
-        }
+    let (tokens, rewalk) = match txn {
+        None => (HashSet::new(), Vec::new()),
+        Some(txn) => d3_start(&txn, &snap)?,
     };
     let w = Walk {
         rules: o.rules,
@@ -1958,7 +1966,7 @@ pub fn check_discovered(
     if r.is_err() {
         // F-52: `persist` drained the queue inside a txn that aborted or failed to commit, so
         // names interned here never reached MDBX: forget them.
-        *d = HotDict::load(&hot.ro()?)?;
+        crate::ctx::reload_dict(hot, &mut d)?;
     }
     r
 }
@@ -1992,5 +2000,27 @@ mod tests {
         assert_eq!(parse_budget(Some(&j), 10, 100), Default::default());
         assert_eq!(parse_budget(Some(&j), 0, 99), Default::default());
         assert_eq!(parse_budget(None, 10, 99), Default::default());
+    }
+
+    /// A token queued for its history walk but not yet in the dictionary snapshot the pass
+    /// walks with (interned after the snapshot) is not walked, so its rewalk key is not
+    /// among the ones the pass clears.
+    #[test]
+    fn d3_start_keeps_the_rewalk_key_of_a_token_missing_from_the_snapshot() {
+        use kdx_types::dict::DictMut;
+        let d = tempfile::tempdir().unwrap();
+        let hot =
+            kdx_hot::HotStore::open(&d.path().join("hot"), kdx_hot::Geometry::default()).unwrap();
+        let mut snap = MemDict::new();
+        let known = snap.intern(DictKind::Module, "free.known");
+        let late = known + 1;
+        let mut txn = hot.rw().unwrap();
+        balances::note_token(&mut txn, known, 5).unwrap();
+        balances::note_token(&mut txn, late, 5).unwrap();
+        balances::queue_rewalk(&mut txn, &[known, late]).unwrap();
+        txn.commit().unwrap();
+        let (tokens, rewalk) = d3_start(&hot.ro().unwrap(), &snap).unwrap();
+        assert_eq!(tokens, HashSet::from(["free.known".to_owned()]));
+        assert_eq!(rewalk, vec![known]);
     }
 }

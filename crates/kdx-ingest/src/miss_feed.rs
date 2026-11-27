@@ -48,6 +48,7 @@ pub fn spawn(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Found>, stop: CancellationTok
             let c = ctx.clone();
             match tokio::task::spawn_blocking(move || mark(&c, &batch)).await {
                 Ok(Ok(n)) => tracing::debug!(marked = n, "balances: gap Q node-found rows marked"),
+                Ok(Err(e)) if crate::ctx::stop_on_reload_failure(&e, &stop) => break,
                 Ok(Err(e)) => {
                     tracing::warn!(error = format!("{e:#}"), "balances: gap Q marks failed")
                 }
