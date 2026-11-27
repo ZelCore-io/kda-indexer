@@ -505,12 +505,14 @@ impl MissReader {
     }
 
     /// The production node call over a [`kdx_node::LocalClient`] of its own. Its rate and
-    /// concurrency must not queue: the reader's own node bucket and slots are the caps.
-    pub fn local_details(local: Arc<kdx_node::LocalClient>) -> DetailsFn {
+    /// concurrency must not queue: the reader's own node bucket and slots are the caps. Each
+    /// read is sent once with `timeout` (no client retries): a failing node costs one
+    /// request per read and frees the slot at once.
+    pub fn local_details(local: Arc<kdx_node::LocalClient>, timeout: Duration) -> DetailsFn {
         Arc::new(move |chain, module, account| {
             let local = local.clone();
             Box::pin(async move {
-                match local.details(chain, &module, &account).await {
+                match local.details_once(chain, &module, &account, timeout).await {
                     Ok(kdx_node::Local::Found { value, height, .. }) => Ok(NodeRow::Found {
                         balance: value.balance,
                         guard: value.guard,
@@ -701,7 +703,7 @@ impl MissReader {
     /// One read before `deadline`, shareable by every field of the request: join the key's
     /// call in flight, or start one. A refusal is a ready error.
     fn request_call(&self, key: Key, deadline: Instant) -> Call {
-        match self.flight(key, deadline) {
+        match self.flight(key) {
             Err(e) => futures::future::ready(Err(e)).boxed().shared(),
             Ok(call) => {
                 let left = deadline.saturating_duration_since(Instant::now());
@@ -716,8 +718,11 @@ impl MissReader {
         }
     }
 
-    /// The key's call in flight, or a new one (a node token taken without waiting).
-    fn flight(&self, key: Key, deadline: Instant) -> Result<Call, ReadErr> {
+    /// The key's call in flight, or a new one (a node token taken without waiting). The
+    /// shared call runs for the reader's own timeout, not the deadline of the request that
+    /// starts it: a request joining it later waits by its own deadline
+    /// ([`Self::request_call`]), and is not cut short when the first one runs out.
+    fn flight(&self, key: Key) -> Result<Call, ReadErr> {
         // Declared before the lock so that a stale call, if this is its last handle, is
         // dropped after the lock is released (its guard takes the same lock).
         let mut _stale: Option<Call> = None;
@@ -745,6 +750,7 @@ impl MissReader {
             kdx_metrics::get().graphql_rejected("account_miss_node_rate");
             return Err(ReadErr::Busy);
         }
+        let until = now + self.core.settings.timeout;
         let id = self.core.next_id.fetch_add(1, Ordering::Relaxed);
         let guard = FlightGuard {
             core: self.core.clone(),
@@ -755,7 +761,7 @@ impl MissReader {
         let k = key.clone();
         let call: Call = async move {
             let _guard = guard;
-            core.call(&k, deadline).await
+            core.call(&k, until).await
         }
         .boxed()
         .shared();
@@ -764,7 +770,7 @@ impl MissReader {
                 key,
                 Flight {
                     id,
-                    until: deadline,
+                    until,
                     call: weak,
                 },
             );
@@ -849,6 +855,27 @@ mod tests {
         assert!(!absent(&c, 3, t0));
         assert!(absent(&c, 5, t0), "bit 5 survives in the young mask");
         assert!(!c.old.contains_key(&mk), "the emptied old mask is dropped");
+    }
+
+    /// A read that joins a call in flight is bounded by its own deadline only: the call is
+    /// not cut short when the request that started it runs out of time.
+    #[tokio::test]
+    async fn a_joined_read_outlives_the_deadline_of_the_request_that_started_it() {
+        let slow: DetailsFn = Arc::new(|_, _, _| {
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(NodeRow::Absent)
+            }
+            .boxed()
+        });
+        let r = MissReader::new(slow, None, MissSettings::default());
+        let now = Instant::now();
+        let first = r.request_call(key(0), now + Duration::from_millis(50));
+        let second = r.request_call(key(0), now + Duration::from_secs(2));
+        let (a, b) = futures::future::join(first, second).await;
+        assert!(matches!(a, Err(ReadErr::Timeout)), "{a:?}");
+        assert!(matches!(b, Ok(NodeRow::Absent)), "{b:?}");
+        assert_eq!(r.calls(), 1, "one shared node call");
     }
 
     fn core(s: MissSettings) -> Core {

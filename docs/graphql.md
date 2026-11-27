@@ -235,7 +235,9 @@ The walk also prices the document with this indexer's own cost model: a read bud
 rows a request reads. It prices a page as served, with the same function the resolvers size a
 page with: as asked up to 1,000; absent, `first: 0` or `last: 0` without a cursor at
 `default_page` (20), at every nesting level; with a cursor the count as given (`after` with
-`first: 0` costs 0). A page variable bound to nothing, a subscription's `quantity` and the ids
+`first: 0` costs 0). Stock's DEX lists (`pools`, `tokens`, `liquidityPositions`,
+`poolTransactions`, `Pool.transactions`) serve their default page for `first: 0` or `last: 0`
+with a cursor too, as stock does, and are priced at that page. A page variable bound to nothing, a subscription's `quantity` and the ids
 of `nodes` are priced at the most served (1,000). An account's NFT holdings are read when the
 account resolves, so `nonFungibleAccount`, `nonFungibleChainAccount` and every NFT id given to
 `node`/`nodes` (or an id only a variable gives) cost 10,000 rows (one details read each)
@@ -611,7 +613,11 @@ the oracle puts them.
 - **`totalCount`** is exact, as stock's (GQ-10, owner ruling 2026-11-26): it is the number
   of rows the full walk of the list returns, with every filter applied, and has no cap. It
   is computed only when selected: from the stored per-key counts where they hold the list
-  (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s).
+  (below), else by a count walk that runs to the request deadline (`api.deadline_ms`, 5 s)
+  or for at most 4 s, whichever ends first. An unbounded count walk that decodes records
+  (not one scoped to one block or one request key) also takes a slot of its own: one per
+  client IP at a time, `graphql.count_walk_slots` in the process (default: half the heavy
+  read slots, at least 2); with none free within 250 ms it answers `COUNT_TIMEOUT`.
   A walk the deadline cuts answers a `COUNT_TIMEOUT` error at
   `totalCount` (the error has the field's path; `totalCount` is `Int!`, but this indexer's
   own errors null the field in place and keep the page: `totalCount` answers `null` next to

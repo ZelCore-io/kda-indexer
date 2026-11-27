@@ -421,6 +421,24 @@ impl LocalClient {
     }
 }
 
+impl LocalClient {
+    /// [`Self::details`] sent once with its own `timeout`: no retry inside the client (the
+    /// account-miss reader, whose own node bucket and slots are the caps).
+    pub async fn details_once(
+        &self,
+        chain: u8,
+        module: &str,
+        account: &str,
+        timeout: Duration,
+    ) -> LocalResult<Details> {
+        check_module(module).and_then(|_| check_name("account", account))?;
+        let code = format!("({module}.details (read-msg \"a\"))");
+        self.call_once(chain, &code, json!({ "a": account }), timeout)
+            .await
+            .and_then(details_of)
+    }
+}
+
 /// Most accounts one [`LocalClient::details_many`] call reads (`balances.local_batch_keys` is
 /// capped at this).
 pub const MAX_BATCH_KEYS: usize = 100;

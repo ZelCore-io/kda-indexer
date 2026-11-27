@@ -282,7 +282,14 @@ pub fn reconcile(
         holders::add_tally(&mut txn, &t)?;
         txn.commit()?;
     }
-    if rep.unrendered == 0 {
+    // A partial store (`run --start-height`, or a first range above height 0) misses the
+    // holders below its start: the table is rebuilt but not marked ready, as the chain
+    // counters in `row_counts::reconcile`.
+    let partial = hot.ro()?.meta(crate::freezer::META_PARTIAL_FROM)?.is_some()
+        || kdx_segment::manifest::Manifest::load(segdir)?
+            .and_then(|m| m.entries.first().map(|e| e.start > 0))
+            .unwrap_or(false);
+    if rep.unrendered == 0 && !partial {
         let mut txn = hot.rw()?;
         holders::set_ready(&mut txn, next_txnum)?;
         holders::stamp_all(&mut txn)?;

@@ -140,11 +140,142 @@ impl Ctx {
     /// an error the caller returns (F-52): going on with the drained in-memory dictionary
     /// would hand out ids that are not in `DictRev`.
     pub fn reload_dict(&self, dict: &mut HotDict) -> Result<()> {
-        *dict = self
-            .hot
-            .ro()
-            .and_then(|t| HotDict::load(&t))
-            .context("reloading the dictionary after a failed write txn")?;
-        Ok(())
+        reload_dict(&self.hot, dict)
+    }
+}
+
+/// A failed reload of the dictionary after a failed write txn (F-52): the in-memory
+/// dictionary may hand out ids that are not in `DictRev`, so the process must stop.
+#[derive(Debug)]
+pub struct DictReloadFailed(anyhow::Error);
+
+impl DictReloadFailed {
+    /// The failure of a reload that ended with `e`.
+    pub fn new(e: anyhow::Error) -> DictReloadFailed {
+        DictReloadFailed(e)
+    }
+}
+
+impl std::fmt::Display for DictReloadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reloading the dictionary after a failed write txn")
+    }
+}
+
+impl std::error::Error for DictReloadFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Replace `dict` with the one persisted in `hot` (see [`Ctx::reload_dict`]). A failure is a
+/// [`DictReloadFailed`]: the caller returns it, and a background writer that would go on
+/// stops the process ([`stop_on_reload_failure`]).
+///
+/// A failed reload poisons `dict` ([`HotDict::poison`]): until the process stops, no write
+/// txn can persist it, so no later block commits ids that are not in `DictRev`. It is also
+/// recorded ([`reload_failure`]), so the command ends with an error.
+pub fn reload_dict(hot: &HotStore, dict: &mut HotDict) -> Result<()> {
+    match hot.ro().and_then(|t| HotDict::load(&t)) {
+        Ok(d) => {
+            *dict = d;
+            Ok(())
+        }
+        Err(e) => {
+            dict.poison();
+            record_reload_failure(&e);
+            Err(anyhow::Error::new(DictReloadFailed(e)))
+        }
+    }
+}
+
+/// The first failed dictionary reload of the process (F-52), recorded so the command that
+/// ran the writer ends with an error and a non-zero exit, and systemd restarts it.
+static RELOAD_FAILED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn record_reload_failure(e: &anyhow::Error) {
+    let _ = RELOAD_FAILED.set(format!("{e:#}"));
+}
+
+/// The recorded failed reload, if any ([`reload_dict`]).
+pub fn reload_failure() -> Option<&'static str> {
+    RELOAD_FAILED.get().map(String::as_str)
+}
+
+/// `res`, or an error when a dictionary reload failed during the command (F-52): a command
+/// whose writer stopped after a failed reload must not end "ok" (exit 0).
+pub fn fail_on_reload_failure<T>(res: Result<T>, failed: Option<&str>) -> Result<T> {
+    match (res, failed) {
+        (Ok(_), Some(why)) => Err(anyhow::anyhow!(
+            "stopped: dictionary reload failed after a failed write txn (F-52): {why}"
+        )),
+        (r, _) => r,
+    }
+}
+
+/// Whether `e` carries a [`DictReloadFailed`].
+pub fn is_reload_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<DictReloadFailed>())
+}
+
+/// The process's stop token, registered by the command that runs the background writers.
+static PROCESS_STOP: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+    std::sync::OnceLock::new();
+
+/// Register the process's stop token: a background writer whose dictionary reload failed
+/// cancels it ([`stop_on_reload_failure`]). The first registration stays.
+pub fn set_process_stop(token: tokio_util::sync::CancellationToken) {
+    let _ = PROCESS_STOP.set(token);
+}
+
+/// For a background writer that logs its errors and goes on: when `e` is a failed reload
+/// (F-52), log it at ERROR and stop the process (the registered token, else `fallback`), and
+/// answer `true`, so the writer stops too.
+pub fn stop_on_reload_failure(
+    e: &anyhow::Error,
+    fallback: &tokio_util::sync::CancellationToken,
+) -> bool {
+    if !is_reload_failure(e) {
+        return false;
+    }
+    record_reload_failure(e);
+    tracing::error!(
+        error = format!("{e:#}"),
+        "dictionary reload failed after a failed write txn; stopping the process (F-52)"
+    );
+    PROCESS_STOP.get().unwrap_or(fallback).cancel();
+    fallback.cancel();
+    true
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    /// A failed reload stops the process token; any other error leaves it running.
+    #[test]
+    fn a_failed_reload_stops_the_process() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let other = anyhow::anyhow!("write failed");
+        assert!(!stop_on_reload_failure(&other, &stop));
+        assert!(!stop.is_cancelled());
+        let e =
+            anyhow::Error::new(DictReloadFailed(anyhow::anyhow!("no readers"))).context("marks");
+        assert!(is_reload_failure(&e));
+        assert!(stop_on_reload_failure(&e, &stop));
+        assert!(stop.is_cancelled());
+        assert!(reload_failure().is_some(), "the failure is recorded");
+    }
+
+    /// A command that ends `Ok` after a failed reload ends with an error instead; an error
+    /// it already has is kept.
+    #[test]
+    fn a_recorded_reload_failure_fails_the_command() {
+        assert!(fail_on_reload_failure(Ok(()), None).is_ok());
+        let e = fail_on_reload_failure(Ok(()), Some("no readers")).unwrap_err();
+        assert!(format!("{e:#}").contains("no readers"), "{e:#}");
+        let e =
+            fail_on_reload_failure::<()>(Err(anyhow::anyhow!("node gone")), Some("x")).unwrap_err();
+        assert!(format!("{e:#}").contains("node gone"), "{e:#}");
     }
 }

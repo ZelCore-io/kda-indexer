@@ -425,14 +425,15 @@ impl<'a> Walker<'a> {
             self.last_object = ty;
             return ty;
         }
+        let possible = meta.possible_types()?;
+        // A `__typename` selected for every possible type names the object's type; a value
+        // that is not one of them is a data field under the same key (never trusted).
         let any = self.plan(sid, None, ty);
         if let Some(Value::String(s)) = any.typename.as_ref().and_then(|k| map.get(k)) {
-            return registry
-                .types
-                .get_key_value(s.as_str())
-                .map(|(k, _)| k.as_str());
+            if let Some(k) = possible.get(s.as_str()) {
+                return Some(k.as_str());
+            }
         }
-        let possible = meta.possible_types()?;
         if possible.len() > MAX_INFER_TYPES {
             return None;
         }
@@ -467,12 +468,13 @@ impl<'a> Walker<'a> {
             self.collect_into(s, runtime, 0, &mut acc);
         }
         let parent_meta = parent.and_then(|p| self.registry.types.get(p));
-        let mut typename = None;
+        // Only a `__typename` selected for every runtime type: one inside a narrower
+        // fragment shares its key with other types' fields.
+        let typename = self.sets[sid]
+            .iter()
+            .find_map(|s| self.outer_typename(s, parent, 0));
         let mut entries = Vec::with_capacity(acc.len());
         for (key, fields) in acc {
-            if fields[0].name.node == "__typename" && typename.is_none() {
-                typename = Some(key.clone());
-            }
             let ty = parent_meta
                 .and_then(|m| m.field_by_name(&fields[0].name.node))
                 .map(|f| f.ty.as_str());
@@ -495,6 +497,51 @@ impl<'a> Walker<'a> {
         });
         self.plans[sid].push((runtime, parent, p.clone()));
         p
+    }
+
+    /// The response key of a `__typename` selected in `set` outside any fragment narrower
+    /// than `parent` (a fragment on `parent` itself, or with no type condition, is not).
+    fn outer_typename(
+        &self,
+        set: &'a SelectionSet,
+        parent: Option<&str>,
+        depth: usize,
+    ) -> Option<Name> {
+        let wide = |c: Option<&Name>| c.is_none_or(|c| Some(c.as_str()) == parent);
+        for sel in &set.items {
+            let found = match &sel.node {
+                Selection::Field(f) => (f.node.name.node == "__typename"
+                    && self.included(&f.node.directives))
+                .then(|| f.node.response_key().node.clone()),
+                Selection::FragmentSpread(s) => {
+                    if depth >= MAX_FRAGMENT_DEPTH || !self.included(&s.node.directives) {
+                        continue;
+                    }
+                    self.doc
+                        .fragments
+                        .get(&s.node.fragment_name.node)
+                        .filter(|f| wide(Some(&f.node.type_condition.node.on.node)))
+                        .and_then(|f| {
+                            self.outer_typename(&f.node.selection_set.node, parent, depth + 1)
+                        })
+                }
+                Selection::InlineFragment(i) => {
+                    if depth >= MAX_FRAGMENT_DEPTH || !self.included(&i.node.directives) {
+                        continue;
+                    }
+                    let cond = i.node.type_condition.as_ref().map(|c| &c.node.on.node);
+                    if wide(cond) {
+                        self.outer_typename(&i.node.selection_set.node, parent, depth + 1)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
     }
 
     fn collect_into(
@@ -947,6 +994,20 @@ mod tests {
             d,
             serde_json::json!({"pets": [{"name": "c", "mood": null}, {"barks": true}]})
         );
+    }
+
+    /// A `__typename` aliased inside one member's fragment names that member only: on the
+    /// other member the same key holds a data field, which is never read as a type name, so
+    /// the runtime type is still inferred and the failed nullable restored.
+    #[tokio::test]
+    async fn an_aliased_typename_in_a_member_fragment_is_not_read_on_other_members() {
+        let s = schema(true);
+        let q = "{ pets { ... on Dog { x: __typename barks } ... on Cat { x: name lives mood } } }";
+        let d = data(&s, q).await;
+        let cat = &d["pets"][0];
+        assert_eq!(keys(cat), ["x", "lives", "mood"], "{d}");
+        assert_eq!(cat["mood"], serde_json::Value::Null);
+        assert_eq!(d["pets"][1]["x"], "Dog", "{d}");
     }
 
     #[tokio::test]

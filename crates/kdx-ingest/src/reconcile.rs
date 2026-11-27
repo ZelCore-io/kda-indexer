@@ -2089,7 +2089,15 @@ where
 async fn receivers_task(ctx: Arc<Ctx>, stop: CancellationToken) {
     tracing::info!("balances: receivers pass task started (D1, D3)");
     loop {
-        let pass = |rules| receivers_pass(&ctx, &stop, rules);
+        let (c, s) = (&ctx, &stop);
+        let pass = |rules| async move {
+            let r = receivers_pass(c, s, rules).await;
+            // F-52: a failed dictionary reload stops the process (and so this task).
+            if let Err(e) = &r {
+                crate::ctx::stop_on_reload_failure(e, s);
+            }
+            r
+        };
         let Some(pause) = receivers_round(pass, set_pass_failed).await else {
             return;
         };
@@ -2127,6 +2135,7 @@ async fn history_task(ctx: Arc<Ctx>, slice: u64, threads: usize, stop: Cancellat
         let pause = match r {
             Ok(Ok(true)) => continue,
             Ok(Ok(false)) => HISTORY_IDLE,
+            Ok(Err(e)) if crate::ctx::stop_on_reload_failure(&e, &stop) => return,
             Ok(Err(e)) => {
                 // The next try resumes from the persisted cursor.
                 tracing::warn!(error = %e, "balances: D3 history walk failed; retried later");
@@ -2469,7 +2478,9 @@ async fn reconcile_loop(
         }
         if o.seed {
             if let Err(e) = discovery_step(&ctx, &local).await {
-                tracing::warn!(error = %e, "balances: D3 discovery check failed; retried next round");
+                if !crate::ctx::stop_on_reload_failure(&e, &stop) {
+                    tracing::warn!(error = %e, "balances: D3 discovery check failed; retried next round");
+                }
             }
         }
         // NFT rows (plan Task 11) share the `/local` budget; the table is small, so one step
