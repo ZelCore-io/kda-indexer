@@ -66,6 +66,7 @@ max_event_lists = 256     # event-name lists one event query may expand to
 # sample_rate = 1.0           # share of requests logged (every n-th)
 # max_body_bytes = 16384      # a larger GraphQL body is not written, only its length
 # queue = 8192                # lines waiting for the writer; more are dropped and counted
+# queue_mb = 8                # bytes waiting for the writer; more are dropped and counted
 # client_ip = "hash"          # "hash" (keyed per process) or "omit"; never the raw address
 
 

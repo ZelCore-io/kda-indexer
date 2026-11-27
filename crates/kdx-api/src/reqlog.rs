@@ -20,7 +20,7 @@ use std::io::{BufWriter, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,8 @@ use crate::server::ApiState;
 pub const MAX_URI_CHARS: usize = 8192;
 /// Lines the writer takes from the queue before it flushes.
 const WRITE_BATCH: usize = 1024;
+/// What an entry costs in the queue besides its URI and body (fields, strings, the slot).
+const ENTRY_OVERHEAD: usize = 256;
 
 /// How the client address appears in a line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,13 +62,21 @@ pub struct Settings {
     pub max_body_bytes: usize,
     /// Lines waiting for the writer at most; more are dropped and counted.
     pub queue: usize,
+    /// Bytes waiting for the writer at most (URIs, GraphQL bodies and a fixed overhead per
+    /// line); a line that would go over is dropped and counted (`dropped_bytes`).
+    pub queue_max_bytes: usize,
     pub client_ip: ClientIp,
 }
 
-/// The GraphQL POST body as the handler read it, handed to the log in the response's
-/// extensions (the handler adds it only while the log is on).
+/// The GraphQL POST body for the log, handed over in the response's extensions (the handler
+/// adds it only while the log is on). Built by [`RequestLog::graphql_body`], which keeps the
+/// body only when it fits `max_body_bytes`: an oversized body is never held past its
+/// request, only its length.
 #[derive(Debug, Clone)]
-pub struct GraphqlBody(pub Bytes);
+pub struct GraphqlBody {
+    pub body: Option<Bytes>,
+    pub len: usize,
+}
 
 /// One request, as the request path hands it to the writer.
 #[derive(Debug)]
@@ -81,10 +91,23 @@ pub struct Entry {
     pub client: Option<u64>,
     pub tips: Option<(i64, i64)>,
     pub lag: Option<i64>,
-    pub body: Option<Bytes>,
+    pub body: Option<GraphqlBody>,
 }
 
 impl Entry {
+    /// What the entry holds in memory while it waits in the queue, roughly.
+    pub fn queued_bytes(&self) -> usize {
+        ENTRY_OVERHEAD
+            + self.uri.len()
+            + self.method.len()
+            + self.route.as_ref().map_or(0, String::len)
+            + self
+                .body
+                .as_ref()
+                .and_then(|b| b.body.as_ref())
+                .map_or(0, Bytes::len)
+    }
+
     /// The JSON line (without the newline).
     pub fn to_line(&self, max_body: usize) -> String {
         let mut uri = self.uri.as_str();
@@ -120,11 +143,11 @@ impl Entry {
             v["lag_max"] = l.into();
         }
         if let Some(b) = &self.body {
-            match graphql_fields(b, max_body) {
+            match b.body.as_ref().and_then(|x| graphql_fields(x, max_body)) {
                 Some(g) => v["gql"] = g,
                 None => {
                     v["gql_cut"] = Value::Bool(true);
-                    v["gql_len"] = b.len().into();
+                    v["gql_len"] = b.len.into();
                 }
             }
         }
@@ -239,6 +262,10 @@ struct Inner {
     seen: AtomicU64,
     written: Arc<AtomicU64>,
     dropped: AtomicU64,
+    /// Bytes of the entries in the queue ([`Entry::queued_bytes`]); the writer subtracts.
+    queued: Arc<AtomicU64>,
+    max_queued: u64,
+    max_body: usize,
     rate: f64,
     client_ip: ClientIp,
     key: RandomState,
@@ -265,10 +292,11 @@ impl RequestLog {
         let (tx, rx) = sync_channel(s.queue.max(1));
         let log = RequestLog::with_sender(tx, &s);
         let written = log.0.written.clone();
+        let queued = log.0.queued.clone();
         let max_body = s.max_body_bytes;
         std::thread::Builder::new()
             .name("kdx-request-log".into())
-            .spawn(move || writer(&rx, &mut w, max_body, &written))?;
+            .spawn(move || writer(&rx, &mut w, max_body, &written, &queued))?;
         Ok(log)
     }
 
@@ -278,6 +306,9 @@ impl RequestLog {
             seen: AtomicU64::new(0),
             written: Arc::new(AtomicU64::new(0)),
             dropped: AtomicU64::new(0),
+            queued: Arc::new(AtomicU64::new(0)),
+            max_queued: s.queue_max_bytes as u64,
+            max_body: s.max_body_bytes,
             rate: s.sample_rate,
             client_ip: s.client_ip,
             key: RandomState::new(),
@@ -295,15 +326,42 @@ impl RequestLog {
         }
     }
 
-    /// Queues `e`, or drops and counts it when the queue is full.
+    /// What the log may keep of a GraphQL body read on the request path: the body (a
+    /// reference-counted handle, no copy) only when it fits `max_body_bytes`, else its length.
+    pub fn graphql_body(&self, body: &Bytes) -> GraphqlBody {
+        GraphqlBody {
+            body: (body.len() <= self.0.max_body).then(|| body.clone()),
+            len: body.len(),
+        }
+    }
+
+    /// Queues `e`, or drops and counts it when the queue is full (`dropped`) or its bytes
+    /// would pass `queue_max_bytes` (`dropped_bytes`).
     pub fn submit(&self, e: Entry) {
-        match self.0.tx.try_send(e) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+        let cost = e.queued_bytes() as u64;
+        let q = &self.0.queued;
+        let mut cur = q.load(Ordering::Relaxed);
+        loop {
+            if cur + cost > self.0.max_queued {
                 self.0.dropped.fetch_add(1, Ordering::Relaxed);
-                kdx_metrics::get().request_log("dropped");
+                kdx_metrics::get().request_log("dropped_bytes");
+                return;
+            }
+            match q.compare_exchange_weak(cur, cur + cost, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => cur = now,
             }
         }
+        if self.0.tx.try_send(e).is_err() {
+            q.fetch_sub(cost, Ordering::AcqRel);
+            self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            kdx_metrics::get().request_log("dropped");
+        }
+    }
+
+    /// Bytes waiting in the queue now.
+    pub fn queued_bytes(&self) -> u64 {
+        self.0.queued.load(Ordering::Relaxed)
     }
 
     /// Lines written and dropped so far by this handle's writer.
@@ -315,14 +373,23 @@ impl RequestLog {
     }
 }
 
-fn writer(rx: &Receiver<Entry>, w: &mut Rotating, max_body: usize, written: &AtomicU64) {
+fn writer(
+    rx: &Receiver<Entry>,
+    w: &mut Rotating,
+    max_body: usize,
+    written: &AtomicU64,
+    queued: &AtomicU64,
+) {
     let m = kdx_metrics::get();
     let mut warned = false;
     while let Ok(first) = rx.recv() {
         let mut next = Some(first);
         let mut n = 0;
         while let Some(e) = next.take() {
-            match w.write_line(&e.to_line(max_body)) {
+            let line = e.to_line(max_body);
+            queued.fetch_sub(e.queued_bytes() as u64, Ordering::AcqRel);
+            drop(e);
+            match w.write_line(&line) {
                 Ok(()) => {
                     written.fetch_add(1, Ordering::Relaxed);
                     m.request_log("written");
@@ -380,10 +447,7 @@ pub async fn layer(
         .get::<ConnectInfo<SocketAddr>>()
         .and_then(|ConnectInfo(peer)| log.client(st.client_ip_of(*peer, req.headers())));
     let mut resp = next.run(req).await;
-    let body = resp
-        .extensions_mut()
-        .remove::<GraphqlBody>()
-        .map(|GraphqlBody(b)| b);
+    let body = resp.extensions_mut().remove::<GraphqlBody>();
     let m = kdx_metrics::get();
     log.submit(Entry {
         unix_ms,
@@ -413,6 +477,7 @@ mod tests {
             sample_rate: 1.0,
             max_body_bytes: 4096,
             queue: 64,
+            queue_max_bytes: 8 << 20,
             client_ip: ClientIp::Hash,
         }
     }
@@ -429,7 +494,10 @@ mod tests {
             client: Some(0xab),
             tips: Some((6_000_000, 6_000_002)),
             lag: Some(1),
-            body: body.map(|b| Bytes::from(b.to_string())),
+            body: body.map(|b| GraphqlBody {
+                body: Some(Bytes::from(b.to_string())),
+                len: b.len(),
+            }),
         }
     }
 
@@ -478,6 +546,46 @@ mod tests {
         assert_eq!(v["gql"][1]["variables"]["x"], 2);
     }
 
+    /// Security review: an oversized body is never kept for the queue (only its length), and
+    /// a burst of large-bodied lines never holds more than `queue_max_bytes` in the queue.
+    #[test]
+    fn oversized_body_is_never_queued_and_queue_bytes_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = settings(dir.path());
+        s.max_body_bytes = 4096;
+        s.queue = 10_000;
+        s.queue_max_bytes = 64 * 1024;
+        let (tx, rx) = sync_channel(s.queue);
+        let log = RequestLog::with_sender(tx, &s);
+        let big = Bytes::from(vec![b'x'; 1 << 20]);
+        let g = log.graphql_body(&big);
+        assert!(g.body.is_none(), "an oversized body is not kept");
+        assert_eq!(g.len, 1 << 20);
+        let mut e = entry(None);
+        e.body = Some(g);
+        assert!(e.queued_bytes() < 1024, "only its length is queued");
+        let v: Value = serde_json::from_str(&e.to_line(4096)).unwrap();
+        assert_eq!(
+            (v["gql_cut"].clone(), v["gql_len"].clone()),
+            (Value::Bool(true), (1u64 << 20).into())
+        );
+        let fits = Bytes::from(vec![b'{'; 4000]);
+        assert!(log.graphql_body(&fits).body.is_some());
+        // A burst of 4,000-byte bodies with no writer draining: the queued bytes stay under
+        // the cap and the rest is dropped and counted.
+        let before = metric("dropped_bytes");
+        for _ in 0..1000 {
+            let mut e = entry(None);
+            e.body = Some(log.graphql_body(&fits));
+            log.submit(e);
+            assert!(log.queued_bytes() <= s.queue_max_bytes as u64);
+        }
+        let queued = rx.try_iter().count();
+        assert!(queued > 0 && queued < 20, "{queued}");
+        assert_eq!(log.counts().1, 1000 - queued as u64);
+        assert!(metric("dropped_bytes") >= before + 1000 - queued as u64);
+    }
+
     #[test]
     fn long_uri_is_cut_on_a_char_boundary() {
         let mut e = entry(None);
@@ -510,19 +618,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = sync_channel(2);
         let log = RequestLog::with_sender(tx, &settings(dir.path()));
-        let before = dropped_metric();
+        let before = metric("dropped");
         for _ in 0..5 {
             log.submit(entry(None));
         }
         assert_eq!(log.counts().1, 3);
-        assert!(dropped_metric() >= before + 3);
+        assert!(metric("dropped") >= before + 3);
+        assert_eq!(log.queued_bytes(), 2 * entry(None).queued_bytes() as u64);
         assert_eq!(rx.try_iter().count(), 2);
     }
 
-    fn dropped_metric() -> u64 {
+    fn metric(result: &str) -> u64 {
         kdx_metrics::get()
             .request_log_lines
-            .get_or_create(&vec![("result", "dropped".to_string())])
+            .get_or_create(&vec![("result", result.to_string())])
             .get()
     }
 
@@ -541,6 +650,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(log.counts(), (10, 0));
+        assert_eq!(log.queued_bytes(), 0, "the writer gives the bytes back");
         let lines = |p: &Path| {
             std::fs::read_to_string(p)
                 .unwrap_or_default()

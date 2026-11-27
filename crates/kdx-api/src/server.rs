@@ -1204,7 +1204,7 @@ pub(crate) mod tests {
     /// listener none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_log_covers_compat_and_graphql_only() {
-        use crate::reqlog::{ClientIp, GraphqlBody, RequestLog, Settings};
+        use crate::reqlog::{ClientIp, RequestLog, Settings};
         let (d, store) = crate::testutil::store();
         let path = d.path().join("log").join("requests.jsonl");
         let log = RequestLog::start(Settings {
@@ -1214,13 +1214,15 @@ pub(crate) mod tests {
             sample_rate: 1.0,
             max_body_bytes: 4096,
             queue: 16,
+            queue_max_bytes: 1 << 20,
             client_ip: ClientIp::Hash,
         })
         .unwrap();
         let ok = || async { "ok" };
-        let gql = |body: axum::body::Bytes| async move {
+        let gql_log = log.clone();
+        let gql = move |body: axum::body::Bytes| async move {
             let mut r = "{}".into_response();
-            r.extensions_mut().insert(GraphqlBody(body));
+            r.extensions_mut().insert(gql_log.graphql_body(&body));
             r
         };
         let (tx, rx) = tokio::sync::oneshot::channel();

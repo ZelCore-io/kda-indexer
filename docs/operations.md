@@ -481,6 +481,7 @@ keep = 8                           # rotated files: .1 (newest) .. .8
 sample_rate = 1.0                  # share of requests logged, every n-th request
 max_body_bytes = 16384             # GraphQL bodies larger than this are not written
 queue = 8192                       # lines waiting for the writer
+queue_mb = 8                       # bytes waiting for the writer (1 to 1024 MB)
 client_ip = "hash"                 # or "omit"
 ```
 
@@ -512,8 +513,12 @@ response bodies. GraphQL variables and REST paths hold account names and keys, w
 chain data; treat the file like an access log anyway.
 
 The request path only takes a sample decision and queues a small record; a writer thread
-formats, writes and rotates. When the queue is full the line is dropped and counted
-(`kdx_request_log_lines_total{result="dropped"}`); serving never waits for the disk. At 50
+formats, writes and rotates. The queue is bounded twice: by `queue` lines and by `queue_mb`
+of URIs and GraphQL bodies. A line over either bound is dropped and counted
+(`kdx_request_log_lines_total{result="dropped"}` or `{result="dropped_bytes"}`); serving
+never waits for the disk. The GraphQL handler hands the log a body only when it fits
+`max_body_bytes`; a larger body is released with its request and only its length is queued,
+so the queue never holds more than about `queue_mb`, whatever the request-body limit. At 50
 requests/s a line is about 300 bytes (GraphQL lines more), about 1.3 GB a day: size `max_mb`
 and `keep` for the hours you need, or lower `sample_rate`.
 
@@ -642,7 +647,7 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_disk_free_bytes` | |
 | `kdx_mdbx_commit_seconds` | |
 | `kdx_http_requests_total`, `kdx_http_request_seconds` | api, route, status |
-| `kdx_request_log_lines_total` | result (written, dropped, error): `[api.request_log]` lines; `dropped` = the queue was full, `error` = the write failed |
+| `kdx_request_log_lines_total` | result (written, dropped, dropped_bytes, error): `[api.request_log]` lines; `dropped` = the queue had `queue` lines, `dropped_bytes` = the line would have taken the queue over `queue_mb`, `error` = the write failed |
 | `kdx_freezer_runs_total`, `kdx_freezer_seconds` | op (freeze, merge) |
 | `kdx_read_view_seconds` | phase (open, held) |
 | `kdx_merkle_blocks_total` | result (verified, mismatch_legacy, mismatch) |

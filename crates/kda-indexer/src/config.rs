@@ -363,6 +363,8 @@ pub struct RequestLogConfig {
     pub max_body_bytes: usize,
     /// Lines waiting for the writer at most; more are dropped and counted.
     pub queue: usize,
+    /// MB waiting for the writer at most (bodies and URIs); more are dropped and counted.
+    pub queue_mb: u64,
     /// `hash` (keyed per process) or `omit`. The raw address is never written.
     pub client_ip: String,
 }
@@ -377,6 +379,7 @@ impl Default for RequestLogConfig {
             sample_rate: 1.0,
             max_body_bytes: 16 * 1024,
             queue: 8192,
+            queue_mb: 8,
             client_ip: "hash".into(),
         }
     }
@@ -393,6 +396,10 @@ impl RequestLogConfig {
             "api.request_log.max_mb must be at least 1"
         );
         anyhow::ensure!(self.queue >= 1, "api.request_log.queue must be at least 1");
+        anyhow::ensure!(
+            (1..=1024).contains(&self.queue_mb),
+            "api.request_log.queue_mb must be between 1 and 1024"
+        );
         anyhow::ensure!(
             matches!(self.client_ip.as_str(), "hash" | "omit"),
             "api.request_log.client_ip must be \"hash\" or \"omit\""
@@ -413,6 +420,8 @@ impl RequestLogConfig {
             sample_rate: self.sample_rate,
             max_body_bytes: self.max_body_bytes,
             queue: self.queue,
+            queue_max_bytes: usize::try_from(self.queue_mb.saturating_mul(1 << 20))
+                .unwrap_or(usize::MAX),
             client_ip: if self.client_ip == "omit" {
                 kdx_api::reqlog::ClientIp::Omit
             } else {
@@ -1578,6 +1587,7 @@ mod api_tests {
         let s = a.settings(Path::new("/data"));
         assert_eq!(s.path, Path::new("/data/log/req.jsonl"));
         assert_eq!(s.max_bytes, 64 << 20);
+        assert_eq!(s.queue_max_bytes, 8 << 20);
         assert_eq!(s.client_ip, kdx_api::reqlog::ClientIp::Omit);
         let abs = api("[request_log]\npath = \"/var/tmp/r.jsonl\"")
             .unwrap()
@@ -1591,6 +1601,7 @@ mod api_tests {
             "sample_rate = -0.1",
             "max_mb = 0",
             "queue = 0",
+            "queue_mb = 0",
             "client_ip = \"raw\"",
             "path = \"\"",
         ] {
