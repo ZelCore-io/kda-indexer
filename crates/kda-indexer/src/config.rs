@@ -514,6 +514,9 @@ pub struct GraphqlConfig {
     /// Retired: `totalCount` is exact and runs to `api.deadline_ms` (a cut count is a
     /// `COUNT_TIMEOUT` error). Still accepted, and ignored, so older config files load.
     pub count_budget_ms: Option<u64>,
+    /// Unbounded decoding `totalCount` walks running at once, process-wide (each client runs
+    /// at most one). Unset: half the heavy read slots, at least two.
+    pub count_walk_slots: Option<u32>,
     /// Serve sender lists (`transactions(accountName)`, `FungibleChainAccount.transactions`,
     /// REST `role=sender`) from the `sndr` postings once the sender index is complete
     /// (FIX-2). `false` forces the old path (the account's postings filtered on
@@ -761,6 +764,7 @@ impl Default for GraphqlConfig {
             feed_poll_ms: 1000,
             feed_ring_mb: 64,
             count_budget_ms: None,
+            count_walk_slots: None,
             sender_index: true,
             network_host: String::new(),
             apq: false,
@@ -790,7 +794,8 @@ impl GraphqlConfig {
                 && self.ws_conns_max > 0
                 && self.ws_init_secs > 0
                 && self.ws_idle_secs > 0
-                && self.ws_tx_wait_secs > 0,
+                && self.ws_tx_wait_secs > 0
+                && self.count_walk_slots != Some(0),
             "graphql limits must be > 0"
         );
         anyhow::ensure!(
@@ -852,6 +857,8 @@ impl GraphqlConfig {
             apq: self.apq,
             back_keys: kdx_graphql::txlist::BACK_KEYS,
             balance_touch_keys: kdx_graphql::types::account::BALANCE_TOUCH_KEYS,
+            count_walk_slots: self.count_walk_slots.map(|n| n as usize),
+            count_window: kdx_graphql::txlist::COUNT_SCAN_WINDOW,
             pact: self.pact.settings(network_chains(network)),
         }
     }

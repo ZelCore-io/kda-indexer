@@ -1285,46 +1285,123 @@ fn run_page_desc(
     Ok((edges.into_iter().map(|(_, e)| e).collect(), info))
 }
 
-/// How long a count walk the stored counts cannot answer runs at most: two page-walk
-/// windows ([`SCAN_WINDOW`]), well under the request deadline.
-pub const COUNT_SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a count walk the stored counts cannot answer runs at most: under the request
+/// deadline, and long enough for the counts of a few seconds that stock answers.
+pub const COUNT_SCAN_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How long an unbounded decoding count waits for a [`CountWalks`] slot before it answers
+/// `COUNT_TIMEOUT`.
+pub const COUNT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The end of a count walk the stored counts cannot answer: the request deadline, or
-/// [`COUNT_SCAN_WINDOW`] from `now` when that comes first.
-pub fn count_until(until: Instant, now: Instant) -> Instant {
-    until.min(now + COUNT_SCAN_WINDOW)
+/// `window` from `now` when that comes first.
+pub fn count_until(until: Instant, now: Instant, window: std::time::Duration) -> Instant {
+    until.min(now + window)
+}
+
+/// The gate of unbounded `totalCount` walks that decode records (the heavy path): at most
+/// one per client, and `cap` in the process. A walk scoped to one block or one request key
+/// never takes it.
+#[derive(Debug)]
+pub struct CountWalks {
+    cap: usize,
+    held: std::sync::Mutex<(usize, std::collections::HashSet<std::net::IpAddr>)>,
+    freed: tokio::sync::Notify,
+}
+
+/// One taken [`CountWalks`] slot, given back on drop.
+#[derive(Debug)]
+pub struct CountWalk {
+    walks: Arc<CountWalks>,
+    client: Option<std::net::IpAddr>,
+}
+
+impl CountWalks {
+    pub fn new(cap: usize) -> CountWalks {
+        CountWalks {
+            cap: cap.max(1),
+            held: std::sync::Mutex::default(),
+            freed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// The default cap for `read_threads` read threads: half the heavy slots, at least two.
+    pub fn default_slots(read_threads: usize) -> usize {
+        ((read_threads / 2).max(1) / 2).max(2)
+    }
+
+    /// A slot for `client` now, or `None` when the client already runs a walk or every
+    /// slot is taken. A walk with no known client is held to the process cap only.
+    pub fn try_take(self: &Arc<Self>, client: Option<std::net::IpAddr>) -> Option<CountWalk> {
+        let mut h = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if h.0 >= self.cap || client.is_some_and(|c| h.1.contains(&c)) {
+            return None;
+        }
+        h.0 += 1;
+        if let Some(c) = client {
+            h.1.insert(c);
+        }
+        Some(CountWalk {
+            walks: self.clone(),
+            client,
+        })
+    }
+
+    /// [`CountWalks::try_take`], waiting up to `wait` for a slot to free.
+    pub async fn take(
+        self: &Arc<Self>,
+        client: Option<std::net::IpAddr>,
+        wait: std::time::Duration,
+    ) -> Option<CountWalk> {
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if let Some(w) = self.try_take(client) {
+                return Some(w);
+            }
+            tokio::time::timeout_at(until, freed).await.ok()?;
+        }
+    }
+}
+
+impl Drop for CountWalk {
+    fn drop(&mut self) {
+        let mut h = self.walks.held.lock().unwrap_or_else(|e| e.into_inner());
+        h.0 -= 1;
+        if let Some(c) = self.client {
+            h.1.remove(&c);
+        }
+        drop(h);
+        self.walks.freed.notify_waiters();
+    }
 }
 
 /// Items of `spec`, exactly: every item the full walk lists. A walk the stored counts cannot
-/// answer runs at most [`count_until`]; one still running then ends with
-/// [`ApiError::Deadline`] (`COUNT_TIMEOUT`), never with a partial count. A walk that decodes
-/// records takes a `walks` slot first, and is cut at once when none is free, so count walks
-/// never hold every heavy read slot.
+/// answer runs at most `window` ([`count_until`]); one still running then ends with
+/// [`ApiError::Deadline`] (`COUNT_TIMEOUT`), never with a partial count. An unbounded walk
+/// that decodes records runs only when `slotted` (the caller holds a [`CountWalks`] slot):
+/// without one the count answers `None` and walks nothing. Bounded callers (one block, one
+/// request key) pass `slotted = true`: their walks are never gated.
 pub fn count(
     view: &View,
     spec: &ListSpec,
     until: Instant,
-    walks: &kdx_api::server::CountWalks,
-) -> ApiResult<u64> {
+    window: std::time::Duration,
+    slotted: bool,
+) -> ApiResult<Option<u64>> {
     let (src, rows) = plan(view, spec)?;
     if let Some(n) = stored_count(view, spec, &src, &rows)? {
-        return Ok(n);
+        return Ok(Some(n));
     }
-    let until = count_until(until, Instant::now());
+    let decode = rows.needs_record();
+    if decode && !slotted {
+        return Ok(None);
+    }
+    let until = count_until(until, Instant::now(), window);
     let caps = Caps::of(view, &spec.filter)?;
     let mut blocks = Blocks::default();
-    let decode = rows.needs_record();
-    let _slot = if decode {
-        match walks.take() {
-            Some(s) => Some(s),
-            None => {
-                kdx_metrics::get().graphql_rejected("count_walks");
-                return Err(ApiError::Deadline);
-            }
-        }
-    } else {
-        None
-    };
     let mut n = 0u64;
     // The key walk reads the clock every `CHECK_EVERY` keys; a decoding walk also reads it
     // before each record it decodes.
@@ -1365,7 +1442,7 @@ pub fn count(
         }
     }
     n += flush(&mut batch, &mut blocks)?;
-    Ok(n)
+    Ok(Some(n))
 }
 
 /// The count of `spec` from the stored per-key row counts (PR #48 part 2), or `None` when
@@ -1722,11 +1799,15 @@ async fn list_as(
     let bounded = matches!(spec.source, SourceSpec::Block(_) | SourceSpec::Rk { .. })
         && selects_direct(ctx, &["totalCount"]);
     let sp = spec.clone();
-    let walks = state.count_walks();
+    let window = g.settings.count_window;
     let (edges, info, exact) = read_list(&state, one_block, move |view| {
         // The count runs to the request deadline; a cut one is an error, not a number (audit
-        // F-50, GQ-10). It is carried out of the read so the page is still served.
-        let exact = bounded.then(|| count(view, &sp, dl, &walks));
+        // F-50, GQ-10). It is carried out of the read so the page is still served. A bounded
+        // count is never gated (`slotted`), so it always walks.
+        let exact = bounded.then(|| {
+            count(view, &sp, dl, window, true)
+                .and_then(|n| n.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("ungated count"))))
+        });
         if !reads {
             return Ok((Vec::new(), PageInfo::default(), exact));
         }
@@ -1752,13 +1833,30 @@ async fn list_as(
         };
         return Ok(ListPage { edges, info, total });
     }
+    let walks = g.count_walks.clone();
+    let client = crate::client_ip(ctx);
     let total = Total::Deferred(Arc::new(move || {
         let state = state.clone();
         let spec = spec.clone();
+        let walks = walks.clone();
         Box::pin(async move {
-            let walks = state.count_walks();
+            let sp = spec.clone();
+            let first = read_list(&state, one_block, move |view| {
+                count(view, &sp, dl, window, false)
+            })
+            .await
+            .map_err(count_error)?;
+            if let Some(n) = first {
+                return Ok(n);
+            }
+            // An unbounded walk that decodes: one per client, `walks` in the process.
+            let Some(_slot) = walks.take(client, COUNT_SLOT_WAIT).await else {
+                kdx_metrics::get().graphql_rejected("count_walks");
+                return Err(count_error(ApiError::Deadline));
+            };
             read_list(&state, one_block, move |view| {
-                count(view, &spec, dl, &walks)
+                count(view, &spec, dl, window, true)?
+                    .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("ungated count")))
             })
             .await
             .map_err(count_error)
@@ -1859,27 +1957,64 @@ pub fn name_arg<'a>(name: &str, s: &'a str) -> async_graphql::Result<&'a str> {
 mod tests {
 
     /// An unindexed count walk ends one count window from its start at the latest, whatever
-    /// the request deadline; a nearer deadline still ends it first.
+    /// the request deadline; a nearer deadline still ends it first. The window is under the
+    /// request deadline and long enough for counts of a few seconds.
     #[test]
     fn a_count_walk_is_bounded_by_the_scan_window() {
         let now = Instant::now();
+        let w = COUNT_SCAN_WINDOW;
+        assert_eq!(w, std::time::Duration::from_secs(4));
         let far = now + std::time::Duration::from_secs(5);
-        assert_eq!(count_until(far, now), now + COUNT_SCAN_WINDOW);
-        assert!(COUNT_SCAN_WINDOW < far - now);
+        assert_eq!(count_until(far, now, w), now + w);
+        assert!(w < far - now);
         let near = now + std::time::Duration::from_millis(10);
-        assert_eq!(count_until(near, now), near);
+        assert_eq!(count_until(near, now, w), near);
     }
 
-    /// Count walks take a slot without waiting: past the cap they are refused at once, and a
-    /// finished walk gives its slot back.
-    #[test]
-    fn count_walk_slots_are_capped_and_returned() {
-        let w = kdx_api::server::CountWalks::new(2);
-        let a = w.take().unwrap();
-        let _b = w.take().unwrap();
-        assert!(w.take().is_none());
+    fn ip(n: u8) -> Option<std::net::IpAddr> {
+        Some(std::net::IpAddr::from([10, 0, 0, n]))
+    }
+
+    /// One unbounded decoding count per client: a second one from the same client is
+    /// refused (after the short wait) while the first runs; another client still gets a
+    /// slot; a finished walk gives its slot back.
+    #[tokio::test]
+    async fn count_walks_are_one_per_client() {
+        let w = Arc::new(CountWalks::new(4));
+        let a = w.take(ip(1), COUNT_SLOT_WAIT).await.unwrap();
+        let t = Instant::now();
+        assert!(w.take(ip(1), COUNT_SLOT_WAIT).await.is_none());
+        assert!(t.elapsed() >= COUNT_SLOT_WAIT - std::time::Duration::from_millis(5));
+        assert!(w.take(ip(2), COUNT_SLOT_WAIT).await.is_some());
         drop(a);
-        assert!(w.take().is_some());
+        assert!(w.try_take(ip(1)).is_some());
+    }
+
+    /// The process cap holds across clients; a walk waiting for a slot gets it when one
+    /// frees within the wait, and is refused when none does.
+    #[tokio::test]
+    async fn count_walks_wait_briefly_for_the_process_cap() {
+        let w = Arc::new(CountWalks::new(2));
+        let a = w.try_take(ip(1)).unwrap();
+        let _b = w.try_take(None).unwrap();
+        assert!(w.try_take(ip(3)).is_none(), "the process cap is full");
+        assert!(w
+            .take(ip(3), std::time::Duration::from_millis(30))
+            .await
+            .is_none());
+        let w2 = w.clone();
+        let waiter = tokio::spawn(async move { w2.take(ip(3), COUNT_SLOT_WAIT).await.is_some() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(a);
+        assert!(waiter.await.unwrap(), "the freed slot went to the waiter");
+    }
+
+    /// The default cap: half the heavy slots (half the read threads), at least two.
+    #[test]
+    fn count_walk_default_slots() {
+        assert_eq!(CountWalks::default_slots(1), 2);
+        assert_eq!(CountWalks::default_slots(4), 2);
+        assert_eq!(CountWalks::default_slots(16), 4);
     }
 
     use super::*;

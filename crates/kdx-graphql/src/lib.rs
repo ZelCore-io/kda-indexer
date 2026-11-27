@@ -104,6 +104,13 @@ pub struct GraphqlSettings {
     /// Transfer keys `balance(...)` reads per (account, module) to decide which zero rows a
     /// TRANSFER touched ([`types::account::BALANCE_TOUCH_KEYS`]; tests lower it).
     pub balance_touch_keys: usize,
+    /// Unbounded decoding `totalCount` walks running at once, process-wide
+    /// (`graphql.count_walk_slots`); `None` derives it from the heavy read slots
+    /// ([`txlist::CountWalks::default_slots`]).
+    pub count_walk_slots: Option<usize>,
+    /// How long a `totalCount` walk the stored counts cannot answer runs at most
+    /// ([`txlist::COUNT_SCAN_WINDOW`]; tests lower it).
+    pub count_window: Duration,
     /// `pactQuery` / `gasLimitEstimate` limits (B1).
     pub pact: pact::PactSettings,
 }
@@ -154,6 +161,8 @@ impl Default for GraphqlSettings {
             apq: false,
             back_keys: txlist::BACK_KEYS,
             balance_touch_keys: types::account::BALANCE_TOUCH_KEYS,
+            count_walk_slots: None,
+            count_window: txlist::COUNT_SCAN_WINDOW,
             pact: pact::PactSettings::default(),
         }
     }
@@ -173,6 +182,8 @@ pub struct Gql {
     pub pact: Option<Arc<pact::PactPass>>,
     /// The node read on a missed account row (gap Q); `None` answers from the store only.
     pub miss: Option<Arc<miss::MissReader>>,
+    /// The gate of unbounded decoding `totalCount` walks ([`txlist::CountWalks`]).
+    pub count_walks: Arc<txlist::CountWalks>,
 }
 
 impl Gql {
@@ -290,6 +301,13 @@ fn build(
     // Stock declares `LiquidityBalance` though no field returns it (DEX extension).
     .register_output_type::<types::dex::LiquidityBalance>()
     .data(Gql {
+        count_walks: Arc::new(txlist::CountWalks::new(
+            settings.count_walk_slots.unwrap_or_else(|| {
+                txlist::CountWalks::default_slots(
+                    state.as_ref().map_or(1, |s| s.settings.read_threads),
+                )
+            }),
+        )),
         state,
         ws: ws::WsState::new(&settings),
         settings,

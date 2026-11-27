@@ -1133,6 +1133,68 @@ mod exact_count {
         }
     }
 
+    /// The counts of many blocks in one request, each scoped to one block, all answer
+    /// exactly, also with the gate of unbounded decoding counts at one slot: a count of one
+    /// block never takes it (I-1).
+    #[tokio::test]
+    async fn block_counts_in_one_request_all_answer() {
+        let fx = fixture_with(GraphqlSettings {
+            count_walk_slots: Some(1),
+            ..GraphqlSettings::default()
+        });
+        let q = "{ blocksFromHeight(startHeight: 0, chainIds: [\"0\", \"1\"], first: 50) { edges { node { height events { totalCount } transactions { totalCount } } } } }";
+        let v = run(&fx.schema, q).await;
+        let edges = v["blocksFromHeight"]["edges"].as_array().unwrap();
+        assert!(edges.len() >= 5, "{}", edges.len());
+        let mut events = 0;
+        for e in edges {
+            let n = &e["node"];
+            events += n["events"]["totalCount"].as_i64().expect("an exact count");
+            assert!(n["transactions"]["totalCount"].is_i64(), "{n}");
+        }
+        assert!(events > 0, "the fixture's blocks have events");
+    }
+
+    /// A decoding count that the count window (4 s in service) cuts is a `COUNT_TIMEOUT`
+    /// error while the request deadline is still far off, never a number; with the window
+    /// the same count is exact (I-1, M-2).
+    #[tokio::test]
+    async fn a_count_past_the_count_window_is_count_timeout() {
+        let q = "{ events(qualifiedEventName: \"coin.TRANSFER\", minHeight: 1, first: 1) { totalCount } }";
+        let req = || {
+            async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+                deadline: Instant::now() + Duration::from_secs(30),
+            })
+        };
+        let fx = fixture_big(
+            GraphqlSettings {
+                count_window: Duration::ZERO,
+                ..GraphqlSettings::default()
+            },
+            200,
+        );
+        let r = fx.schema.execute(req()).await;
+        let codes: Vec<String> = r
+            .errors
+            .iter()
+            .filter_map(|e| e.extensions.as_ref()?.get("code").map(|c| c.to_string()))
+            .collect();
+        assert!(
+            !codes.is_empty() && codes.iter().all(|c| c.contains("COUNT_TIMEOUT")),
+            "{codes:?}"
+        );
+        let d = serde_json::to_value(&r.data).unwrap();
+        assert!(
+            d["events"].is_null() || d["events"]["totalCount"].is_null(),
+            "{d}"
+        );
+        let fx = fixture_big(GraphqlSettings::default(), 200);
+        let r = fx.schema.execute(req()).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let d = serde_json::to_value(&r.data).unwrap();
+        assert!(d["events"]["totalCount"].as_i64().unwrap() > 0, "{d}");
+    }
+
     /// A count the deadline cuts is a `COUNT_TIMEOUT` error at `totalCount`, never a number
     /// and never a response flag. The same count with time is exact.
     #[tokio::test]

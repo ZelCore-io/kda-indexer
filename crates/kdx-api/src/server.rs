@@ -137,8 +137,6 @@ pub struct ApiState {
     v1txs: Arc<Semaphore>,
     /// Heavy reads per client key (H-1): one runs, [`HEAVY_WAITING_PER_CLIENT`] wait.
     heavy_clients: Arc<HeavyClients>,
-    /// Decoding `totalCount` walks running at once ([`count_walk_slots`]).
-    count_walks: Arc<CountWalks>,
     in_flight: Arc<Semaphore>,
     limiter: RateLimiter,
     /// `[balances] key_modules` (M-1, SEC-2): the modules `GET /keys/{pubkey}/accounts`
@@ -245,11 +243,6 @@ impl ApiState {
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
         self.read_on(None, &self.reads, budget, f).await
-    }
-
-    /// The cap on decoding `totalCount` walks (taken inside a heavy read, never waited for).
-    pub fn count_walks(&self) -> Arc<CountWalks> {
-        self.count_walks.clone()
     }
 
     /// `read` for an expensive request class: a `heavy` slot first, then a read slot.
@@ -447,49 +440,6 @@ pub(crate) const V1TXS_BUSY: &str = "too many /v1/txs requests running: retry la
 /// The `/v1/txs` slots for `read_threads` read threads: a quarter, at least one (S-1).
 fn v1txs_slots(read_threads: usize) -> usize {
     (read_threads / 4).max(1)
-}
-
-/// Decoding count walks for `read_threads` read threads: half the heavy slots, at least one,
-/// so count walks alone never take every heavy slot (when there are two or more).
-fn count_walk_slots(read_threads: usize) -> usize {
-    ((read_threads / 2).max(1) / 2).max(1)
-}
-
-/// A cap on work that runs inside a read and must not wait for a slot (it already holds
-/// one): [`CountWalks::take`] answers at once.
-#[derive(Debug)]
-pub struct CountWalks {
-    used: std::sync::atomic::AtomicUsize,
-    cap: usize,
-}
-
-/// One taken [`CountWalks`] slot, given back on drop.
-#[derive(Debug)]
-pub struct CountWalk<'a>(&'a CountWalks);
-
-impl CountWalks {
-    pub fn new(cap: usize) -> CountWalks {
-        CountWalks {
-            used: std::sync::atomic::AtomicUsize::new(0),
-            cap: cap.max(1),
-        }
-    }
-
-    /// A slot, or `None` when all are taken.
-    pub fn take(&self) -> Option<CountWalk<'_>> {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.cap).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| CountWalk(self))
-    }
-}
-
-impl Drop for CountWalk<'_> {
-    fn drop(&mut self) {
-        self.0.used.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 impl IntoResponse for ApiError {
@@ -897,7 +847,6 @@ impl Api {
             heavy: Arc::new(Semaphore::new((settings.read_threads / 2).max(1))),
             v1txs: Arc::new(Semaphore::new(v1txs_slots(settings.read_threads))),
             heavy_clients: Arc::default(),
-            count_walks: Arc::new(CountWalks::new(count_walk_slots(settings.read_threads))),
             key_modules: std::sync::OnceLock::new(),
             graphql_extra: std::sync::OnceLock::new(),
             stats_cache: &crate::compat::stats::CACHE,

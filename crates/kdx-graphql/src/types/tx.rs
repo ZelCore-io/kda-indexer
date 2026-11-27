@@ -1306,6 +1306,7 @@ mod canonical_tests {
                     search: None,
                     pact: None,
                     miss: None,
+                    count_walks: std::sync::Arc::new(crate::txlist::CountWalks::new(2)),
                 })
                 .finish();
             let r = schema.execute("{ s { canonical } }").await;
