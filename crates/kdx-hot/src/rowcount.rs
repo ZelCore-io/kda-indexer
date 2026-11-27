@@ -258,6 +258,20 @@ pub fn sum(txn: &impl Txn, kind: CountKind, entity: u64, chain: Option<u8>) -> R
     }))
 }
 
+/// `(user, coinbase)` rows stored for every entity of `kind`, on `chain` or summed over all
+/// chains: one scan of the kind's key range (one row per entity and chain).
+pub fn sum_kind(txn: &impl Txn, kind: CountKind, chain: Option<u8>) -> Result<(u64, u64)> {
+    let k = kind as u8;
+    let rows = txn.scan(Table::RowCounts, &[k], |key| key.first() == Some(&k))?;
+    Ok(rows
+        .iter()
+        .filter(|(key, _)| chain.is_none_or(|c| key.get(9) == Some(&c)))
+        .fold((0, 0), |(u, c), (_, v)| {
+            let (a, b) = decode_val(v);
+            (u.saturating_add(a), c.saturating_add(b))
+        }))
+}
+
 /// Add `sign` × the terms of `r` (1 at apply, -1 at unwind). A record whose output does not
 /// render clears the marker instead (the walk fails on it too, so no count is trusted).
 pub fn add_tx(txn: &mut RwTxn<'_>, r: &TxRecord, dict: &dyn Dict, sign: i64) -> Result<()> {

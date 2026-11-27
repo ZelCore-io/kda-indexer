@@ -3029,6 +3029,20 @@ mod stored_count {
         "events(qualifiedEventName: \"coin.COINBASE\", ARGS)",
     ];
 
+    /// Lists with no selective argument and no height or depth filter: all history from the
+    /// stored counters (chain counters for `transactions`, the token transfer counts for
+    /// `transfers`). The fixture's heights are far below the 20,000 the height walk lists,
+    /// so its walk sees all history too. Kept out of [`STORED`]: the reorg tests leave chain
+    /// 1's tip below a block it holds (its blocks are applied out of height order), which the
+    /// height walk, starting at the highest tip, does not list.
+    const ALL_HISTORY: &[&str] = &[
+        "transfers(ARGS)",
+        "transfers(chainId: \"1\", ARGS)",
+        "transfers(isNFT: false, ARGS)",
+        "transactions(ARGS)",
+        "transactions(chainId: \"0\", ARGS)",
+    ];
+
     /// Lists that keep the walk: heights, depth, `fungibleName` on an account's txs, event
     /// parameter / order filters, NFT transfers.
     const WALKED: &[&str] = &[
@@ -3038,6 +3052,9 @@ mod stored_count {
         "events(qualifiedEventName: \"coin.TRANSFER\", minHeight: 5, ARGS)",
         "events(qualifiedEventName: \"coin.TRANSFER\", orderIndex: 0, ARGS)",
         "transfers(accountName: \"k:alice\", isNFT: true, ARGS)",
+        "transfers(isNFT: true, ARGS)",
+        "transactions(minHeight: 5, ARGS)",
+        "transactions(minimumDepth: 1, ARGS)",
     ];
 
     fn field(l: &str) -> &str {
@@ -3218,7 +3235,7 @@ mod stored_count {
         let fx = fixture();
         let walked: Vec<i64> = {
             let mut v = Vec::new();
-            for l in STORED {
+            for l in STORED.iter().chain(ALL_HISTORY) {
                 v.push(walk(&fx.schema, l).await);
             }
             v
@@ -3226,7 +3243,7 @@ mod stored_count {
         assert!(!ready(&fx));
         let r = reconcile(&fx);
         assert!(r.frozen_txs > 0 && r.hot_txs > 0, "{r:?}");
-        for (l, w) in STORED.iter().zip(&walked) {
+        for (l, w) in STORED.iter().chain(ALL_HISTORY).zip(&walked) {
             assert_eq!(total(&fx.schema, l).await, *w, "{l}");
             assert_eq!(total_spent(&fx.schema, l).await, Some(*w), "{l}: stored");
         }
@@ -3583,6 +3600,52 @@ mod stored_count {
         for l in WALKED {
             assert_eq!(total_spent(&fx.schema, l).await, None, "{l}");
         }
+        // The lists with no selective argument answer from the stored counters too, equal
+        // to their walk (G4 11-27: unfiltered `transfers { totalCount }` was cut at 4.9 s).
+        for l in ALL_HISTORY {
+            assert_eq!(
+                total_spent(&fx.schema, l).await,
+                Some(walk_all(&fx.schema, l).await),
+                "{l}"
+            );
+        }
+    }
+
+    /// `transactions(isCoinbase: true)` with no selective argument counts as stock's
+    /// `Counters` do: the user txs of the per-chain counters plus one coinbase per block
+    /// from genesis to the tip. Without the counters it walks.
+    #[tokio::test]
+    async fn unfiltered_coinbase_count_adds_one_per_block() {
+        let fx = fixture();
+        let l = "transactions(isCoinbase: true, ARGS)";
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::chaincount::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+        // Not ready: the walk, which lists the coinbases of the blocks the fixture holds
+        // (it holds a few heights only, so fewer than one per height).
+        let walked = walk(&fx.schema, l).await;
+        assert_eq!(total(&fx.schema, l).await, walked);
+        reconcile(&fx);
+        let user = total_spent(&fx.schema, "transactions(ARGS)").await.unwrap();
+        let ro = fx.store.hot.ro().unwrap();
+        let blocks: i64 = [0u8, 1]
+            .iter()
+            .map(|&c| {
+                i64::from(
+                    kdx_hot::checkpoint(&ro, kdx_hot::Stage::Tail, c)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                ) + 1
+            })
+            .sum();
+        drop(ro);
+        assert_eq!(total_spent(&fx.schema, l).await, Some(user + blocks));
+        let l0 = "transactions(isCoinbase: true, chainId: \"0\", ARGS)";
+        let user0 = total_spent(&fx.schema, "transactions(chainId: \"0\", ARGS)")
+            .await
+            .unwrap();
+        assert_eq!(total_spent(&fx.schema, l0).await, Some(user0 + 13));
     }
 
     /// Unwind chain `chain` to `to` and apply `fork` (another block hash) in one txn.

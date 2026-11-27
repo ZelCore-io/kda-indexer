@@ -1458,6 +1458,9 @@ fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResu
     if f.min_h.is_some() || f.max_h.is_some() || f.depth.is_some() {
         return Ok(None);
     }
+    if let Src::Heights = src {
+        return all_history_count(view, f, rows);
+    }
     let &Src::Post(fam, e) = src else {
         return Ok(None);
     };
@@ -1531,6 +1534,61 @@ fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResu
             _ => true,
         };
     Ok(Some(user.saturating_add(if with_cb { cb } else { 0 })))
+}
+
+/// The `totalCount` of a list with no selective argument (the height walk) and no height or
+/// depth filter, as stock counts it: over the whole history, not the 20,000 heights the walk
+/// lists ([`MAX_HEIGHTS`]). `None` (the caller walks) when the stored counters cannot answer.
+///
+/// - `transactions`: the user txs of the per-chain counters (`kdx_hot::chaincount`, the
+///   `countersOfEachChain.transactionCount` numbers), plus one coinbase per block with
+///   `isCoinbase: true`; stock sums its `Counters.canonicalTransactions` (and
+///   `canonicalBlocks`) the same way.
+/// - `transfers` (fungible): the sum over every token of the stored
+///   `transfers(fungibleName)` counts (`TokenXfer`), coinbase transfers included. Stock
+///   answers the last value of its `Transfers` id sequence, an all-history estimate.
+fn all_history_count(view: &View, f: &KeyFilter, rows: &Rows) -> ApiResult<Option<u64>> {
+    match rows {
+        Rows::Txs {
+            sender: None,
+            nft: false,
+            module: None,
+            coinbase,
+        } => {
+            if !kdx_hot::chaincount::ready(&view.txn)? {
+                return Ok(None);
+            }
+            let counts = kdx_hot::chaincount::read_all(&view.txn)?;
+            let mut n = 0u64;
+            for (c, genesis, tip) in crate::types::block::tips_and_genesis(view)? {
+                if f.chain.is_some_and(|x| x != c) {
+                    continue;
+                }
+                // A chain without a row (or a damaged one) is not served as 0: walk.
+                let Some(Some(k)) = counts.get(&c) else {
+                    return Ok(None);
+                };
+                n = n.saturating_add(k.user_txs);
+                if *coinbase && !f.user_only {
+                    n = n.saturating_add((tip + 1).saturating_sub(genesis));
+                }
+            }
+            Ok(Some(n))
+        }
+        Rows::Transfers {
+            module: None,
+            account: None,
+            nft: false,
+        } => {
+            let Some((user, cb)) =
+                view.row_count_kind(kdx_decode::rowcount::CountKind::TokenXfer, f.chain)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(user.saturating_add(if f.user_only { 0 } else { cb })))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Keys a decoding count walk reads ahead at once ([`count`]).

@@ -535,7 +535,8 @@ the oracle puts them.
 - **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` (txs
   touching the account), else `fungibleName` (txs with a `<token>.TRANSFER` event, all
   history); with none of them, every user tx from the tip down (at most 20,000 heights), as
-  a latest-transactions list asks. Beside `accountName`, `requestKey` or `blockHash`,
+  a latest-transactions list asks (its `totalCount` still counts all history, as stock's:
+  see `totalCount`, all-history counts). Beside `accountName`, `requestKey` or `blockHash`,
   `fungibleName` keeps the txs with any event of that module, as stock does (`EXISTS` on
   `Events.module`, indexer-kadena `90a4be1`). **Known difference (deliberate):**
   `fungibleName` without those (alone, or with `chainId`, heights or `minimumDepth`) lists
@@ -654,12 +655,37 @@ the oracle puts them.
       `transactions(fungibleName)`; `transactionsByPublicKey`;
     - `events(qualifiedEventName)`;
     - each with `chainId`, and the transaction lists with `isCoinbase: true`.
+  - *All-history counts* (no walk): a `transactions` or fungible `transfers` list with no
+    selective argument (no account, key, event name, `fungibleName`, block or request key)
+    and no `minHeight`, `maxHeight` or `minimumDepth` answers stock's number, which counts
+    the whole history, not the 20,000 heights the list itself walks:
+    - `transactions` (with or without `chainId`): the user txs of the stored per-chain
+      counters (`countersOfEachChain.transactionCount`, coinbases excluded); with
+      `isCoinbase: true` plus one coinbase per block, genesis to the tip. Stock sums its
+      `Counters` table (`canonicalTransactions`, plus `canonicalBlocks` with `isCoinbase`)
+      the same way.
+    - `transfers` (with or without `chainId`, `isNFT` absent or `false`): the sum over every
+      token of the stored `transfers(fungibleName)` counts, coinbase transfers included.
+      Stock answers the last value of its `Transfers` id sequence: every transfer row it
+      ever inserted, NFT transfers and rows a reorg deleted included, so its number is an
+      estimate somewhat above ours (on 11-27 it answered 441,794,129). **Known
+      difference:** a transfer row the list takes from an event whose name only ends in
+      `TRANSFER` (`<m>.WIZ_TRANSFER`), in a tx with no `<m>.TRANSFER` event, is listed by the
+      height walk and not counted here; stock keeps only events named `TRANSFER`, so it
+      counts none of them.
+
+    Both read O(chains) or O(tokens × chains) stored rows, well inside the deadline. While
+    the counters they read are not ready, these lists walk their 20,000 heights as before
+    (the count then is the walk's, and a decoding `transfers` walk that long is usually cut
+    with `COUNT_TIMEOUT`). With a height or depth filter they keep the walk: stock answers
+    those from its height counters with a block-count formula, which we do not copy.
 
     These keep the walk (and its `COUNT_TIMEOUT` on very long lists): `minHeight`,
     `maxHeight`, `minimumDepth`; `transactions(accountName, fungibleName)` (the module filter
     reads each record); `events` with `parametersFilter`, `orderIndex` or `moduleName`;
     `transfers(isNFT: true)`; sender lists on the old path (no sender index); lists without
-    a selective argument (the height walk); a block's or a request key's list (counted with
+    a selective argument with a height or depth filter, or with `isNFT: true` (the height
+    walk); a block's or a request key's list (counted with
     the page). Per-height buckets were left out: a height range would still walk its two edge
     buckets, which on the lists that need them (a popular event) is the same cut. While the
     counts are not ready (never built, or cleared by `backfill`, `rebuild-range`,
