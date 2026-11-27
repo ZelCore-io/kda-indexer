@@ -39,8 +39,9 @@ fn mark_now(hot: &HotStore, key: &[u8; 9]) -> Option<Mark> {
         .and_then(|v| Mark::decode(&v))
 }
 
-/// A window of `k` batches is one refill of `k × n` keys: the same keys in the same order,
-/// handed out `n` at a time, each key once and with exactly the mark in the table.
+/// A window of `k` batches is one refill of `k × n` keys: the same keys, handed out `n` at a
+/// time (each batch its own tip share, then the rest in order), each key once and with
+/// exactly the mark in the table.
 #[test]
 fn window_hands_out_one_refill_with_exact_marks() {
     let dir = tempfile::tempdir().unwrap();
@@ -66,7 +67,15 @@ fn window_hands_out_one_refill_with_exact_marks() {
         }
         all.extend(b);
     }
-    assert_eq!(all, keys);
+    let sorted = |v: &[Dirty]| {
+        let mut v = v.to_vec();
+        v.sort_by_key(|d| d.key);
+        v
+    };
+    assert_eq!(sorted(&all), sorted(&keys));
+    // The non-tip keys in the refill's order.
+    let rest = |v: &[Dirty]| v.iter().filter(|d| !d.tip).copied().collect::<Vec<_>>();
+    assert_eq!(rest(&all), rest(&keys));
     assert_eq!(w.left(), 0);
     assert!(w.next_batch(20).is_empty());
     assert!(w.due(Instant::now(), WINDOW_MAX_AGE));
@@ -74,7 +83,14 @@ fn window_hands_out_one_refill_with_exact_marks() {
     assert_eq!(refill_window(&hot, 20, 4, 0, &back).unwrap().len(), 20);
     assert_eq!(
         refill_window(&hot, 5, 1, 1000, &back).unwrap(),
-        refill_with(&hot, 5 * MAX_REFILL_WINDOW, MAX_REFILL_WINDOW, &back).unwrap()
+        refill_tip(
+            &hot,
+            5 * MAX_REFILL_WINDOW,
+            MAX_REFILL_WINDOW,
+            tip_share(5) * MAX_REFILL_WINDOW,
+            &back
+        )
+        .unwrap()
     );
 }
 
@@ -140,8 +156,9 @@ async fn key_marked_again_during_window_keeps_new_mark() {
     );
 }
 
-/// The tip share still leads a window: the newest marks of a chain come in its first batch,
-/// ahead of an older backlog many windows long.
+/// The tip share still leads a window: the newest marks of a chain come in its first batches,
+/// one tip share a batch (as a refill per batch takes them), ahead of an older backlog many
+/// windows long.
 #[test]
 fn window_starts_with_the_tip_share() {
     let dir = tempfile::tempdir().unwrap();
@@ -169,11 +186,25 @@ fn window_starts_with_the_tip_share() {
         refill_window(&hot, 16, 4, 8, &HashMap::new()).unwrap(),
         Instant::now(),
     );
+    // Chain 0's newest backlog marks share the tip round-robin with chain 3: a batch of 16
+    // has 4 tip slots, chain 3 takes 2 of them, as in a refill of one batch.
+    let one: HashSet<[u8; 9]> = refill(&hot, 16, 4)
+        .unwrap()
+        .iter()
+        .filter(|d| tip.contains(&d.key))
+        .map(|d| d.key)
+        .collect();
+    assert_eq!(one.len(), 2);
     let first: HashSet<[u8; 9]> = w.next_batch(16).iter().map(|d| d.key).collect();
+    assert!(one.is_subset(&first), "the tip marks of one refill");
+    let second: HashSet<[u8; 9]> = w.next_batch(16).iter().map(|d| d.key).collect();
     for k in &tip {
-        assert!(first.contains(k), "a tip mark in the window's first batch");
+        assert!(
+            first.contains(k) || second.contains(k),
+            "a tip mark in the window's first two batches"
+        );
     }
-    for _ in 1..8 {
+    for _ in 2..8 {
         assert!(w.next_batch(16).iter().all(|d| !tip.contains(&d.key)));
     }
 }
@@ -212,24 +243,44 @@ fn window_is_due_when_used_up_or_old() {
     assert!(w.due(t, WINDOW_MAX_AGE));
     assert!(w.next_batch(1).is_empty());
 }
-
 /// A `/local` node for the bench: every call takes `delay`; `details` of `absent_pct` % of
-/// the accounts (by a hash of the number) is absent (a `try` marker in a batch, `row not
-/// found` alone), every other one has a balance and an inline keyset. Answers read height
-/// 10 on our stored tip.
+/// the backlog accounts (`a…`, by a hash of the number) and of `tip_absent_pct` % of the tip
+/// accounts (`t…`, [`mark_tip`]) is absent (a `try` marker in a batch, `row not found`
+/// alone), every other one has a balance and an inline keyset. Answers read height 10 on our
+/// stored tip. Two rates, because the newest marks can be far more often absent than the old
+/// backlog (KDA mainnet: about 50% against 12%), and only then does a batch's composition
+/// show in its absent rate.
 struct BenchNode {
     delay: Duration,
     absent_pct: u64,
+    tip_absent_pct: u64,
     calls: AtomicUsize,
     /// Calls per kind: batched `details`, one-key `details`, fungible checks, other.
     kinds: [AtomicUsize; 4],
+    /// Keys asked in batched `details` calls.
+    batched_keys: AtomicUsize,
 }
 
 impl BenchNode {
+    fn new(delay: Duration, absent_pct: u64, tip_absent_pct: u64) -> Arc<BenchNode> {
+        Arc::new(BenchNode {
+            delay,
+            absent_pct,
+            tip_absent_pct,
+            calls: AtomicUsize::new(0),
+            kinds: Default::default(),
+            batched_keys: AtomicUsize::new(0),
+        })
+    }
+
     fn absent(&self, acct: &str) -> bool {
         // Hashed: which keys a refill takes first follows the account number.
-        let n = acct.trim_start_matches('a').parse::<u64>().unwrap_or(0);
-        (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 100 < self.absent_pct
+        let (pct, num) = match acct.strip_prefix('t') {
+            Some(n) => (self.tip_absent_pct, n),
+            None => (self.absent_pct, acct.trim_start_matches('a')),
+        };
+        let n = num.parse::<u64>().unwrap_or(0);
+        (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 100 < pct
     }
 
     fn answer(&self, cmd: &Value) -> Value {
@@ -256,6 +307,7 @@ impl BenchNode {
             return ok(json!(true));
         }
         if let Some(list) = data.get("as").and_then(Value::as_array) {
+            self.batched_keys.fetch_add(list.len(), Ordering::Relaxed);
             let out: Vec<Value> = list
                 .iter()
                 .map(|a| {
@@ -360,18 +412,329 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Our tail at height 10 on `chains` chains, with the header the nodes name: an absent answer
+/// (`as_of` = the tail) then clears marks up to 10, as on a live host.
+fn tail_at_10(hot: &HotStore, chains: u8) {
+    let mut txn = hot.rw().unwrap();
+    for c in 0..chains {
+        kdx_hot::set_checkpoint(&mut txn, kdx_hot::Stage::Tail, c, 10, tip_hash()).unwrap();
+    }
+    txn.commit().unwrap();
+    for c in 0..chains {
+        put_header(hot, c, 10, tip_hash());
+    }
+}
+
+/// Mark `per_chain` `coin` keys of tip accounts (`t0..`) on each of `chains` chains at height
+/// 10, newer than every backlog mark (write sequence from `seq`): the newest marks, which the
+/// tip share takes first. Run again with a higher `seq`, it marks them again (as the tail
+/// would).
+fn mark_tip(hot: &HotStore, chains: u8, per_chain: u32, seq: u64) -> Vec<[u8; 9]> {
+    let mut txn = hot.rw().unwrap();
+    let mut dict = HotDict::load(&txn).unwrap();
+    let coin = dict.intern(DictKind::Module, "coin");
+    let accts: Vec<u32> = (0..per_chain)
+        .map(|i| dict.intern(DictKind::Account, &format!("t{i}")))
+        .collect();
+    dict.persist(&mut txn).unwrap();
+    let mut keys = Vec::new();
+    let mut s = seq;
+    for c in 0..chains {
+        for &a in &accts {
+            let key = balances::bal_key(a, coin, c);
+            let mark = Mark { height: 10, seq: s };
+            s += 1;
+            txn.put(Table::BalanceDirty, &key, &mark.encode()).unwrap();
+            keys.push(key);
+        }
+    }
+    txn.commit().unwrap();
+    keys
+}
+
+/// What one [`drain`] run did.
+#[derive(Default)]
+struct Drained {
+    done: u64,
+    batches: u32,
+    refills: u32,
+    refill_secs: f64,
+    tot: BatchStats,
+    ph: Phases,
+    /// Most tip-share keys in one batch.
+    tip_max: usize,
+}
+
+/// `reconcile_loop`'s refill, batch and bookkeeping steps for windows of `k` batches of `n`
+/// keys, a window taken again once `max_age` old, until `batches` batches ran, `secs`
+/// seconds passed or the table is drained.
+#[allow(clippy::too_many_arguments)]
+async fn drain(
+    hot: &Arc<HotStore>,
+    ctx: &Ctx,
+    primary: &LocalClient,
+    pool: &ReadPool,
+    caps: &Caps,
+    (n, k): (usize, usize),
+    max_age: Duration,
+    (batches, secs): (u32, Duration),
+) -> Drained {
+    let mut r = Drained::default();
+    let (mut back, mut fails, mut retries) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let mut w = RefillWindow::default();
+    let refill =
+        |b: &HashMap<[u8; 9], Mark>| spawn_refill(hot.clone(), n, caps.module_share, k, b.clone());
+    let mut batch_secs = 0.0;
+    let start = Instant::now();
+    while r.batches < batches && start.elapsed() < secs {
+        if w.due(Instant::now(), max_age) {
+            let (keys, s, ended) = refill(&back).await.unwrap().unwrap();
+            r.refill_secs += s;
+            r.refills += 1;
+            w.set(keys, ended);
+        }
+        let batch = w.next_batch(n);
+        if batch.is_empty() {
+            break;
+        }
+        r.tip_max = r.tip_max.max(batch.iter().filter(|d| d.tip).count());
+        let next = (k > 1
+            && (w.left() == 0
+                || w.due(
+                    Instant::now() + Duration::from_secs_f64(batch_secs),
+                    max_age,
+                )))
+        .then(|| refill(&back));
+        let t0 = Instant::now();
+        let st = reconcile_batch_with(ctx, primary, Some(pool), &batch, caps)
+            .await
+            .unwrap();
+        batch_secs = secs_since(t0);
+        after_batch(hot, &mut fails, &mut retries, &batch, &st).unwrap();
+        note_remarked(&mut back, &batch, &st);
+        if let Some(next) = next {
+            let (keys, s, ended) = next.await.unwrap().unwrap();
+            r.refill_secs += s;
+            r.refills += 1;
+            w.set_without(keys, ended, &batch);
+        }
+        r.done += st.ok + st.absent + st.skipped + st.failures + st.dropped;
+        r.batches += 1;
+        let t = &mut r.tot;
+        t.ok += st.ok;
+        t.absent += st.absent;
+        t.dropped += st.dropped;
+        t.skipped += st.skipped;
+        t.failures += st.failures;
+        t.invalid += st.invalid;
+        t.node_errors += st.node_errors;
+        t.other_branch += st.other_branch;
+        let (p, ph) = (st.phases, &mut r.ph);
+        ph.prep += p.prep;
+        ph.fungible += p.fungible;
+        ph.reads_batched += p.reads_batched;
+        ph.reads_rereads += p.reads_rereads;
+        ph.txn_wait += p.txn_wait;
+        ph.branch += p.branch;
+        ph.write += p.write;
+        ph.clear += p.clear;
+        ph.commit += p.commit;
+    }
+    r
+}
+
+/// Three bench nodes (the primary first) at `rps` each, and the pool over them.
+fn bench_pool(nodes: &[Arc<BenchNode>; 3], rps: u32) -> (Arc<LocalClient>, ReadPool) {
+    let urls: Vec<String> = nodes.iter().map(|n| serve(n.clone())).collect();
+    let primary = bench_client(&urls[0], rps);
+    let pool = ReadPool::new(
+        vec![
+            ReadNode::new("n0".into(), primary.clone(), true),
+            ReadNode::new("n1".into(), bench_client(&urls[1], rps), false),
+            ReadNode::new("n2".into(), bench_client(&urls[2], rps), false),
+        ],
+        25,
+    );
+    (primary, pool)
+}
+
+/// More tip candidates than one batch holds (20 chains × 20 newest marks, a batch of 64):
+/// every batch of a window takes at most its own tip share ([`TIP_SHARE_PCT`] of the batch),
+/// and fills the rest from the old backlog, oldest first. A window that led with its whole
+/// tip share sent batches of tip keys only (KDA-03 after PR #70: 1,024 of 1,024).
+#[test]
+fn every_batch_of_a_window_keeps_its_tip_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hot, _, _) = store(dir.path(), 2_000);
+    let tip: HashSet<[u8; 9]> = mark_tip(&hot, 20, 20, 1 << 40).into_iter().collect();
+    let (n, k) = (64, 8);
+    let share = n * TIP_SHARE_PCT / 100;
+    // The old backlog in the order a one-batch refill takes it: oldest first.
+    let mut oldest: Vec<Dirty> = refill_with(&hot, 2_000 + tip.len(), 1_000, &HashMap::new())
+        .unwrap()
+        .into_iter()
+        .filter(|d| !tip.contains(&d.key))
+        .collect();
+    oldest.sort_by_key(|d| (d.mark, d.key));
+    let mut w = RefillWindow::default();
+    w.set(
+        refill_window(&hot, n, 4, k, &HashMap::new()).unwrap(),
+        Instant::now(),
+    );
+    let mut backlog = Vec::new();
+    for i in 0..k {
+        let b = w.next_batch(n);
+        assert_eq!(b.len(), n, "batch {i} is full");
+        let t = b.iter().filter(|d| tip.contains(&d.key)).count();
+        assert!(t <= share, "batch {i}: {t} tip keys, more than {share}");
+        assert_eq!(t, b.iter().filter(|d| d.tip).count());
+        backlog.extend(b.into_iter().filter(|d| !d.tip));
+    }
+    // The rest is the oldest backlog, in order across the window's batches.
+    let want: Vec<[u8; 9]> = oldest.iter().take(backlog.len()).map(|d| d.key).collect();
+    let got: Vec<[u8; 9]> = backlog.iter().map(|d| d.key).collect();
+    assert_eq!(got.len(), k * (n - share));
+    assert_eq!(
+        got.iter().collect::<HashSet<_>>(),
+        want.iter().collect::<HashSet<_>>(),
+        "the oldest backlog marks"
+    );
+    // The first batch's backlog keys are the ones a one-batch refill takes.
+    let one: HashSet<[u8; 9]> = refill(&hot, n, 4)
+        .unwrap()
+        .into_iter()
+        .filter(|d| !d.tip)
+        .map(|d| d.key)
+        .collect();
+    assert_eq!(
+        got[..n - share].iter().copied().collect::<HashSet<_>>(),
+        one
+    );
+}
+
+/// The reconcile loop's steps against three mock nodes (the primary first), with the newest
+/// marks 60% absent and the old backlog 10%: a window of 8 batches drains like a window of 1.
+/// It clears at least as much of the oldest backlog, its absent rate stays within a few
+/// points, and the primary reads at most about the tip share of the batched keys (tip chunks
+/// may go to any node, backlog chunks spare the primary). Windows are taken again before
+/// every batch here (`max_age` 0, as when batches are slower than [`WINDOW_MAX_AGE`]), and
+/// once at [`WINDOW_MAX_AGE`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_keeps_batch_composition_with_an_absent_heavy_tip() {
+    const CHAINS: u8 = 20;
+    const BACKLOG: u32 = 4_000;
+    let (n, batches) = (64usize, 8u32);
+    let run = |k: usize, max_age: Duration| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let hot = Arc::new(HotStore::open(&dir.path().join("hot"), Geometry::default()).unwrap());
+        tail_at_10(&hot, CHAINS);
+        // The old backlog: `a0..` over 20 chains at heights 1..=9, write sequence in order.
+        let backlog: Vec<([u8; 9], Mark)> = {
+            let mut txn = hot.rw().unwrap();
+            let mut dict = HotDict::load(&txn).unwrap();
+            let coin = dict.intern(DictKind::Module, "coin");
+            let accts: Vec<u32> = (0..BACKLOG / u32::from(CHAINS))
+                .map(|a| dict.intern(DictKind::Account, &format!("a{a}")))
+                .collect();
+            dict.persist(&mut txn).unwrap();
+            let mut out = Vec::new();
+            for i in 0..BACKLOG {
+                let a = accts[(i / u32::from(CHAINS)) as usize];
+                let key = balances::bal_key(a, coin, (i % u32::from(CHAINS)) as u8);
+                let mark = Mark {
+                    height: 1 + i * 9 / BACKLOG,
+                    seq: u64::from(i),
+                };
+                txn.put(Table::BalanceDirty, &key, &mark.encode()).unwrap();
+                out.push((key, mark));
+            }
+            txn.commit().unwrap();
+            out
+        };
+        mark_tip(&hot, CHAINS, 40, 1 << 40);
+        let nodes = [
+            BenchNode::new(Duration::from_millis(1), 10, 60),
+            BenchNode::new(Duration::from_millis(1), 10, 60),
+            BenchNode::new(Duration::from_millis(1), 10, 60),
+        ];
+        let (primary, pool) = bench_pool(&nodes, 500);
+        let (ctx, _) = client_on(
+            dir.path(),
+            &hot,
+            Arc::new(Mutex::new(tip_hash().to_b64url())),
+        );
+        let r = drain(
+            &hot,
+            &ctx,
+            &primary,
+            &pool,
+            &Caps::default(),
+            (n, k),
+            max_age,
+            (batches, Duration::from_secs(120)),
+        )
+        .await;
+        assert_eq!(r.batches, batches);
+        // Of the oldest backlog marks one batch's backlog share at a time would take, how
+        // many are cleared.
+        let oldest = batches as usize * (n - n * TIP_SHARE_PCT / 100);
+        let ro = hot.ro().unwrap();
+        let cleared = backlog[..oldest]
+            .iter()
+            .filter(|(key, _)| ro.get(Table::BalanceDirty, key).unwrap().is_none())
+            .count();
+        let keys: Vec<usize> = nodes
+            .iter()
+            .map(|n| n.batched_keys.load(Ordering::Relaxed))
+            .collect();
+        let absent = r.tot.absent as f64 / r.done.max(1) as f64;
+        let primary_share = keys[0] as f64 / keys.iter().sum::<usize>().max(1) as f64;
+        (r, cleared, absent, primary_share)
+    };
+    for max_age in [Duration::ZERO, WINDOW_MAX_AGE] {
+        let (one, one_cleared, one_absent, _) = run(1, max_age).await;
+        let (win, cleared, absent, primary_share) = run(8, max_age).await;
+        let label = format!("max_age {max_age:?}");
+        eprintln!(
+            "{label}: window 1 cleared {one_cleared}, absent {one_absent:.3}; window 8 cleared \
+             {cleared}, absent {absent:.3}, primary {primary_share:.3}, most tip keys {}",
+            win.tip_max
+        );
+        assert!(
+            win.tip_max <= n * TIP_SHARE_PCT / 100,
+            "{label}: {} tip keys in one batch",
+            win.tip_max
+        );
+        assert!(
+            cleared >= one_cleared,
+            "{label}: window 8 cleared {cleared} of the oldest backlog, window 1 {one_cleared}"
+        );
+        assert!(
+            (absent - one_absent).abs() <= 0.05,
+            "{label}: absent {absent:.3} with window 8, {one_absent:.3} with window 1"
+        );
+        assert!(
+            primary_share <= 0.25,
+            "{label}: the primary read {primary_share:.3} of the batched keys"
+        );
+        assert_eq!(one.tot.failures + win.tot.failures, 0);
+    }
+}
+
 /// The drain bench (not a check): the reconcile loop's refill, batches and bookkeeping over a
 /// large `BalanceDirty` against three mock `/local` nodes (the primary among them), each at
 /// `local_rps` 50 and concurrency 8, every call `KDX_DRAIN_DELAY_MS` (20) long, with
-/// `KDX_DRAIN_ABSENT_PCT` (12) % of the keys absent. Keys per second of the whole loop, per
-/// window size in `KDX_DRAIN_K` (`1,8`; 1 is the loop before windows), and the batch's time
-/// per phase. The table (`KDX_DRAIN_ROWS`, 2,000,000) is kept in `KDX_DRAIN_DIR` (a temp dir
-/// by default) for the next run.
+/// `KDX_DRAIN_ABSENT_PCT` (12) % of the backlog keys absent. Before each run it marks
+/// `KDX_DRAIN_TIP` (2,000) `coin` keys per chain at the tip, newest of all, `KDX_DRAIN_TIP_ABSENT_PCT`
+/// (60) % of them absent: more tip candidates than a batch, absent-heavy, as on KDA mainnet.
+/// Keys per second of the whole loop, per window size in `KDX_DRAIN_K` (`1,8`; 1 is the loop
+/// before windows), and the batch's time per phase. The table (`KDX_DRAIN_ROWS`, 2,000,000)
+/// is kept in `KDX_DRAIN_DIR` (a temp dir by default) for the next run.
 ///
 /// It mirrors `reconcile_loop`'s steps (refill, prefetch, batch, `after_batch`,
-/// `note_remarked`, `set_without`) rather than calling the loop, so a change to the loop's
-/// order must be copied here; `the_loop_drains_a_table_with_a_refill_window` runs the loop
-/// itself.
+/// `note_remarked`, `set_without`) in [`drain`] rather than calling the loop, so a change to
+/// the loop's order must be copied there; `the_loop_drains_a_table_with_a_refill_window` runs
+/// the loop itself.
 ///
 /// `cargo test --release -p kdx-ingest drain_bench -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -381,6 +744,8 @@ async fn drain_bench() {
     let secs: u64 = env("KDX_DRAIN_SECS", 20);
     let delay: u64 = env("KDX_DRAIN_DELAY_MS", 20);
     let absent_pct: u64 = env("KDX_DRAIN_ABSENT_PCT", 12);
+    let tip_per_chain: u32 = env("KDX_DRAIN_TIP", 2_000);
+    let tip_absent_pct: u64 = env("KDX_DRAIN_TIP_ABSENT_PCT", 60);
     let ks: Vec<usize> = env::<String>("KDX_DRAIN_K", "1,8".into())
         .split(',')
         .filter_map(|k| k.trim().parse().ok())
@@ -390,18 +755,7 @@ async fn drain_bench() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| tmp.path().to_path_buf());
     let hot = Arc::new(HotStore::open(&dir.join("hot"), Geometry::default()).unwrap());
-    // Our tail at height 10 on every chain, with the header the nodes name: an absent answer
-    // (`as_of` = the tail) then clears marks up to 10, as on a live host.
-    {
-        let mut txn = hot.rw().unwrap();
-        for c in 0..20u8 {
-            kdx_hot::set_checkpoint(&mut txn, kdx_hot::Stage::Tail, c, 10, tip_hash()).unwrap();
-        }
-        txn.commit().unwrap();
-        for c in 0..20u8 {
-            put_header(&hot, c, 10, tip_hash());
-        }
-    }
+    tail_at_10(&hot, 20);
     // Accounts `a0..`, 20 chains, about 2/3 `coin` rows and 400 other modules.
     const ACCOUNTS: u32 = 500_000;
     let have = balances::dirty_count(&hot.ro().unwrap()).unwrap() as u32;
@@ -448,106 +802,55 @@ async fn drain_bench() {
         }
         eprintln!("filled {rows} dirty rows in {:?}", t.elapsed());
     }
-    let mk = || {
-        Arc::new(BenchNode {
-            delay: Duration::from_millis(delay),
-            absent_pct,
-            calls: AtomicUsize::new(0),
-            kinds: Default::default(),
-        })
-    };
-    let nodes = [mk(), mk(), mk()];
-    let urls: Vec<String> = nodes.iter().map(|n| serve(n.clone())).collect();
-    let primary = bench_client(&urls[0], 50);
+    let nodes = [
+        BenchNode::new(Duration::from_millis(delay), absent_pct, tip_absent_pct),
+        BenchNode::new(Duration::from_millis(delay), absent_pct, tip_absent_pct),
+        BenchNode::new(Duration::from_millis(delay), absent_pct, tip_absent_pct),
+    ];
+    let (primary, pool) = bench_pool(&nodes, 50);
     let (ctx, _) = client_on(&dir, &hot, Arc::new(Mutex::new(tip_hash().to_b64url())));
-    let pool = ReadPool::new(
-        vec![
-            ReadNode::new("n0".into(), primary.clone(), true),
-            ReadNode::new("n1".into(), bench_client(&urls[1], 50), false),
-            ReadNode::new("n2".into(), bench_client(&urls[2], 50), false),
-        ],
-        25,
-    );
     let caps = Caps::default();
-    for k in ks {
-        let (mut done, mut batches, mut refills, mut refill_secs) = (0u64, 0u32, 0u32, 0.0f64);
-        let mut ph = Phases::default();
-        let mut tot = BatchStats::default();
-        let (mut back, mut fails, mut retries) = (HashMap::new(), HashMap::new(), HashMap::new());
-        let mut w = RefillWindow::default();
+    for (run, k) in ks.into_iter().enumerate() {
+        if tip_per_chain > 0 {
+            mark_tip(&hot, 20, tip_per_chain, (1 << 40) + ((run as u64) << 32));
+        }
         let calls0: Vec<usize> = nodes
             .iter()
             .map(|n| n.calls.load(Ordering::Relaxed))
             .collect();
-        let refill = |b: &HashMap<[u8; 9], Mark>| {
-            spawn_refill(hot.clone(), 1024, caps.module_share, k, b.clone())
-        };
-        let mut batch_secs = 0.0;
+        let keys0: Vec<usize> = nodes
+            .iter()
+            .map(|n| n.batched_keys.load(Ordering::Relaxed))
+            .collect();
         let start = Instant::now();
-        // `reconcile_loop`'s refill, batch and bookkeeping steps.
-        while start.elapsed() < Duration::from_secs(secs) {
-            if w.due(Instant::now(), WINDOW_MAX_AGE) {
-                let (keys, s, ended) = refill(&back).await.unwrap().unwrap();
-                refill_secs += s;
-                refills += 1;
-                w.set(keys, ended);
-            }
-            let batch = w.next_batch(1024);
-            if batch.is_empty() {
-                break;
-            }
-            let next = (k > 1
-                && (w.left() == 0
-                    || w.due(
-                        Instant::now() + Duration::from_secs_f64(batch_secs),
-                        WINDOW_MAX_AGE,
-                    )))
-            .then(|| refill(&back));
-            let t0 = Instant::now();
-            let st = reconcile_batch_with(&ctx, &primary, Some(&pool), &batch, &caps)
-                .await
-                .unwrap();
-            batch_secs = secs_since(t0);
-            after_batch(&hot, &mut fails, &mut retries, &batch, &st).unwrap();
-            note_remarked(&mut back, &batch, &st);
-            if let Some(next) = next {
-                let (keys, s, ended) = next.await.unwrap().unwrap();
-                refill_secs += s;
-                refills += 1;
-                w.set_without(keys, ended, &batch);
-            }
-            done += st.ok + st.absent + st.skipped + st.failures + st.dropped;
-            batches += 1;
-            tot.ok += st.ok;
-            tot.absent += st.absent;
-            tot.dropped += st.dropped;
-            tot.skipped += st.skipped;
-            tot.failures += st.failures;
-            tot.invalid += st.invalid;
-            tot.node_errors += st.node_errors;
-            tot.other_branch += st.other_branch;
-            let p = st.phases;
-            ph.prep += p.prep;
-            ph.fungible += p.fungible;
-            ph.reads_batched += p.reads_batched;
-            ph.reads_rereads += p.reads_rereads;
-            ph.txn_wait += p.txn_wait;
-            ph.branch += p.branch;
-            ph.write += p.write;
-            ph.clear += p.clear;
-            ph.commit += p.commit;
-        }
+        let r = drain(
+            &hot,
+            &ctx,
+            &primary,
+            &pool,
+            &caps,
+            (1024, k),
+            WINDOW_MAX_AGE,
+            (u32::MAX, Duration::from_secs(secs)),
+        )
+        .await;
         let wall = start.elapsed().as_secs_f64();
         let calls: Vec<usize> = nodes
             .iter()
             .zip(&calls0)
             .map(|(n, c0)| n.calls.load(Ordering::Relaxed) - c0)
             .collect();
-        let b = f64::from(batches.max(1));
+        let keys: Vec<usize> = nodes
+            .iter()
+            .zip(&keys0)
+            .map(|(n, c0)| n.batched_keys.load(Ordering::Relaxed) - c0)
+            .collect();
+        let b = f64::from(r.batches.max(1));
         let kinds: Vec<Vec<usize>> = nodes
             .iter()
             .map(|n| n.kinds.iter().map(|c| c.load(Ordering::Relaxed)).collect())
             .collect();
+        let tot = &r.tot;
         eprintln!(
             "  totals: ok {} absent {} dropped {} skipped {} failures {} invalid {} node_errors {} \
              other_branch {}; calls [batched, single, fungible, other] per node so far {kinds:?}",
@@ -561,11 +864,18 @@ async fn drain_bench() {
             tot.other_branch
         );
         eprintln!(
-            "K={k}: {done} keys in {wall:.1} s = {:.0} keys/s; {batches} batches, {refills} \
-             refills ({:.2} s each); calls per node {calls:?}",
-            done as f64 / wall,
-            refill_secs / f64::from(refills.max(1)),
+            "K={k}: {} keys in {wall:.1} s = {:.0} keys/s; absent {:.1}%; {} batches, {} \
+             refills ({:.2} s each); most tip keys in a batch {}; calls per node {calls:?}; \
+             batched keys per node {keys:?}",
+            r.done,
+            r.done as f64 / wall,
+            100.0 * tot.absent as f64 / r.done.max(1) as f64,
+            r.batches,
+            r.refills,
+            r.refill_secs / f64::from(r.refills.max(1)),
+            r.tip_max,
         );
+        let ph = &r.ph;
         eprintln!(
             "  per batch: prep {:.3} fungible {:.3} reads_batched {:.3} reads_rereads {:.3} \
              txn_wait {:.3} branch {:.3} write {:.3} clear {:.3} commit {:.3}",
