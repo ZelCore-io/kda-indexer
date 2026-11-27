@@ -364,6 +364,13 @@ The G4 replay of real traffic (below) met most of these classes again; its
 - chainweb-data answered the `fluxteam` account list (`limit=200000`, no `minheight`) with
   recent rows only, 27 to 32 against ours' 237; ours answers the whole history (R-G4-05). The
   general cause is inferred from this one account ([api.md](api.md#compat-notes)).
+- Input validation: ours answers `BAD_USER_INPUT` for an empty `chainId: ""`, chain ids that
+  are not plain decimal (`chainIds: ["1e1"]`, `["0x1"]`, `[""]`), an empty
+  `accountName: ""`, and bad block or depth arguments. Stock answers `[]`, a value, or
+  `INTERNAL_SERVER_ERROR` for the same requests (final cycle 2026-11-27: 119 rows in 9
+  groups; run 2 met them too).
+- Malformed `/v1/txs` paths: `//coin/0` answers 400 on ours and 404 on kda-txs;
+  `..%2F..%2Fx` answers 200 `[]` on ours and 404 on kda-txs (8 rows in 2 groups).
 
 ### Stock faults the node disproves
 
@@ -407,6 +414,16 @@ Accepted on node samples taken when the rule was made, not on a per-record read:
 stock strips (`graphql-r60-oracle-strips-quotes`); see
 [graphql.md](graphql.md#transaction-fields-where-stock-differs-from-the-node).
 
+Stock crashes where ours answers (final cycle 2026-11-27: 61 rows in 7 groups; run 2 met
+them too), classified by hand, with no allowlist rule:
+
+- `node` / `nodes` with a `Transaction` id that pairs a block with a transaction from another
+  block: stock fails with `Abstract type "Node" must resolve to an Object type`, ours answers
+  `null`. On the node, the transaction of the case checked is in another block than the one
+  its id names, so `null` is right;
+- `completedBlockHeights` requests where stock answers `INTERNAL_SERVER_ERROR` and ours
+  answers.
+
 Not accepted: entries without a node read are open and their differences are reported
 (`cwd-hole-tx-au4cjml8`, `cwd-hole-txs-au4cjml8`, `cwd-hole-events-7392263`,
 `kdatxs-gap-cont-d7bf62`, `oracle-event-order`). Open entries, our own defects and known gaps
@@ -414,8 +431,9 @@ match nothing.
 
 ## G4 real-traffic replay
 
-**Numbers as of 2026-11-25; to be refreshed after the final G4 checks.** The same results as a
-standalone page: [g4-comparison.html](g4-comparison.html).
+**Replay numbers as of 2026-11-25.** The final comparison cycle of 2026-11-27 is in
+[Final comparison cycle (2026-11-27)](#final-comparison-cycle-2026-11-27) below. The same
+results as a standalone page: [g4-comparison.html](g4-comparison.html).
 
 ### Method
 
@@ -543,6 +561,99 @@ documented difference), **unknown** (not settled yet).
 Totals: 43 classes. 4 fixed in ours (1–4); 2 open on ours' side (22, and 43 until its recheck
 passes); 4 not settled (7, 37, 38, 39); the rest are documented differences where ours
 follows the node or both answers are acceptable.
+
+### Final comparison cycle (2026-11-27)
+
+After the replay, a final cycle ran the endpoint suite against the stock indexers on
+2026-11-27 and compared its match rates with the previous suite run ("run 2"). It is a
+reduced cycle: up to 1,000 cases per light endpoint, paired with stock, plus a sample of the
+heavy endpoints, at no more than 2 requests per second to stock.
+
+**Build under test.** `9b96aba` for most of the run (PRs #65–#68: stock-exact
+`minerAccount` and `parametersFilter` forms, the balance reconciler running beside the
+receivers passes, faster balance drain with extra read nodes, optional `networkInfo` node
+fields); the first rows, before an 11:12Z swap, ran on `7db6e5b` (#65, #66). `main` is now
+`bc69c50`, which adds #69–#72 (audit items N-16 to N-26 with a 4 s count window, the reconcile
+refill window with a per-batch tip share, and all-history unfiltered counts). No rows ran on
+`ea0c4fe` (#69, #70), so its 4 s count window was not measured live.
+
+**What was kept.** 46,571 rows after dropping the swap windows, the pauses and 327 rows of
+chainweb-data endpoints taken off a stock host when they timed out (as in run 2). Node checks:
+3,271 of 3,271 ok. Cross-checks: 3,333 of 3,333 ok. Open harness errors: 0.
+
+**Match rates against run 2.** The match rate is (equal + allowlisted + known-gap) / (those +
+diff + status); rows stock could not answer are left out. Sample rows are few (13 to 61 per
+endpoint), because the stock GraphQL indexer answers most heavy requests with a 504 at 30 s.
+
+| Endpoint | Coverage | n | Match | Run 2 n | Run 2 match | Note |
+|---|---|---:|---:|---:|---:|---|
+| `/v1/txs` (kda-txs) | stock | 1,000 | 34.0% | 3,484 | 33.0% | 407 are kda-txs 404 after 30 s (#33) |
+| `fungibleAccount` | stock | 1,000 | 85.7% | 20,000 | 95.8% | the suite no longer allowlists JS-float rows (#11, 156); with them, 99.4% |
+| `fungibleChainAccounts` | stock | 1,000 | 90.3% | 20,000 | 29.3% | up |
+| `fungibleChainAccount` | stock | 1,000 | 99.3% | 20,000 | 93.8% | up |
+| `gasLimitEstimate` | stock | 1,000 | 100% | 20,000 | 88.8% | up |
+| `graphConfiguration` | stock | 1,000 | 100% | 20,000 | 100% | same |
+| `pactQuery` | stock | 1,000 | 100% | 20,000 | 88.8% | up |
+| `lastBlockHeight` | stock | 1,000 | 94.6% | 20,000 | 100% | ±1 tip races (#26) no longer allowlisted |
+| `networkInfo` | stock | 116 | 26.7% | 20,000 | 95.0% | stock errored on 884 of 1,000 (see below) |
+| `node` | stock | 730 | 94.5% | 4,989 | 95.9% | |
+| `nodes` | stock | 514 | 86.2% | 3,181 | 84.4% | includes the (d) rows |
+| `block` | sample | 61 | 63.9% | 352 | 73.3% | |
+| `blocksFromDepth` | sample | 26 | 65.4% | 131 | 38.9% | |
+| `blocksFromHeight` | sample | 34 | 82.4% | 199 | 19.1% | |
+| `completedBlockHeights` | sample | 45 | 93.3% | 262 | 59.9% | |
+| `events` | sample | 20 | 80.0% | 67 | 31.3% | |
+| `transaction` | sample | 22 | 81.8% | 72 | 15.3% | |
+| `transactions` | sample | 17 | 88.2% | 67 | 31.3% | |
+| `transactionsByPublicKey` | sample | 16 | 93.8% | 68 | 38.2% | |
+| `transfers` | sample | 17 | 76.5% | 50 | 58.0% | |
+| `fungibleAccountsByPublicKey` | sample | 13 | 69.2% | 34 | 29.4% | (d) rows |
+| `fungibleChainAccountsByPublicKey` | sample | 14 | 92.9% | 38 | 28.9% | |
+| `nonFungibleChainAccount` | sample | 15 | 100% | 46 | 41.3% | |
+| chainweb-data `/txs/recent` | sample | 417 | 0% | 7 | 0% | compared by position against stock's cache (#36) |
+
+**Classes of the differences.** Every row that is not a match falls in one of four classes.
+
+| Class | Rows | Groups | Meaning |
+|---|---:|---:|---|
+| (a) documented | 654 | 40 | A difference this page or [graphql.md](graphql.md) / [api.md](api.md) already describes: ours follows the node, or both answers are acceptable. |
+| (b) new, looks like ours | 3 | 1 | Not documented and not explained by stock or by the harness. |
+| (c) harness, timing, stock timeout | 936 | 31 | Tip races, reads before our queue drained, comparing by position, and stock timing out. |
+| (d) balance drain in progress | 41 | 5 | Our stored balance rows were not filled yet when the case ran. |
+
+- **(a)** JS floats (#11, 162 rows); kda-txs pairing, event order and missing rows (#31 177,
+  #32 29, #34 39); the nested block page (#7, 4); `NetworkInfo` node fields (50, below);
+  the guard shape and the `"coin "` name (5, [graphql.md](graphql.md#accounts)); and three
+  groups run 2 met too that were not on this page yet: input validation (119), malformed
+  `/v1/txs` paths (8) and stock crashes (61). They are now listed under
+  [Intended differences](#intended-differences) and
+  [Stock faults the node disproves](#stock-faults-the-node-disproves).
+- **(b)** The unfiltered `transfers { totalCount }` answered `COUNT_TIMEOUT` at the 4.9 s
+  deadline on ours (`gql.transfers` cases 14, 16 and 87), where stock answered. Fixed by #72,
+  which counts unfiltered `transactions` and `transfers` over all history from stored
+  counters. After the swap to `bc69c50`, unfiltered `transfers` answers 441,469,276 in
+  1.44 ms (before: `COUNT_TIMEOUT` after 4.90 s), unfiltered `transactions` 230,519,399 in
+  0.50 ms (before: 50,619 over the last 20,000 heights, 3.39 s; it equals the
+  `countersOfEachChain` sum), and `transactions(isCoinbase: true)` 370,837,002 in 0.71 ms
+  (before: 450,589, 3.40 s). The stock GraphQL indexer now times out (504 at 30 s) on these
+  counts, so they were not compared with stock live.
+- **(c)** kda-txs 404 after 30 s (#33, 407 rows); `/txs/recent` by position (#36, 417);
+  `lastBlockHeight` and `totalCount` ±1 (#26, 55); stale `coinsInCirculation` (#28, 35); row
+  order and page window (#6, #38, #39, 10); harness tags (8); our node-read deadline under
+  load (2) and reads before the queue drained (#25, 2), both equal on a re-query.
+- **(d)** `fungibleAccountsByPublicKey` / `fungibleChainAccountsByPublicKey` (5 rows) and
+  `nodes` with a `FungibleAccount` id (36 rows, `null` on ours, because `node(id:)` reads the
+  store only). They are re-run when the balance drain ends, and the result will be added here
+  as an addendum. The drain slowed on 2026-11-27 because of the data: the oldest part of the
+  backlog has about 48% absent keys, and each absent key is re-read on its own on the primary
+  node at the designed limit of 50 reads per second. The same keys drain about 10% slower on
+  the previous build, so it is not a regression of `bc69c50`.
+
+**Stock answers.** The stock GraphQL indexer's light requests (paired with stock, all cases)
+took p50 9 ms and p90 58 ms, the same as in run 2. Its `networkInfo` errored on 884 of 1,000
+requests: the whole field was `null` with `Cannot return null for non-nullable field
+NetworkInfo.apiVersion` (and the other node fields); ours answers. Those 884 rows count as
+stock unavailable, and 50 more are class (a).
 
 ## What is not compared
 
