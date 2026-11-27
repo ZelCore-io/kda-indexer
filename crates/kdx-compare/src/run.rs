@@ -3704,9 +3704,20 @@ async fn shutdown_signal(max_secs: Option<u64>) {
 /// `once`: one request through the full pipeline; returns the outcomes.
 pub async fn once(cfg: CompareConfig, path: &str) -> anyhow::Result<Vec<Outcome>> {
     let ctx = Ctx::new(cfg).await?;
-    let route = RouteKind::from_path(path);
     // Oracle from the request itself: tx/txs with a request key use /poll (chain from A).
-    let oracle = match route {
+    let req = Request::new(
+        path.to_string(),
+        crate::gen::Origin::Seed,
+        poll_oracle(path),
+    );
+    let out = ctx.process(&req).await;
+    ctx.flush_summary();
+    Ok(out)
+}
+
+/// The `/poll` oracle of a `/txs/tx` or `/txs/txs` request with a request key (chain from A).
+fn poll_oracle(path: &str) -> Option<OracleRef> {
+    match RouteKind::from_path(path) {
         RouteKind::Tx | RouteKind::Txs => path
             .split_once('?')
             .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("requestkey=")))
@@ -3715,11 +3726,75 @@ pub async fn once(cfg: CompareConfig, path: &str) -> anyhow::Result<Vec<Outcome>
                 request_key: rk.to_string(),
             }),
         _ => None,
-    };
-    let req = Request::new(path.to_string(), crate::gen::Origin::Seed, oracle);
-    let out = ctx.process(&req).await;
+    }
+}
+
+/// One `replay-batch` input line: a REST path, or a GraphQL document with its variables.
+#[derive(Debug, serde::Deserialize)]
+pub struct BatchItem {
+    pub id: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub variables: Option<serde_json::Map<String, Value>>,
+}
+
+/// The verdict line `replay-batch` prints for one item: the outcomes of every pair (class,
+/// allowlist ids, and the diff record of a non-matching one), or `skip` with the reason the
+/// item was not compared.
+pub fn batch_line(id: &str, skip: Option<&str>, out: &[Outcome]) -> Value {
+    let outcomes: Vec<Value> = out
+        .iter()
+        .map(|o| {
+            let mut v = json!({ "class": o.class, "allowlist": o.allowlist_ids });
+            if let Some(r) = o.record.as_ref().filter(|_| o.class != "match") {
+                v["record"] = serde_json::to_value(r).unwrap_or(Value::Null);
+            }
+            v
+        })
+        .collect();
+    json!({ "id": id, "skip": skip, "outcomes": outcomes })
+}
+
+/// `replay-batch`: every item through the full pipeline (normalisers, allowlist, node
+/// oracles, target rate caps), at most `concurrency` items at a time, one verdict line each
+/// on `out` as it finishes (any order; lines carry the item's id).
+pub async fn replay_batch(
+    cfg: CompareConfig,
+    items: Vec<BatchItem>,
+    concurrency: usize,
+    out: &mut (dyn std::io::Write + Send),
+) -> anyhow::Result<()> {
+    use futures::StreamExt;
+    let ctx = Ctx::new(cfg).await?;
+    let ctx = &ctx;
+    let mut lines = futures::stream::iter(items)
+        .map(|it| async move {
+            if let Some(path) = it.path.as_deref() {
+                let req = Request::new(
+                    path.to_string(),
+                    crate::gen::Origin::Seed,
+                    poll_oracle(path),
+                );
+                let o = ctx.process(&req).await;
+                batch_line(&it.id, None, &o)
+            } else if let Some(q) = it.query.as_deref() {
+                let (skip, o) =
+                    crate::graphql::replay_one(ctx, q, it.variables.unwrap_or_default()).await;
+                batch_line(&it.id, skip, &o)
+            } else {
+                batch_line(&it.id, Some("empty"), &[])
+            }
+        })
+        .buffer_unordered(concurrency.max(1));
+    while let Some(v) = lines.next().await {
+        writeln!(out, "{v}")?;
+        out.flush()?;
+    }
     ctx.flush_summary();
-    Ok(out)
+    Ok(())
 }
 
 /// Percent-decoded path segment.
@@ -3853,6 +3928,45 @@ mod mock_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `replay-batch`: an input line is a REST path or a GraphQL document; a verdict line
+    /// carries every pair's class and allowlist ids, the skip reason, and no record for a
+    /// match. Only tx/txs with a request key get the `/poll` oracle.
+    #[test]
+    fn replay_batch_lines() {
+        let rest: BatchItem =
+            serde_json::from_str(r#"{"id":"1","path":"/txs/tx?requestkey=abc"}"#).unwrap();
+        assert_eq!(rest.path.as_deref(), Some("/txs/tx?requestkey=abc"));
+        let g: BatchItem =
+            serde_json::from_str(r#"{"id":"2","query":"{ a }","variables":{"x":1}}"#).unwrap();
+        assert_eq!(g.variables.unwrap()["x"], 1);
+        assert!(matches!(
+            poll_oracle("/txs/tx?requestkey=abc"),
+            Some(OracleRef::Poll { ref request_key, .. }) if request_key == "abc"
+        ));
+        assert!(poll_oracle("/txs/recent").is_none());
+        let out = [
+            Outcome {
+                class: "allowlisted".into(),
+                record: None,
+                allowlist_ids: vec!["stats-estimate".into()],
+            },
+            Outcome {
+                class: "match".into(),
+                record: None,
+                allowlist_ids: Vec::new(),
+            },
+        ];
+        let v = batch_line("7", None, &out);
+        assert_eq!(v["id"], "7");
+        assert!(v["skip"].is_null());
+        assert_eq!(v["outcomes"][0]["allowlist"][0], "stats-estimate");
+        assert_eq!(v["outcomes"][1]["class"], "match");
+        assert!(v["outcomes"][1].get("record").is_none());
+        let v = batch_line("8", Some("tip-only"), &[]);
+        assert_eq!(v["skip"], "tip-only");
+        assert_eq!(v["outcomes"].as_array().unwrap().len(), 0);
+    }
 
     /// R-P5P9-10 #1: the balances pair's compare.
     #[test]

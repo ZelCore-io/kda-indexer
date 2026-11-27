@@ -102,6 +102,8 @@ assets = [
     ["../../packaging/config/mainnet01.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
     ["../../packaging/config/testnet.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
     ["../../packaging/config/compare.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
+    ["../../packaging/config/hourly-check.toml.example", "usr/share/doc/kda-indexer/examples/", "644"],
+    ["../../scripts/hourly_check.py", "usr/share/kda-indexer/compare/", "755"],
     ["../../packaging/systemd/backfill.conf.example", "usr/share/doc/kda-indexer/examples/backfill.conf", "644"],
     ["../../packaging/systemd/memory.conf.example", "usr/share/doc/kda-indexer/examples/memory.conf", "644"],
     ["../../packaging/systemd/datadir-volume-root.conf.example", "usr/share/doc/kda-indexer/examples/datadir-volume-root.conf", "644"],

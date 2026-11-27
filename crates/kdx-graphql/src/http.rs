@@ -191,7 +191,14 @@ async fn post_handler(
             Err(m) => return bad(m),
         },
     };
-    execute(schema, &st, peer, &headers, batch, run).await
+    // `[api.request_log]`: the body goes to the log through the response (zero-copy).
+    let logged = st.request_log().map(|_| bytes.clone());
+    let mut resp = execute(schema, &st, peer, &headers, batch, run).await;
+    if let Some(b) = logged {
+        resp.extensions_mut()
+            .insert(kdx_api::reqlog::GraphqlBody(b));
+    }
+    resp
 }
 
 /// The request's shared deadline: the guard's, else (no guard, as in tests) one from now

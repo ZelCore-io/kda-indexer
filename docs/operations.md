@@ -458,12 +458,127 @@ adds a line to `<data_dir>/merkle-unverified.jsonl`. `kda-indexer verify merkle 
 
 ## Behind a load balancer
 
-To serve the compat routes through HAProxy next to chainweb-data, and move them one route at a
-time with a rollback for each step, see [load-balancer.md](load-balancer.md). In short: bind
+To serve the compat routes through HAProxy next to chainweb-data, and move them all in one
+step (or one route group at a time) with a one-line rollback, see
+[load-balancer.md](load-balancer.md). After the move, run the hourly validation below. In short: bind
 the compat, graphql and admin listeners to loopback plus the host's private address, set
 `api.trusted_proxies` to the balancer's address, and let the balancer check `/readyz` on the
 admin port. A host that is not ready leaves the pool, and its routes fall back to
 chainweb-data. Drain the server on the balancer before a planned restart.
+
+## Request log
+
+`[api.request_log]` writes one JSON line per request served on the compat and GraphQL
+listeners (not native or admin). It is off by default; turn it on for a cutover and its
+hourly validation (next section), then off again.
+
+```toml
+[api.request_log]
+enabled = true
+path = "requests/requests.jsonl"   # relative = under the data dir
+max_mb = 256                       # rotate at this size
+keep = 8                           # rotated files: .1 (newest) .. .8
+sample_rate = 1.0                  # share of requests logged, every n-th request
+max_body_bytes = 16384             # GraphQL bodies larger than this are not written
+queue = 8192                       # lines waiting for the writer
+client_ip = "hash"                 # or "omit"
+```
+
+A relative `path` is under the data dir, which the systemd unit may write
+(`ProtectSystem=strict`); an absolute path elsewhere needs its own `ReadWritePaths=`. The file
+is opened at start-up, so a path that cannot be written stops the start with an error.
+
+One line, for example:
+
+```json
+{"t":1795780800123,"listener":"compat","method":"GET","uri":"/txs/account/k:abc?limit=20","route":"/txs/account/{account}","status":200,"ms":4.2,"client":"5f0c9a1e22b7d3c4","tip_min":6012340,"tip_max":6012342,"lag_max":1}
+```
+
+| Field | What |
+|---|---|
+| `t` | time the request arrived, Unix milliseconds |
+| `listener` | `compat` or `graphql` |
+| `method`, `uri` | method, path and query string (cut at 8,192 bytes, then `uri_cut: true`) |
+| `route` | the route template that served it (null when none matched) |
+| `status`, `ms` | status the client got (the limits' 429/503/504 included) and the time to the response head |
+| `client` | keyed hash of the client address (after `api.trusted_proxies`); absent with `client_ip = "omit"` |
+| `tip_min`, `tip_max`, `lag_max` | lowest and highest indexed chain height and the largest chain lag, as last sampled for `/metrics` (at most 10 s old) |
+| `gql` | GraphQL POST only: the body's `operationName`, `query` and `variables` (each request of a batch) |
+| `gql_cut`, `gql_len` | instead of `gql`, when the body is over `max_body_bytes` or not JSON |
+
+What it never holds: the client address (the hash key is random per process, so a hash does
+not link across restarts, and nothing can turn it back without the key), headers, cookies,
+response bodies. GraphQL variables and REST paths hold account names and keys, which are public
+chain data; treat the file like an access log anyway.
+
+The request path only takes a sample decision and queues a small record; a writer thread
+formats, writes and rotates. When the queue is full the line is dropped and counted
+(`kdx_request_log_lines_total{result="dropped"}`); serving never waits for the disk. At 50
+requests/s a line is about 300 bytes (GraphQL lines more), about 1.3 GB a day: size `max_mb`
+and `keep` for the hours you need, or lower `sample_rate`.
+
+## Hourly validation
+
+After a cutover, `scripts/hourly_check.py` (installed under
+`/usr/share/kda-indexer/compare/`) checks every hour that the requests served in that hour
+were answered correctly and that the indexer follows the chain. It needs the request log on,
+the stock services still running, and a compare config for the replay; the example
+`hourly-check.toml.example` holds both configs.
+
+```sh
+python3 /usr/share/kda-indexer/compare/hourly_check.py --config /etc/kda-indexer/hourly-check.toml
+python3 /usr/share/kda-indexer/compare/hourly_check.py --config /etc/kda-indexer/hourly-check.toml --hour 2026-11-27T13
+```
+
+Without `--hour` it checks the last full hour (UTC); run it a few minutes past each hour (a
+cron line or a systemd timer). `--dry-run` samples and runs the chain checks without
+replaying.
+
+1. **Sample.** It reads the hour's lines from the log and its rotations and takes one request
+   of every distinct query shape (route and query-parameter names; for GraphQL the document and
+   its variable names), then up to `per_route` per route, `budget` in all (default 2,000).
+   Identical requests are replayed once. Non-GET REST requests (they stay on the old backends),
+   GraphQL batches and bodies over the log's cap are counted, not replayed.
+2. **Replay.** `kda-compare replay-batch` sends each request to kda-indexer and to the stock
+   side the compare config pairs it with (chainweb-data, kda-txs, the GraphQL indexer), and to
+   the node where a node check applies (transaction existence by `/poll`, block hashes,
+   balances). It uses the harness's normalisers, field rules, allowlist and node oracles, and
+   each target's `rate_rps`: keep chainweb-data at 1 r/s and kda-txs and the GraphQL indexer at
+   2 r/s or less; `concurrency` (default 2) bounds the requests in flight. A request that
+   differs is asked again once after `recheck_delay_s`. The replay stops at
+   `deadline_minutes`; what it did not reach counts as `not-run`.
+3. **Classify.** Each request takes the worst class of its pairs:
+
+   | Class | Meaning | Fails the hour |
+   |---|---|---|
+   | `equal` | same answer | no |
+   | `allowlisted` (a) | a documented difference ([comparison.md](comparison.md)) | no |
+   | `known-gap` (d) | a known gap the allowlist names | no |
+   | `timing` (c) | a tip race, a balance row read while the drain had it stale, or a difference the re-check no longer shows | no |
+   | `stock-unavailable` | the stock side failed | no |
+   | `not-compared` | nothing to compare (a tip-only GraphQL document, no oracle) | no |
+   | `ours-error` | kda-indexer failed | yes |
+   | `unexplained` | any other difference | yes |
+
+   The replay runs after the request was served, up to an hour later. It checks the same
+   request's answer now, not the bytes that were served: what moved with the tip in between is
+   what the timing class and the re-check absorb.
+4. **Follow the chain.** Our tip per chain (native `/status`) against the node's cut: the lag,
+   and the node's block hash at our height. From `/metrics`: halted chains, 5xx since the last
+   run, the balance drain (`kdx_balance_dirty_rows` and its change), and the request log's
+   dropped lines. Restarts from the unit (`NRestarts`, `MainPID`).
+
+The hour **passes** with no `unexplained` and no `ours-error`, every chain within
+`ready_max_lag` (default 20) now and in every logged request of the hour, no halted chain or
+hash mismatch, no restart since the last run, and no route with more than `max_5xx_share`
+(0.5%, at least 2) of its answers 5xx. Exit 0 = pass, 1 = fail, 2 = the check could not run.
+
+Output: a short summary on stdout (pass or fail, counts per class, a line per route, the chain
+line, up to five difference examples marked `NEW` when that route and set of differing fields
+was not seen in an earlier hour, and the reasons for a fail), and the full report as
+`<out_dir>/hourly-<hour>.json`. `<out_dir>/hourly-state.json` carries the restart counters,
+the drain level and the differences already seen to the next run. The report holds request
+paths and GraphQL variables: keep it on the host.
 
 ## `/stats` freshness
 
@@ -527,6 +642,7 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_disk_free_bytes` | |
 | `kdx_mdbx_commit_seconds` | |
 | `kdx_http_requests_total`, `kdx_http_request_seconds` | api, route, status |
+| `kdx_request_log_lines_total` | result (written, dropped, error): `[api.request_log]` lines; `dropped` = the queue was full, `error` = the write failed |
 | `kdx_freezer_runs_total`, `kdx_freezer_seconds` | op (freeze, merge) |
 | `kdx_read_view_seconds` | phase (open, held) |
 | `kdx_merkle_blocks_total` | result (verified, mismatch_legacy, mismatch) |

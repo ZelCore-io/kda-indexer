@@ -3636,6 +3636,65 @@ pub async fn once(cfg: CompareConfig, stem: &str) -> anyhow::Result<Vec<Outcome>
     Ok(out)
 }
 
+/// `replay-batch`: one logged GraphQL request (document and variables as the client sent
+/// them) through every GraphQL pair whose B is an oracle. The operation keeps the stem of the
+/// captured document with the same root fields, so the allowlist entries scoped to that
+/// document apply; other documents get the stem `replay`. Returns `(class, outcomes)`:
+/// `class` is set (and `outcomes` empty) when the request is not compared, with the reason.
+pub(crate) async fn replay_one(
+    ctx: &Ctx,
+    query: &str,
+    vars: Map<String, Value>,
+) -> (Option<&'static str>, Vec<Outcome>) {
+    let Ok(parsed) = parse_op("replay", query, true) else {
+        return (Some("not-parsed"), Vec::new());
+    };
+    let stem = ctx
+        .gql
+        .ops
+        .iter()
+        .find(|o| o.roots == parsed.roots && o.kind == parsed.kind)
+        .map_or_else(|| "replay".to_string(), |o| o.stem.clone());
+    let op = GqlOp { stem, ..parsed };
+    match op.kind {
+        OpKind::Tip => return (Some("tip-only"), Vec::new()),
+        OpKind::Subscription => return (Some("subscription"), Vec::new()),
+        _ => {}
+    }
+    let mut out = Vec::new();
+    for (a, b) in &ctx.cfg.pairs {
+        let Some(ta) = ctx
+            .targets
+            .get(a)
+            .filter(|t| t.kind == TargetKind::KdaIndexerGraphql)
+        else {
+            continue;
+        };
+        let Some(tb) = ctx.targets.get(b) else {
+            continue;
+        };
+        let max = ctx.cfg.targets[&tb.name].max_height.unwrap_or(u64::MAX);
+        let o = match op.kind {
+            OpKind::NotSupported => ctx.gql_not_supported(ta, &op, &vars).await,
+            OpKind::Pact => ctx.gql_pact(ta, tb, &op, &vars).await,
+            OpKind::Oracle | OpKind::NodeTx | OpKind::NodeBlock | OpKind::NodeBalance => {
+                if let Some(acct) = vars.get("accountName").and_then(Value::as_str) {
+                    if !ctx.account_below(ta, acct, max).await {
+                        return (Some("skipped-account-newer"), Vec::new());
+                    }
+                }
+                ctx.gql_vs_oracle(ta, tb, &op, &vars, max).await
+            }
+            OpKind::Tip | OpKind::Subscription => continue,
+        };
+        out.push(o);
+    }
+    if out.is_empty() {
+        return (Some("no-pair"), out);
+    }
+    (None, out)
+}
+
 /// `gen --source graphql`: prints `count` sampled (operation, variables) draws.
 pub async fn gen_debug(cfg: &CompareConfig, count: usize, print: bool) -> anyhow::Result<()> {
     let node = cfg.node_client()?;
