@@ -748,14 +748,18 @@ with `[balances] enabled = false`.
   they are re-read whenever the balance row's `as_of` moves, and rarely differ between
   sibling blocks.
 - **Errors**: a node error (timeout, connection, HTTP status) keeps the row dirty and moves it
-  to the back of the queue; the reconciler backs off (up to 60 s) only when node errors are at
+  to the back of the queue: its mark moves up to the tail height, and while the mark is still
+  the one the failed read wrote it is left out of the batch's tip share (see *Batch order*
+  below), so it waits behind the older backlog instead of being re-read every batch (an
+  off-branch answer is treated the same, without a retry count). The reconciler backs off (up to 60 s) only when node errors are at
   least half of a batch, and a row that fails 5 times in a row is parked (`result="parked"`,
   mark dropped until its next tail mark). It never becomes a zero balance. A Pact failure (for
   example a token module without a `details` function) drops the mark it read (a newer mark
   survives) and keeps any stored row, flagged unverified (served `stale: true`), with no
   back-off. An unusable answer (not JSON, too large, no decimal balance) does not drop the
   mark at once: it is logged (`balances: details answer unusable; key kept dirty`), counted
-  (`result="invalid"`) and moved to the back of the queue. After 5 in a row the key is parked
+  (`result="invalid"`); a tail mark keeps its place so the same key is read again, and a
+  seed mark becomes a tail mark at the back of the queue (out of the tip share). After 5 in a row the key is parked
   like a node error and listed (`parked_invalid` in `--status`, at most 100,000 keys);
   `reconcile-balances --all` puts the listed keys back in the queue. Unusable answers count
   as module failures: a module none of whose keys answers usably in 3 batches in a row is
@@ -841,8 +845,11 @@ network; a network this build has no heights for uses mainnet01's and logs a war
 - **Batch order while the passes mark.** D1 and D3 mark rows at the credit's historic
   height, and the loop takes coin marks oldest first, so a large pass backlog would hold the
   tip back. Each batch therefore reserves a quarter of its slots for the newest tail marks of
-  each chain (round-robin over chains, coin first, then the other modules within their
-  share): a miner's or a recent receiver's coin row is read within a batch or two. The other
+  each chain (round-robin over chains; coin marks fill it first, the other modules take the
+  room coin leaves, within their share): a miner's or a recent receiver's coin row is read
+  within a batch or two. A row marked again after a node error, an off-branch answer or an
+  unusable seed answer is not a fresh tip mark and stays out of this share until a newer
+  mark replaces it. The other
   three quarters go to the oldest coin marks, then the other modules round-robin; tail marks
   of tokens outside the tip share, and the seed backlog, wait until the older coin backlog
   drains. Watch `kdx_balance_dirty_rows` fall, against the pass report's `dirty_inserted`.

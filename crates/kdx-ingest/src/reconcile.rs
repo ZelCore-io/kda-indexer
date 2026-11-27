@@ -296,10 +296,10 @@ fn tip_deal(
 
 /// The next batch of up to `n` dirty keys (R-P5P9-8 #1, I-7), in this order:
 /// 0. the tip share, [`TIP_SHARE_PCT`] of `n`: the newest tail marks of each chain,
-///    round-robin over chains, `coin` first, then the other modules (at most `share` each,
-///    counted with their rows in 2), so a miner's or a recent receiver's mark is not starved
-///    behind an old backlog the receivers passes (D1, D3) marked at historic heights
-///    (PR #66 review I1);
+///    round-robin over chains, `coin` marks only while they fill it; other modules take the
+///    room `coin` leaves (at most `share` each, counted with their rows in 2). So a miner's
+///    or a recent receiver's mark is not starved behind an old backlog the receivers passes
+///    (D1, D3) marked at historic heights (PR #66 review I1);
 /// 1. tail marks of `coin`, oldest first;
 /// 2. tail marks of the other modules, round-robin over modules, at most `share` each;
 /// 3. only when 0 to 2 leave room, the seed backlog (the first `SEED_WINDOW × n` rows of
@@ -311,6 +311,21 @@ fn tip_deal(
 /// takes a fresh refill, so a new `coin` mark waits at most one batch behind newer `coin`
 /// marks, whatever other modules mark.
 pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
+    refill_with(hot, n, share, &HashMap::new())
+}
+
+/// [`refill`], with `back`: the keys recent batches marked again at the tail to send them to
+/// the back of the queue ([`note_remarked`]), with the mark written. A row whose mark is
+/// still exactly that one takes the old-backlog path (1, 2) only, never the tip share (PR #66
+/// review I3): its new tail mark is the newest of its chain, and in the tip share a chain
+/// whose node fails for some keys would re-read them every batch and park them within
+/// seconds. A newer mark (the key moved again) is a fresh tip mark and gets the share.
+pub fn refill_with(
+    hot: &HotStore,
+    n: usize,
+    share: usize,
+    back: &HashMap<[u8; 9], Mark>,
+) -> Result<Vec<Dirty>> {
     let share = share.max(1);
     let coin = balances::coin_module(&hot.ro()?)?;
     let tip_n = n * TIP_SHARE_PCT / 100;
@@ -328,7 +343,7 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
                 continue;
             };
             let module = module_of(&key);
-            if tip_n > 0 {
+            if tip_n > 0 && back.get(&key) != Some(&m) {
                 let tip = if Some(module) == coin {
                     &mut tip_coin
                 } else {
@@ -772,6 +787,10 @@ pub struct BatchStats {
     pub node_error_keys: Vec<([u8; 9], Mark)>,
     /// Keys with an invalid answer, with the mark the batch wrote for them; still dirty.
     pub invalid_keys: Vec<([u8; 9], Mark)>,
+    /// Keys the batch marked again at the tail to send them to the back of the queue (a node
+    /// error, an off-branch answer, an invalid seed answer), with the mark written. The loop
+    /// keeps them out of the tip share ([`note_remarked`], [`refill_with`]).
+    pub remarked: Vec<([u8; 9], Mark)>,
     /// Modules with an answer (`ok` or `absent`) in this batch.
     pub answered: HashSet<u32>,
     /// Non-coin modules with a failed or invalid `details` call in this batch.
@@ -1059,7 +1078,9 @@ pub async fn reconcile_batch(
                         ?branch,
                         "details answer is not on our branch; kept dirty"
                     );
-                    balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    let m =
+                        balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    st.remarked.push((it.d.key, m));
                     kdx_metrics::get().balance_reconcile("other_branch", 0.0);
                     st.other_branch += 1;
                     if prev_hash.is_none() {
@@ -1103,7 +1124,10 @@ pub async fn reconcile_batch(
                 // more unusable keys than the retry map tracks would rotate them forever,
                 // none reaching a second strike. A seed mark becomes a tail mark once.
                 let m = if it.d.seed {
-                    balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?
+                    let m =
+                        balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                    st.remarked.push((it.d.key, m));
+                    m
                 } else {
                     it.d.mark
                 };
@@ -1115,8 +1139,9 @@ pub async fn reconcile_batch(
             }
             Outcome::NodeError => {
                 // To the back of the queue: the mark moves up to the tail height (never down)
-                // and out of the seed backlog.
+                // and out of the seed backlog, and stays out of the tip share (`remarked`).
                 let m = balances::mark_dirty(&mut txn, it.account, it.module, it.chain, it.tail)?;
+                st.remarked.push((it.d.key, m));
                 st.node_errors += 1;
                 st.node_error_keys.push((it.d.key, m));
             }
@@ -1676,6 +1701,7 @@ async fn reconcile_loop(
     let mut details_cursor: Option<Vec<u8>> = None;
     let mut backoff: Option<Duration> = None;
     let mut retries: HashMap<[u8; 9], u32> = HashMap::new();
+    let mut back: HashMap<[u8; 9], Mark> = HashMap::new();
     let mut fails: HashMap<u32, u32> = HashMap::new();
     let mut last_recheck: Option<Instant> = None;
     let mut done = 0u64;
@@ -1729,7 +1755,11 @@ async fn reconcile_loop(
             tracing::debug!(?det, "nft: details read");
         }
         let (h, n, share) = (ctx.hot.clone(), o.batch, o.caps.module_share);
-        let batch = tokio::task::spawn_blocking(move || refill(&h, n, share)).await??;
+        let b = std::mem::take(&mut back);
+        let (batch, b) =
+            tokio::task::spawn_blocking(move || refill_with(&h, n, share, &b).map(|r| (r, b)))
+                .await??;
+        back = b;
         if batch.is_empty() {
             kdx_metrics::get()
                 .balance_dirty_rows
@@ -1763,6 +1793,7 @@ async fn reconcile_loop(
             last_log = Instant::now();
         }
         after_batch(&ctx.hot, &mut fails, &mut retries, &batch, &st)?;
+        note_remarked(&mut back, &batch, &st);
         let alert = watch.note(Instant::now(), &st);
         if let Some(n) = alert.no_hash {
             tracing::warn!(
@@ -1844,6 +1875,19 @@ pub fn after_batch(
         park_keys(hot, &parked, &invalid)?;
     }
     Ok(())
+}
+
+/// Track the keys a batch sent to the back of the queue ([`BatchStats::remarked`]) for
+/// [`refill_with`]: the batch's other keys are forgotten (answered, dropped, or kept in
+/// place), its re-marked keys recorded with the mark written. Bounded like the retry map.
+pub fn note_remarked(back: &mut HashMap<[u8; 9], Mark>, batch: &[Dirty], st: &BatchStats) {
+    for d in batch {
+        back.remove(&d.key);
+    }
+    if back.len() > MAX_TRACKED {
+        back.clear();
+    }
+    back.extend(st.remarked.iter().copied());
 }
 
 /// The keys to park after a batch (SR-2): none when the batch backs off (the node itself is
@@ -2799,6 +2843,75 @@ pub(crate) mod tests {
             assert!(parked_after(&mut m, &batch, &one).is_empty());
         }
         assert_eq!(parked_after(&mut m, &batch, &one), vec![batch[0]]);
+    }
+
+    /// PR #66 review I3: keys of a chain whose node fails for them are marked again at the tail
+    /// (the newest marks of their chain) and must still go to the back of the queue: kept out
+    /// of the tip share, they are not re-read every batch and parked while a backlog waits.
+    /// A fresh tip mark of the same chain still gets the share.
+    #[test]
+    fn keys_marked_again_after_a_node_error_stay_out_of_the_tip_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, _) = setup(dir.path(), &[]);
+        let names: Vec<String> = (0..43).map(|i| format!("acc{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let accts = intern(&hot, DictKind::Account, &refs);
+        // An old backlog on chain 0; two keys at the tip of chain 1, whose node fails for them.
+        for (i, a) in accts[..40].iter().enumerate() {
+            mark(&hot, *a, coin, 0, 1 + i as u32);
+        }
+        for a in &accts[40..42] {
+            mark(&hot, *a, coin, 1, 100);
+        }
+        let failing: HashSet<[u8; 9]> = accts[40..42]
+            .iter()
+            .map(|a| balances::bal_key(*a, coin, 1))
+            .collect();
+        let fresh = balances::bal_key(accts[42], coin, 1);
+        let (n, tip_n) = (8, 8 * TIP_SHARE_PCT / 100);
+        let (mut fails, mut retries, mut back) = (HashMap::new(), HashMap::new(), HashMap::new());
+        for i in 0..MAX_KEY_RETRIES {
+            if i == 3 {
+                mark(&hot, accts[42], coin, 1, 101);
+            }
+            let keys = refill_with(&hot, n, 4, &back).unwrap();
+            let tip: Vec<[u8; 9]> = keys[..tip_n].iter().map(|d| d.key).collect();
+            if i >= 2 {
+                assert!(
+                    tip.iter().all(|k| !failing.contains(k)),
+                    "batch {i}: {keys:?}"
+                );
+            }
+            if i == 3 {
+                assert!(tip.contains(&fresh), "batch {i}: {keys:?}");
+            }
+            let mut st = BatchStats::default();
+            let mut txn = hot.rw().unwrap();
+            for d in &keys {
+                if failing.contains(&d.key) {
+                    let a = u32::from_be_bytes(d.key[..4].try_into().unwrap());
+                    let m = balances::mark_dirty(&mut txn, a, coin, 1, 100).unwrap();
+                    st.node_errors += 1;
+                    st.node_error_keys.push((d.key, m));
+                    st.remarked.push((d.key, m));
+                } else {
+                    clear_mark(&mut txn, d.table(), &d.key, d.mark).unwrap();
+                    st.ok += 1;
+                }
+            }
+            txn.commit().unwrap();
+            after_batch(&hot, &mut fails, &mut retries, &keys, &st).unwrap();
+            note_remarked(&mut back, &keys, &st);
+        }
+        let txn = hot.ro().unwrap();
+        assert!(
+            balances::dirty_count(&txn).unwrap() > 2,
+            "the backlog still waits"
+        );
+        for k in &failing {
+            assert!(txn.get(Table::BalanceDirty, k).unwrap().is_some(), "parked");
+            assert!(retries.get(k).copied().unwrap_or(0) < 2, "{retries:?}");
+        }
     }
 
     fn intern(hot: &HotStore, kind: DictKind, names: &[&str]) -> Vec<u32> {

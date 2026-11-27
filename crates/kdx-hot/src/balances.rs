@@ -65,10 +65,11 @@ pub mod meta {
     /// Resume cursor of a running D3 pass (same layout as the D1 cursor).
     pub const BALANCES_SEED_TOKEN_RECEIVERS_CURSOR: &str = "balances_seed_token_receivers_cursor";
     /// u32s, big-endian: the tokens queued for a history walk ([`D3_REWALK`]) when the
-    /// running first D3 pass (from 0) started, written beside its cursor. A resumed attempt
-    /// walks later-tracked tokens only from the cursor, so at the end the pass clears the
-    /// rewalk keys of these tokens only (PR #66 review C1). Absent on a resume (a cursor of an
-    /// older build): the pass clears none.
+    /// running first D3 pass (from 0) started, written in a separate transaction just before
+    /// its first cursor write. A resumed attempt walks later-tracked tokens only from the
+    /// cursor, so at the end the pass clears the rewalk keys of these tokens only and deletes
+    /// this list (PR #66 review C1). Absent on a resume (a cursor of an older build): the pass
+    /// clears none.
     pub const BALANCES_SEED_TOKEN_RECEIVERS_START: &str = "balances_seed_token_receivers_start";
     /// Txs the D3 pass could not read (u64), like [`BALANCES_SEED_RECEIVERS_ERRORS`].
     pub const BALANCES_SEED_TOKEN_RECEIVERS_ERRORS: &str = "balances_seed_token_receivers_errors";
