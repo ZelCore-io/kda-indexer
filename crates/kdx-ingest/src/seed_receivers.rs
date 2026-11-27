@@ -304,7 +304,7 @@ fn module_skip(txn: &impl Txn, module: u32, coin: u32, key: &[u8; 9]) -> Result<
 
 /// A verified `Balances` row read at or above `height`: it already reflects the credit, so it
 /// needs no re-read (review H1). Older or unverified rows are marked like absent keys.
-fn fresh_row(v: Option<&[u8]>, height: u32) -> bool {
+pub(crate) fn fresh_row(v: Option<&[u8]>, height: u32) -> bool {
     v.and_then(balances::BalanceRow::decode)
         .is_some_and(|r| !r.unverified && r.as_of >= height)
 }
@@ -784,6 +784,17 @@ fn cursor(from: u32, next: u64, c: &Carry) -> [u8; CURSOR_LEN] {
     v
 }
 
+/// Module ids as big-endian u32s ([`meta::BALANCES_SEED_TOKEN_RECEIVERS_START`]).
+fn encode_ids(ids: &[u32]) -> Vec<u8> {
+    ids.iter().flat_map(|m| m.to_be_bytes()).collect()
+}
+
+fn decode_ids(v: &[u8]) -> Vec<u32> {
+    v.chunks_exact(4)
+        .filter_map(|b| Some(u32::from_be_bytes(b.try_into().ok()?)))
+        .collect()
+}
+
 fn parse_cursor(v: &[u8]) -> Option<(u32, u64, Carry)> {
     let from = be_u32(v.get(..4)?)?;
     let next = u64::from_be_bytes(v.get(4..12)?.try_into().ok()?);
@@ -1131,9 +1142,10 @@ pub fn run(
         ..ReceiversReport::default()
     };
     let (flag_key, cursor_key, errors_key) = o.rules.keys();
-    let (coin, span, resume, budget, prior_errors) = {
+    let (coin, span, resume, budget, prior_errors, started) = {
         let txn = hot.ro()?;
         let resume = txn.meta(cursor_key)?.as_deref().and_then(parse_cursor);
+        let started = txn.meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_START)?;
         let budget = txn.meta(meta::BALANCES_SEED_TOKEN_RECEIVERS_BUDGET)?;
         let prior = txn
             .meta(errors_key)?
@@ -1144,7 +1156,14 @@ pub fn run(
         if span.is_some() {
             check_ready(&txn, segdir)?;
         }
-        (balances::coin_module(&txn)?, span, resume, budget, prior)
+        (
+            balances::coin_module(&txn)?,
+            span,
+            resume,
+            budget,
+            prior,
+            started,
+        )
     };
     let Some((from, to)) = span else {
         return Ok(rep);
@@ -1202,6 +1221,24 @@ pub fn run(
             Some((next, c))
         }
         _ => None,
+    };
+    // The rewalk keys a first pass clears at its end: the tokens queued when it started,
+    // which it walked from 0. A resumed attempt reads them back; tokens tracked since walk
+    // only from the cursor and keep theirs for the history walk (PR #66 review C1).
+    let rewalk = match (&resume, o.rules, from) {
+        (None, Rules::D3, 0) => {
+            if !o.dry_run {
+                let mut txn = hot.rw()?;
+                txn.set_meta(
+                    meta::BALANCES_SEED_TOKEN_RECEIVERS_START,
+                    &encode_ids(&rewalk),
+                )?;
+                txn.commit()?;
+            }
+            rewalk
+        }
+        (Some(_), Rules::D3, 0) => started.as_deref().map(decode_ids).unwrap_or_default(),
+        _ => rewalk,
     };
     if o.rules == Rules::D3 && !o.dry_run {
         // Discoveries an earlier pass or the tail dropped at a quota go first (security
@@ -1280,11 +1317,15 @@ pub fn run(
             meta::BALANCES_SEED_TOKEN_RECEIVERS_BUDGET.as_bytes(),
         )?;
         if from == 0 {
-            // The walk from 0 covered every token tracked when it started.
+            // The walk from 0 covered every token tracked when its first attempt started.
             for m in &rewalk {
                 balances::clear_rewalk(&mut txn, *m)?;
             }
         }
+        txn.del(
+            Table::Meta,
+            meta::BALANCES_SEED_TOKEN_RECEIVERS_START.as_bytes(),
+        )?;
     }
     txn.set_meta(flag_key, &to.to_be_bytes())?;
     txn.set_meta(errors_key, &total.to_be_bytes())?;
