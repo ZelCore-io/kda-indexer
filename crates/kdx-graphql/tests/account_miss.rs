@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use async_graphql::Request;
 use kdx_api::{Api, ApiSettings, Store, TipWatch};
+use kdx_decode::{decode_block, index_block, VerifyReport};
 use kdx_graphql::miss::{
     DetailsFn, FoundRow, FoundSink, MissBudget, MissReader, MissSettings, NodeRow, ReadErr,
 };
 use kdx_graphql::{build_schema_with_miss, ClientIp, GraphqlSettings, KdxSchema};
 use kdx_hot::balances::{bal_key, BalanceRow};
 use kdx_hot::{HotDict, Table};
+use kdx_types::hash::b64url_encode;
 use kdx_types::{DictKind, DictMut};
 use serde_json::{json, Value};
 
@@ -129,6 +131,11 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
     };
     t.put(Table::Balances, &bal_key(alice, coin, 0), &row.encode())
         .unwrap();
+    for (c, miner) in MINERS {
+        let ib = index_block(&miner_block(c, miner), &VerifyReport::default(), &mut dict)
+            .expect("block indexes");
+        kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+    }
     t.commit().unwrap();
     let store = Arc::new(Store::open(hot, d.path()).unwrap());
     let settings = ApiSettings {
@@ -166,6 +173,51 @@ fn fixture(mode: Mode, s: MissSettings) -> Fx {
         mock,
         fed,
     }
+}
+
+/// Blocks at height 1 with no user tx, by chain and miner: CARD (no stored row, on chain on
+/// 12 per the mock), ALICE on chain 0 (stored row), a name the node has no row for, and one
+/// that is no account name at all (two characters).
+const MINERS: [(u8, &str); 4] = [(12, CARD), (0, ALICE), (3, "k:nobody"), (4, "ab")];
+
+fn miner_hash(c: u8) -> String {
+    b64url_encode(&[0xB0 ^ c; 32])
+}
+
+fn miner_block(c: u8, miner: &str) -> kdx_decode::DecodedBlock {
+    let cb = serde_json::to_vec(
+        &json!({"gas": 0, "result": {"status": "success", "data": "ok"},
+        "reqKey": b64url_encode(&[0xCB ^ c; 32]), "logs": null, "events": [],
+        "metaData": null, "continuation": null, "txId": null}),
+    )
+    .unwrap();
+    let md = serde_json::to_vec(&json!({"account": miner, "predicate": "keys-all",
+        "public-keys": []}))
+    .unwrap();
+    let payload_hash = b64url_encode(&[0xA4 ^ c; 32]);
+    let header = json!({
+        "nonce": "1", "creationTime": 1_700_000_000_000_000u64,
+        "parent": b64url_encode(&[0xB1 ^ c; 32]),
+        "adjacents": {"5": b64url_encode(&[0xAD ^ c; 32])},
+        "target": b64url_encode(&[0xff; 32]), "payloadHash": payload_hash, "chainId": c,
+        "weight": b64url_encode(&[1; 32]), "height": 1, "chainwebVersion": "mainnet01",
+        "epochStart": 1, "featureFlags": 0, "hash": miner_hash(c)
+    });
+    let payload = json!({
+        "transactions": [], "minerData": b64url_encode(&md),
+        "transactionsHash": b64url_encode(&[0xA7 ^ c; 32]),
+        "outputsHash": b64url_encode(&[0xA8 ^ c; 32]),
+        "payloadHash": payload_hash, "coinbase": b64url_encode(&cb),
+    });
+    decode_block(&header, &payload).expect("block decodes")
+}
+
+fn miner_q(c: u8) -> String {
+    format!(
+        "{{ block(hash: \"{}\") {{ minerAccount {{ accountName chainId balance \
+         guard {{ __typename raw }} }} }} }}",
+        miner_hash(c)
+    )
 }
 
 fn settings() -> MissSettings {
@@ -679,4 +731,57 @@ async fn cache_churn_from_one_client_is_bounded() {
     // The default read rate cannot turn a generation over within the absent TTL.
     let turnover = (s.cache_entries / 2) as f64 / f64::from(s.per_ip_rps);
     assert!(turnover >= s.ttl_absent.as_secs_f64(), "{turnover}");
+}
+
+/// `Block.minerAccount` as stock answers it (`(coin.details "<miner>")` live, zero on any
+/// failure): the stored row; else the node's row, read once and cached; else balance 0 with
+/// a `raw: "null"` guard, for a name the node has no row for, a name that is no account
+/// (never sent to the node) and a failed read (flagged), never an error.
+#[tokio::test]
+async fn miner_account_reads_the_node_on_a_miss_and_answers_zero_as_stock() {
+    let fx = fixture(Mode::Chain, settings());
+    let zero = |c: u8, a: &str| {
+        json!({"accountName": a, "chainId": c.to_string(), "balance": 0.0,
+               "guard": {"__typename": "RawGuard", "raw": "null"}})
+    };
+    let v = exec(&fx, &miner_q(0), [10, 0, 0, 1]).await;
+    assert_eq!(
+        v["data"]["block"]["minerAccount"]["balance"],
+        json!(5.0),
+        "{v}"
+    );
+    assert_eq!(
+        fx.mock.calls.load(Ordering::SeqCst),
+        0,
+        "stored row: no read"
+    );
+    let v = exec(&fx, &miner_q(12), [10, 0, 0, 1]).await;
+    assert_eq!(
+        v["data"]["block"]["minerAccount"],
+        json!({"accountName": CARD, "chainId": "12", "balance": 0.0,
+               "guard": {"__typename": "KeysetGuard",
+                         "raw": format!("{{\"keys\":[\"{KEY}\"],\"pred\":\"keys-all\"}}")}}),
+        "{v}"
+    );
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 1);
+    let v = exec(&fx, &miner_q(3), [10, 0, 0, 1]).await;
+    assert_eq!(
+        v["data"]["block"]["minerAccount"],
+        zero(3, "k:nobody"),
+        "{v}"
+    );
+    assert_eq!(fx.mock.calls.load(Ordering::SeqCst), 2);
+    let v = exec(&fx, &miner_q(4), [10, 0, 0, 1]).await;
+    assert_eq!(v["data"]["block"]["minerAccount"], zero(4, "ab"), "{v}");
+    assert_eq!(
+        fx.mock.calls.load(Ordering::SeqCst),
+        2,
+        "no account name: no read"
+    );
+    assert!(v.get("extensions").is_none(), "{v}");
+
+    let fx = fixture(Mode::Error, settings());
+    let v = exec(&fx, &miner_q(12), [10, 0, 0, 1]).await;
+    assert_eq!(v["data"]["block"]["minerAccount"], zero(12, CARD), "{v}");
+    assert_eq!(v["extensions"]["nodeReadIncomplete"], json!(true), "{v}");
 }

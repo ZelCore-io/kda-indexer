@@ -15,6 +15,9 @@
 //! - `dexPricesPartial: true`: a `tokenPrice` or `tokenPrices` price search ran out of its row
 //!   budget or the request deadline; the tokens it could not finish answer 0 (stock's answer
 //!   with no path), so a 0 in such a response may be a real price left unsearched.
+//! - `parametersFilterIgnored: true`: an `events` `parametersFilter` form we do not serve
+//!   was ignored and the events answer unfiltered, as stock answers every form (it never
+//!   reads the argument).
 //!
 //! One [`RespFlags`] per request (an extension instance is created per request), so the
 //! requests of a batch are flagged separately. Subscription events carry no flags.
@@ -35,6 +38,7 @@ pub struct RespFlags {
     node_read_incomplete: AtomicBool,
     dex_pairs_capped: AtomicBool,
     dex_prices_partial: AtomicBool,
+    parameters_filter_ignored: AtomicBool,
 }
 
 /// Which mark to set.
@@ -48,6 +52,8 @@ pub enum Flag {
     DexPairsCapped,
     /// A DEX price search was cut by the budget or deadline (some prices answer 0).
     DexPricesPartial,
+    /// An `events` `parametersFilter` we do not serve was ignored, as stock ignores it.
+    ParametersFilterIgnored,
 }
 
 impl RespFlags {
@@ -58,6 +64,7 @@ impl RespFlags {
             Flag::NodeReadIncomplete => &self.node_read_incomplete,
             Flag::DexPairsCapped => &self.dex_pairs_capped,
             Flag::DexPricesPartial => &self.dex_prices_partial,
+            Flag::ParametersFilterIgnored => &self.parameters_filter_ignored,
         }
     }
     pub fn is_set(&self, f: Flag) -> bool {
@@ -112,6 +119,7 @@ impl Extension for FlagsExt {
             (Flag::NodeReadIncomplete, "nodeReadIncomplete"),
             (Flag::DexPairsCapped, "dexPairsCapped"),
             (Flag::DexPricesPartial, "dexPricesPartial"),
+            (Flag::ParametersFilterIgnored, "parametersFilterIgnored"),
         ] {
             if self.0.is_set(f) {
                 r.extensions.insert(name.to_owned(), Value::Boolean(true));

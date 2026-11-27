@@ -1745,6 +1745,97 @@ async fn miner_account_is_served_at_zero() {
     );
 }
 
+/// Stock reads `(coin.details "<miner>")` from the node for `Block.minerAccount` and, when
+/// the read fails (no row on the chain, a name that is no account, a timeout), answers
+/// balance 0 and a `RawGuard` of `raw: "null"`. A miner with no row on the block's chain
+/// (here `k:miner` on chain 1; no node reader configured) answers that shape, never an error.
+#[tokio::test]
+async fn miner_account_without_a_row_answers_stock_zero_shape() {
+    let fx = fixture();
+    let q = format!(
+        "{{ block(hash: \"{}\") {{ minerAccount {{ accountName chainId fungibleName balance \
+         guard {{ __typename raw ... on RawGuard {{ keys predicate }} }} }} }} }}",
+        block_hash(1, 12)
+    );
+    let v = run(&fx.schema, &q).await;
+    assert_eq!(
+        v["block"]["minerAccount"],
+        json!({"accountName": "k:miner", "chainId": "1", "fungibleName": "coin", "balance": 0.0,
+               "guard": {"__typename": "RawGuard", "raw": "null", "keys": [], "predicate": ""}}),
+        "{v}"
+    );
+}
+
+/// Stock never reads `parametersFilter`: every value answers the unfiltered events. A form
+/// we serve filters (`array_ends_with` here); one we do not is ignored as stock ignores it,
+/// with `parametersFilterIgnored`, never an error.
+#[tokio::test]
+async fn parameters_filter_forms_we_do_not_serve_are_ignored_as_stock() {
+    let fx = fixture();
+    let q = |f: &str| {
+        format!(
+            "{{ events(qualifiedEventName: \"coin.TRANSFER\", first: 100{f}) \
+             {{ edges {{ node {{ parameters }} }} }} }}"
+        )
+    };
+    let all = fx.schema.execute(q("").as_str()).await;
+    assert!(all.errors.is_empty(), "{:?}", all.errors);
+    let all = serde_json::to_value(&all).unwrap();
+    let n = all["data"]["events"]["edges"].as_array().unwrap().len();
+    assert!(n > 1, "{all}");
+    for bad in [
+        r#"{\"mode\": \"insensitive\"}"#,
+        "not json",
+        r#"{\"array_starts_with\": []}"#,
+    ] {
+        let r = fx
+            .schema
+            .execute(q(&format!(", parametersFilter: \"{bad}\"")).as_str())
+            .await;
+        assert!(r.errors.is_empty(), "{bad}: {:?}", r.errors);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["data"], all["data"], "{bad}");
+        assert_eq!(
+            v["extensions"]["parametersFilterIgnored"],
+            json!(true),
+            "{bad}"
+        );
+    }
+    let last = all["data"]["events"]["edges"][0]["node"]["parameters"]
+        .as_str()
+        .unwrap();
+    let last: Value = serde_json::from_str(last).unwrap();
+    let tail = last
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .to_string()
+        .replace('"', "\\\"");
+    let r = fx
+        .schema
+        .execute(
+            q(&format!(
+                ", parametersFilter: \"{{\\\"array_ends_with\\\": {tail}}}\""
+            ))
+            .as_str(),
+        )
+        .await;
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(v.get("extensions").is_none(), "{v}");
+    let got = v["data"]["events"]["edges"].as_array().unwrap();
+    assert!(!got.is_empty() && got.len() <= n, "{v}");
+    for e in got {
+        let p: Value = serde_json::from_str(e["node"]["parameters"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            p.as_array().unwrap().last(),
+            last.as_array().unwrap().last(),
+            "{v}"
+        );
+    }
+}
+
 /// FIX-4 item 2: `chainIds: []` on the block lists means every chain, as no `chainIds` does.
 #[tokio::test]
 async fn empty_chain_ids_on_block_lists_mean_every_chain() {
