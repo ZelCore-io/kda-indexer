@@ -56,7 +56,7 @@ footer{color:var(--muted);font-size:.82rem}
 <div class="wrap">
 <header style="display:grid;gap:8px">
   <h1>KDA Indexer vs Stock</h1>
-  <p class="sub">An independent audit of the G4 replay of real production requests: what was compared, how it was compared, and every difference found between ours and stock (the Kadena GraphQL indexer, chainweb-data and kda-txs). Audit of 25 Nov 2026; doc status updated with the G4 docs change. Numbers as of 25 Nov 2026, to be refreshed after the final G4 checks.</p>
+  <p class="sub">An independent audit of the G4 replay of real production requests: what was compared, how it was compared, and every difference found between ours and stock (the Kadena GraphQL indexer, chainweb-data and kda-txs). Audit of 25 Nov 2026; doc status updated with the G4 docs change. Replay numbers as of 25 Nov 2026; the final comparison cycle of 27 Nov is in its own section below.</p>
 </header>
 
 <section>
@@ -73,6 +73,73 @@ footer{color:var(--muted);font-size:.82rem}
     <h3>Verdict</h3>
     <p><b>Detecting differences is sound.</b> Every response is compared as full JSON, fail-closed. Comparing by position can over-report differences but can't hide one.</p>
     <p><b>Explaining and closing them is not sound yet.</b> Most remaining differences were closed by scripts that live only on the test server and were never reviewed. A few labels contradict the harness's own rules. Two kinds of check were never done: <b>pages after the first</b>, and <b>sets inside paged block lists</b>. At the audit, 24 of the 43 kinds weren't in the public docs; the docs now cover all of them except the 2 not yet classified (#38, #39).</p>
+  </div>
+</section>
+
+<section>
+  <h2>Final comparison cycle, 27 Nov</h2>
+  <p>After the replay, a final cycle ran the endpoint suite against the stock indexers on 27 Nov and compared its match rates with the previous suite run ("run 2"). It is a reduced cycle: up to 1,000 cases per light endpoint, paired with stock, plus a sample of the heavy endpoints, at no more than 2 requests per second to stock.</p>
+  <div class="kpis">
+    <div class="kpi"><span>Rows kept</span><b>46,571</b></div>
+    <div class="kpi"><span>(a) documented</span><b>654</b></div>
+    <div class="kpi"><span>(b) new, ours</span><b>3</b></div>
+    <div class="kpi"><span>(c) harness / timing</span><b>936</b></div>
+    <div class="kpi"><span>(d) drain pending</span><b>41</b></div>
+    <div class="kpi"><span>Node checks, all ok</span><b>3,271</b></div>
+  </div>
+  <div class="card">
+    <h3>Build under test</h3>
+    <p><code>9b96aba</code> for most of the run (PRs #65–#68: stock-exact <code>minerAccount</code> and <code>parametersFilter</code> forms, the balance reconciler running beside the receivers passes, a faster balance drain with extra read nodes, optional <code>networkInfo</code> node fields). The first rows, before an 11:12Z swap, ran on <code>7db6e5b</code> (#65, #66). <code>main</code> is now <code>bc69c50</code>, which adds #69–#72: security hardening with a 4 s count window, the reconcile refill window with a per-batch tip share, and all-history unfiltered counts. No rows ran on <code>ea0c4fe</code>, so the 4 s count window was not measured live.</p>
+    <p>46,571 rows kept after dropping the swap windows, the pauses and 327 rows of chainweb-data endpoints taken off a stock host when they timed out (as in run 2). Node checks 3,271 of 3,271 ok, cross-checks 3,333 of 3,333 ok, 0 open harness errors.</p>
+  </div>
+
+  <h3>Match rates against run 2</h3>
+  <p class="sub">Match rate = (equal + allowlisted + known-gap) / (those + diff + status). Rows stock could not answer are left out. Sample rows are few (13 to 61 per endpoint), because the stock GraphQL indexer answers most heavy requests with a 504 at 30 s.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Endpoint</th><th>Coverage</th><th>n</th><th>Match</th><th>Run 2 n</th><th>Run 2 match</th><th>Note</th></tr></thead>
+    <tbody>
+    <tr><td><code>/v1/txs</code> (kda-txs)</td><td>stock</td><td class="n">1,000</td><td class="n">34.0%</td><td class="n">3,484</td><td class="n">33.0%</td><td>407 are kda-txs 404 after 30 s (#33)</td></tr>
+    <tr><td><code>fungibleAccount</code></td><td>stock</td><td class="n">1,000</td><td class="n">85.7%</td><td class="n">20,000</td><td class="n">95.8%</td><td>JS-float rows (#11, 156) no longer allowlisted; with them, 99.4%</td></tr>
+    <tr><td><code>fungibleChainAccounts</code></td><td>stock</td><td class="n">1,000</td><td class="n">90.3%</td><td class="n">20,000</td><td class="n">29.3%</td><td><span class="chip ok">up</span></td></tr>
+    <tr><td><code>fungibleChainAccount</code></td><td>stock</td><td class="n">1,000</td><td class="n">99.3%</td><td class="n">20,000</td><td class="n">93.8%</td><td><span class="chip ok">up</span></td></tr>
+    <tr><td><code>gasLimitEstimate</code></td><td>stock</td><td class="n">1,000</td><td class="n">100%</td><td class="n">20,000</td><td class="n">88.8%</td><td><span class="chip ok">up</span></td></tr>
+    <tr><td><code>graphConfiguration</code></td><td>stock</td><td class="n">1,000</td><td class="n">100%</td><td class="n">20,000</td><td class="n">100%</td><td>same</td></tr>
+    <tr><td><code>pactQuery</code></td><td>stock</td><td class="n">1,000</td><td class="n">100%</td><td class="n">20,000</td><td class="n">88.8%</td><td><span class="chip ok">up</span></td></tr>
+    <tr><td><code>lastBlockHeight</code></td><td>stock</td><td class="n">1,000</td><td class="n">94.6%</td><td class="n">20,000</td><td class="n">100%</td><td>±1 tip races (#26) no longer allowlisted</td></tr>
+    <tr><td><code>networkInfo</code></td><td>stock</td><td class="n">116</td><td class="n">26.7%</td><td class="n">20,000</td><td class="n">95.0%</td><td>stock errored on 884 of 1,000</td></tr>
+    <tr><td><code>node</code></td><td>stock</td><td class="n">730</td><td class="n">94.5%</td><td class="n">4,989</td><td class="n">95.9%</td><td></td></tr>
+    <tr><td><code>nodes</code></td><td>stock</td><td class="n">514</td><td class="n">86.2%</td><td class="n">3,181</td><td class="n">84.4%</td><td>includes the (d) rows</td></tr>
+    <tr><td><code>block</code></td><td>sample</td><td class="n">61</td><td class="n">63.9%</td><td class="n">352</td><td class="n">73.3%</td><td></td></tr>
+    <tr><td><code>blocksFromDepth</code></td><td>sample</td><td class="n">26</td><td class="n">65.4%</td><td class="n">131</td><td class="n">38.9%</td><td></td></tr>
+    <tr><td><code>blocksFromHeight</code></td><td>sample</td><td class="n">34</td><td class="n">82.4%</td><td class="n">199</td><td class="n">19.1%</td><td></td></tr>
+    <tr><td><code>completedBlockHeights</code></td><td>sample</td><td class="n">45</td><td class="n">93.3%</td><td class="n">262</td><td class="n">59.9%</td><td></td></tr>
+    <tr><td><code>events</code></td><td>sample</td><td class="n">20</td><td class="n">80.0%</td><td class="n">67</td><td class="n">31.3%</td><td></td></tr>
+    <tr><td><code>transaction</code></td><td>sample</td><td class="n">22</td><td class="n">81.8%</td><td class="n">72</td><td class="n">15.3%</td><td></td></tr>
+    <tr><td><code>transactions</code></td><td>sample</td><td class="n">17</td><td class="n">88.2%</td><td class="n">67</td><td class="n">31.3%</td><td></td></tr>
+    <tr><td><code>transactionsByPublicKey</code></td><td>sample</td><td class="n">16</td><td class="n">93.8%</td><td class="n">68</td><td class="n">38.2%</td><td></td></tr>
+    <tr><td><code>transfers</code></td><td>sample</td><td class="n">17</td><td class="n">76.5%</td><td class="n">50</td><td class="n">58.0%</td><td></td></tr>
+    <tr><td><code>fungibleAccountsByPublicKey</code></td><td>sample</td><td class="n">13</td><td class="n">69.2%</td><td class="n">34</td><td class="n">29.4%</td><td>(d) rows</td></tr>
+    <tr><td><code>fungibleChainAccountsByPublicKey</code></td><td>sample</td><td class="n">14</td><td class="n">92.9%</td><td class="n">38</td><td class="n">28.9%</td><td></td></tr>
+    <tr><td><code>nonFungibleChainAccount</code></td><td>sample</td><td class="n">15</td><td class="n">100%</td><td class="n">46</td><td class="n">41.3%</td><td></td></tr>
+    <tr><td>chainweb-data <code>/txs/recent</code></td><td>sample</td><td class="n">417</td><td class="n">0%</td><td class="n">7</td><td class="n">0%</td><td>compared by position against stock's cache (#36)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Classes of the differences</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Class</th><th>Rows</th><th>Groups</th><th>Meaning</th><th>Status</th></tr></thead>
+    <tbody>
+    <tr><td><b>(a) documented</b></td><td class="n">654</td><td class="n">40</td><td>Already described in the docs: ours follows the node, or both answers are acceptable. JS floats (#11, 162); kda-txs pairing, event order and missing rows (#31 177, #32 29, #34 39); nested block page (#7, 4); <code>NetworkInfo</code> node fields (50); guard shape and the <code>"coin "</code> name (5). Three groups run 2 met too were added to the docs now: input validation, ours <code>BAD_USER_INPUT</code> where stock answers <code>[]</code>, a value or <code>INTERNAL_SERVER_ERROR</code> (119); malformed <code>/v1/txs</code> paths, ours 400 or 200 <code>[]</code> where kda-txs answers 404 (8); stock crashes where ours answers, such as <code>Abstract type "Node" must resolve to an Object type</code> on <code>node</code>/<code>nodes</code> (61).</td><td><span class="chip info">documented</span></td></tr>
+    <tr><td><b>(b) new, looks like ours</b></td><td class="n">3</td><td class="n">1</td><td>Unfiltered <code>transfers { totalCount }</code> answered <code>COUNT_TIMEOUT</code> at the 4.9 s deadline on ours, where stock answered. Fixed by #72 (all-history counts from stored counters). After the swap to <code>bc69c50</code>: <code>transfers</code> 441,469,276 in 1.44 ms (before: <code>COUNT_TIMEOUT</code> after 4.90 s); <code>transactions</code> 230,519,399 in 0.50 ms (before: 50,619 over the last 20,000 heights, 3.39 s); <code>transactions(isCoinbase: true)</code> 370,837,002 in 0.71 ms (before: 450,589, 3.40 s). Stock now times out on these counts, so they were not compared live.</td><td><span class="chip ok">fixed</span></td></tr>
+    <tr><td><b>(c) harness, timing, stock timeout</b></td><td class="n">936</td><td class="n">31</td><td>kda-txs 404 after 30 s (#33, 407); <code>/txs/recent</code> by position (#36, 417); ±1 tip races (#26, 55); stale <code>coinsInCirculation</code> (#28, 35); row order and page window (#6, #38, #39, 10); harness tags (8); our node-read deadline under load (2) and reads before the queue drained (#25, 2), both equal on a re-query.</td><td><span class="chip info">explained</span></td></tr>
+    <tr><td><b>(d) balance drain in progress</b></td><td class="n">41</td><td class="n">5</td><td>Our stored balance rows were not filled yet: <code>…ByPublicKey</code> account lists (5) and <code>nodes</code> with a <code>FungibleAccount</code> id, <code>null</code> on ours because <code>node(id:)</code> reads the store only (36). Re-run when the drain ends; the result will be added as an addendum. The drain slowed because of the data, not the build: the oldest part of the backlog has about 48% absent keys, each re-read on its own on the primary node at the designed 50 reads per second. The previous build drains the same keys about 10% slower.</td><td><span class="chip warn">pending</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="cols">
+    <div class="card"><h3>Stock latency</h3><p>The stock GraphQL indexer's light requests (paired with stock, all cases): <b>p50 9 ms, p90 58 ms</b>, the same as in run 2.</p></div>
+    <div class="card"><h3>Stock <code>networkInfo</code></h3><p>Stock errored on <b>884 of 1,000</b> requests: the whole field was <code>null</code> with <code>Cannot return null for non-nullable field NetworkInfo.apiVersion</code> (and the other node fields). Ours answers.</p></div>
+    <div class="card"><h3>Node checks</h3><p><span class="chip ok">all ok</span> 3,271 of 3,271 node checks and 3,333 of 3,333 cross-checks. 0 open harness errors.</p></div>
   </div>
 </section>
 
@@ -213,13 +280,13 @@ footer{color:var(--muted);font-size:.82rem}
 <section>
   <h2>Before G4</h2>
   <div class="cols">
-    <div class="card"><h3>Docs</h3><ul><li>Done: the sections "Intended differences" and "Stock faults the node disproves" are in the docs.</li><li>Done: every kind found is documented, except #38 and #39, which are not classified yet.</li><li>Done: the line about stock's block order is fixed.</li><li>Open: the final stats after the remaining checks.</li></ul></div>
+    <div class="card"><h3>Docs</h3><ul><li>Done: the sections "Intended differences" and "Stock faults the node disproves" are in the docs.</li><li>Done: every kind found is documented, except #38 and #39, which are not classified yet.</li><li>Done: the line about stock's block order is fixed.</li><li>Done: the final stats of the 27 Nov cycle. The (d) addendum follows the balance drain.</li></ul></div>
     <div class="card"><h3>Harness</h3><ul><li>Set-based compare for lists.</li><li>An "incomplete" column in every table.</li><li>Move the closure scripts into the repo and get them reviewed.</li><li>Correct the mislabelled records.</li><li>Classify #38 and #39.</li></ul></div>
     <div class="card"><h3>Live checks</h3><ul><li>Page-walk compare, including the 515 blocks.</li><li>Live replay of the fixed families on the release build.</li><li><code>nonFungibleAccount</code>, <code>/txs/recent</code> and <code>/txs/search</code> against the node.</li></ul></div>
   </div>
 </section>
 
-<footer>Sources: the G4 replay report (runs 1–3), the final checks report and an independent audit, kept with the project's G4 notes. Counts from the stored results are the reports' own counts. "7 days" is the real-traffic corpus: GraphQL 16–18 Nov, REST 14–21 Nov.</footer>
+<footer>Sources: the G4 replay report (runs 1–3), the final checks report, the 27 Nov final cycle report and an independent audit, kept with the project's G4 notes. Counts from the stored results are the reports' own counts. "7 days" is the real-traffic corpus: GraphQL 16–18 Nov, REST 14–21 Nov.</footer>
 </div>
 </body>
 </html>
