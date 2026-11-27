@@ -69,7 +69,8 @@
 //! - Heartbeat: `Meta balances_reconcile_stats` (JSON: unix time, rows done, in-batch `rate`,
 //!   wall-clock `wall_rate`, dirty) per batch; not part of the systemd watchdog.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,9 @@ const MAX_TRACKED: usize = 100_000;
 pub const NOT_FUNGIBLE_AFTER: u32 = 3;
 /// Seed rows read per refill, per batch slot.
 const SEED_WINDOW: usize = 16;
+/// Percent of each batch [`refill`] reserves for the newest tail marks per chain (PR #66
+/// review I1).
+const TIP_SHARE_PCT: usize = 25;
 /// `BalanceDirty` rows per read txn during a refill.
 const SCAN_CHUNK: usize = 100_000;
 const IDLE: Duration = Duration::from_secs(2);
@@ -183,6 +187,8 @@ impl Dirty {
 }
 
 type Heap = BinaryHeap<(Mark, [u8; 9])>;
+/// Newest-kept heap ([`keep_newest`]) per chain, for the tip share.
+type TipHeaps = BTreeMap<u8, BinaryHeap<Reverse<(Mark, [u8; 9])>>>;
 
 /// Keep the `cap` oldest entries (height, then write sequence, then key).
 fn keep(h: &mut Heap, e: (Mark, [u8; 9]), cap: usize) {
@@ -228,22 +234,90 @@ fn fair(out: &mut Vec<Dirty>, by_module: HashMap<u32, Heap>, n: usize, share: us
     }
 }
 
+/// Keep the `cap` newest entries.
+fn keep_newest(h: &mut BinaryHeap<Reverse<(Mark, [u8; 9])>>, e: (Mark, [u8; 9]), cap: usize) {
+    h.push(Reverse(e));
+    if h.len() > cap {
+        h.pop();
+    }
+}
+
+/// Newest first, round-robin over chains, until `out` holds `n` (the tip share). A module
+/// other than coin takes at most its `share` (`taken` counts its rows).
+fn tip_deal(
+    out: &mut Vec<Dirty>,
+    by_chain: TipHeaps,
+    n: usize,
+    cap: Option<(usize, &mut HashMap<u32, usize>)>,
+) {
+    let lists: Vec<Vec<(Mark, [u8; 9])>> = by_chain
+        .into_values()
+        .map(|h| {
+            h.into_sorted_vec()
+                .into_iter()
+                .map(|Reverse(e)| e)
+                .collect()
+        })
+        .collect();
+    let (share, mut taken) = match cap {
+        Some((s, t)) => (s, Some(t)),
+        None => (usize::MAX, None),
+    };
+    let mut i = 0;
+    while out.len() < n {
+        let mut any = false;
+        for l in &lists {
+            if out.len() >= n {
+                break;
+            }
+            let Some(&(mark, key)) = l.get(i) else {
+                continue;
+            };
+            any = true;
+            if let Some(t) = taken.as_deref_mut() {
+                let c = t.entry(module_of(&key)).or_insert(0);
+                if *c >= share {
+                    continue;
+                }
+                *c += 1;
+            }
+            out.push(Dirty {
+                key,
+                mark,
+                seed: false,
+            });
+        }
+        if !any {
+            break;
+        }
+        i += 1;
+    }
+}
+
 /// The next batch of up to `n` dirty keys (R-P5P9-8 #1, I-7), in this order:
+/// 0. the tip share, [`TIP_SHARE_PCT`] of `n`: the newest tail marks of each chain,
+///    round-robin over chains, `coin` first, then the other modules (at most `share` each,
+///    counted with their rows in 2), so a miner's or a recent receiver's mark is not starved
+///    behind an old backlog the receivers passes (D1, D3) marked at historic heights
+///    (PR #66 review I1);
 /// 1. tail marks of `coin`, oldest first;
 /// 2. tail marks of the other modules, round-robin over modules, at most `share` each;
-/// 3. only when 1 and 2 leave room, the seed backlog (the first `SEED_WINDOW × n` rows of
+/// 3. only when 0 to 2 leave room, the seed backlog (the first `SEED_WINDOW × n` rows of
 ///    `BalanceSeed`): `coin` first, then the other modules round-robin, at most `share` each
 ///    in the fair pass; the room that is left is topped up from the window's remaining rows
 ///    without the cap (a window of one module is a full batch, not `share` rows).
 ///
 /// Tail marks are all of `BalanceDirty` (what changed since its last reconcile); every batch
-/// takes a fresh refill, so a new `coin` mark waits at most one batch, whatever other modules
-/// mark.
+/// takes a fresh refill, so a new `coin` mark waits at most one batch behind newer `coin`
+/// marks, whatever other modules mark.
 pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
     let share = share.max(1);
     let coin = balances::coin_module(&hot.ro()?)?;
+    let tip_n = n * TIP_SHARE_PCT / 100;
     let mut coin_rows = Heap::new();
     let mut by_module: HashMap<u32, Heap> = HashMap::new();
+    let mut tip_coin: TipHeaps = BTreeMap::new();
+    let mut tip_other: TipHeaps = BTreeMap::new();
     let mut after: Option<Vec<u8>> = None;
     loop {
         let rows =
@@ -254,10 +328,23 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
                 continue;
             };
             let module = module_of(&key);
+            if tip_n > 0 {
+                let tip = if Some(module) == coin {
+                    &mut tip_coin
+                } else {
+                    &mut tip_other
+                };
+                keep_newest(tip.entry(key[8]).or_default(), (m, key), tip_n);
+            }
             if Some(module) == coin {
                 keep(&mut coin_rows, (m, key), n);
             } else {
-                keep(by_module.entry(module).or_default(), (m, key), share);
+                // `share` past the tip's: the tip may take rows of the module's oldest.
+                keep(
+                    by_module.entry(module).or_default(),
+                    (m, key),
+                    share.saturating_add(tip_n),
+                );
             }
         }
         match rows.last() {
@@ -265,13 +352,35 @@ pub fn refill(hot: &HotStore, n: usize, share: usize) -> Result<Vec<Dirty>> {
             _ => break,
         }
     }
-    let mut out: Vec<Dirty> = coin_rows
-        .into_sorted_vec()
+    let mut out = Vec::with_capacity(n);
+    let mut taken: HashMap<u32, usize> = HashMap::new();
+    tip_deal(&mut out, tip_coin, tip_n, None);
+    tip_deal(&mut out, tip_other, tip_n, Some((share, &mut taken)));
+    let tipped: HashSet<[u8; 9]> = out.iter().map(|d| d.key).collect();
+    out.extend(
+        coin_rows
+            .into_sorted_vec()
+            .into_iter()
+            .filter(|(_, key)| !tipped.contains(key))
+            .take(n.saturating_sub(tipped.len()))
+            .map(|(mark, key)| Dirty {
+                key,
+                mark,
+                seed: false,
+            }),
+    );
+    // A module's rows in the tip count against its `share`.
+    let by_module: HashMap<u32, Heap> = by_module
         .into_iter()
-        .map(|(mark, key)| Dirty {
-            key,
-            mark,
-            seed: false,
+        .map(|(m, h)| {
+            let left = share.saturating_sub(taken.get(&m).copied().unwrap_or(0));
+            let h: Heap = h
+                .into_sorted_vec()
+                .into_iter()
+                .filter(|(_, key)| !tipped.contains(key))
+                .take(left)
+                .collect();
+            (m, h)
         })
         .collect();
     fair(&mut out, by_module, n, share, false);
@@ -1102,26 +1211,22 @@ async fn seed_pass(ctx: &Arc<Ctx>, stop: &CancellationToken) -> Result<bool> {
     Ok(!rep.stopped)
 }
 
-/// D1: the receivers pass of the seed (`seed_receivers`), when the store has not had it, or
-/// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
-/// store is not ready for it (review L3). It runs in [`receivers_task`], beside the reconcile
-/// loop: tail, seed and miss-feed dirty rows are reconciled while it walks (review L4 kept it
-/// inline when it was D1 alone; D3's first walk over every stored height held all of them
-/// for hours on a fresh store). Returns false when stopped.
-///
-/// D3 (`Rules::D3`): the token receivers pass, same mechanics over every stored height; after
-/// its first walk it is pending again whenever the tail grew, and walks only the new heights.
 use crate::seed_receivers::Rules;
 
 /// Clears `kdx_balance_receivers_pass{rules}` when the pass ends, however it ends.
 struct PassGauge(&'static str);
 
+/// The `rules` label of the receivers pass metrics.
+fn rules_label(rules: Rules) -> &'static str {
+    match rules {
+        Rules::D1 => "d1",
+        Rules::D3 => "d3",
+    }
+}
+
 impl PassGauge {
     fn start(rules: Rules) -> PassGauge {
-        let label = match rules {
-            Rules::D1 => "d1",
-            Rules::D3 => "d3",
-        };
+        let label = rules_label(rules);
         kdx_metrics::get()
             .balance_receivers_pass
             .get_or_create(&vec![("rules", label.into())])
@@ -1139,6 +1244,15 @@ impl Drop for PassGauge {
     }
 }
 
+/// D1: the receivers pass of the seed (`seed_receivers`), when the store has not had it, or
+/// its stored history below coin v3 grew since. Postponed (to the next recheck) while the
+/// store is not ready for it (review L3). It runs in [`receivers_task`], beside the reconcile
+/// loop: tail, seed and miss-feed dirty rows are reconciled while it walks (review L4 kept it
+/// inline when it was D1 alone; D3's first walk over every stored height held all of them
+/// for hours on a fresh store). Returns false when stopped.
+///
+/// D3 (`Rules::D3`): the token receivers pass, same mechanics over every stored height; after
+/// its first walk it is pending again whenever the tail grew, and walks only the new heights.
 async fn receivers_pass(
     ctx: &Arc<Ctx>,
     stop: &CancellationToken,
@@ -1182,32 +1296,60 @@ async fn receivers_pass(
 /// Pause before a failed receivers pass is tried again (from its persisted cursor).
 const RECEIVERS_RETRY: Duration = Duration::from_secs(60);
 
+/// `kdx_balance_receivers_pass_failed{rules}`: 1 while the last attempt failed, else 0.
+fn set_pass_failed(rules: Rules, failed: bool) {
+    kdx_metrics::get()
+        .balance_receivers_pass_failed
+        .get_or_create(&vec![("rules", rules_label(rules).into())])
+        .set(i64::from(failed));
+}
+
+/// One round of the receivers passes: D1, then D3 even when D1 failed (separate cursors,
+/// PR #66 review I2). `failed` gets each attempt's outcome (the service sets
+/// `kdx_balance_receivers_pass_failed{rules}`, [`set_pass_failed`]). Returns the pause before
+/// the next round ([`RECEIVERS_RETRY`] after a failure, else [`RECHECK_SCAN`]), or `None`
+/// when a pass was stopped.
+async fn receivers_round<F, Fut, G>(mut pass: F, mut failed: G) -> Option<Duration>
+where
+    F: FnMut(Rules) -> Fut,
+    G: FnMut(Rules, bool),
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let mut pause = RECHECK_SCAN;
+    for rules in [Rules::D1, Rules::D3] {
+        let r = pass(rules).await;
+        failed(rules, r.is_err());
+        match r {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    ?rules,
+                    "balances: receivers pass failed; retried later from its cursor"
+                );
+                pause = RECEIVERS_RETRY;
+            }
+        }
+    }
+    Some(pause)
+}
+
 /// The D1 and D3 receivers passes in their own task, beside the reconcile loop (like
 /// [`history_task`]): D1 then D3 at once, then again every [`RECHECK_SCAN`] after the last
 /// round ended (D1: a tail still below coin v3 stores new pre-v3 txs; D3: the new heights of
-/// the tail). This task is the only caller in the service, so a recheck never starts a pass
-/// while one is running. Each pass resumes from its persisted cursor and commits per chunk;
-/// `stop` ends it within one chunk. Errors are logged and retried after [`RECEIVERS_RETRY`],
-/// never fatal, as for the history walk.
+/// the tail). A "not ready" or "no coin" postpone also waits the full [`RECHECK_SCAN`]. This
+/// task is the only caller in the service, so a recheck never starts a pass while one is
+/// running. Each pass resumes from its persisted cursor and commits per chunk; `stop` ends it
+/// within one chunk. Errors are logged, raise `kdx_balance_receivers_pass_failed`, and are
+/// retried after [`RECEIVERS_RETRY`], never fatal, as for the history walk.
 async fn receivers_task(ctx: Arc<Ctx>, stop: CancellationToken) {
     tracing::info!("balances: receivers pass task started (D1, D3)");
     loop {
-        let mut pause = RECHECK_SCAN;
-        for rules in [Rules::D1, Rules::D3] {
-            match receivers_pass(&ctx, &stop, rules).await {
-                Ok(true) => {}
-                Ok(false) => return,
-                Err(e) => {
-                    tracing::warn!(
-                        error = format!("{e:#}"),
-                        ?rules,
-                        "balances: receivers pass failed; retried later from its cursor"
-                    );
-                    pause = RECEIVERS_RETRY;
-                    break;
-                }
-            }
-        }
+        let pass = |rules| receivers_pass(&ctx, &stop, rules);
+        let Some(pause) = receivers_round(pass, set_pass_failed).await else {
+            return;
+        };
         tokio::select! {
             _ = stop.cancelled() => return,
             _ = tokio::time::sleep(pause) => {}
@@ -1334,8 +1476,13 @@ async fn discovery_step(ctx: &Arc<Ctx>, local: &LocalClient) -> Result<()> {
             Err(LocalError::Node(_) | LocalError::Skipped(_)) => None,
         })
         .collect();
-    let (tracked, rejected) =
-        crate::seed_receivers::check_discovered(&ctx.hot, &ctx.dict, &queued, &verdicts)?;
+    // The dictionary mutex may be held by a receivers pass for a whole chunk write: wait for
+    // it on a blocking thread, not a runtime worker (PR #66 review M4).
+    let c = ctx.clone();
+    let (tracked, rejected) = tokio::task::spawn_blocking(move || {
+        crate::seed_receivers::check_discovered(&c.hot, &c.dict, &queued, &verdicts)
+    })
+    .await??;
     if tracked + rejected > 0 {
         tracing::info!(tracked, rejected, "balances: D3 discovered modules checked");
     }
@@ -2669,6 +2816,79 @@ pub(crate) mod tests {
         txn.commit().unwrap();
     }
 
+    /// PR #66 review I2: a D1 failure does not keep D3 from running in the same round, and
+    /// `kdx_balance_receivers_pass_failed{rules}` is 1 while the last attempt failed, 0 after
+    /// one succeeds.
+    #[tokio::test]
+    async fn a_failed_d1_pass_still_runs_d3_and_raises_its_failed_gauge() {
+        let ran = std::sync::Mutex::new(Vec::new());
+        let mut gauge = HashMap::new();
+        let mut set = |r: Rules, f: bool| {
+            gauge.insert(rules_label(r), f);
+        };
+        let pause = receivers_round(
+            |r| {
+                ran.lock().unwrap().push(r);
+                async move {
+                    match r {
+                        Rules::D1 => Err(anyhow::anyhow!("d1 broke")),
+                        Rules::D3 => Ok(true),
+                    }
+                }
+            },
+            &mut set,
+        )
+        .await;
+        assert_eq!(*ran.lock().unwrap(), vec![Rules::D1, Rules::D3]);
+        assert_eq!(pause, Some(RECEIVERS_RETRY));
+        assert_eq!((gauge["d1"], gauge["d3"]), (true, false));
+        let pause = receivers_round(|_| async { Ok(true) }, &mut |r, f| {
+            gauge.insert(rules_label(r), f);
+        })
+        .await;
+        assert_eq!(pause, Some(RECHECK_SCAN));
+        assert_eq!((gauge["d1"], gauge["d3"]), (false, false));
+        let stopped = receivers_round(|_| async { Ok(false) }, &mut |_, _| {}).await;
+        assert_eq!(stopped, None);
+    }
+
+    /// PR #66 review I1: a large backlog of old coin marks (D1/D3 at historic heights) does
+    /// not starve the tip. A miner's mark at the newest height of its chain is in the first
+    /// batch (the tip share is coin first, so the token's tip mark waits for the fair pass).
+    #[test]
+    fn the_tip_gets_its_share_of_a_batch_behind_an_old_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hot, coin, _) = setup(dir.path(), &[]);
+        let tok = intern(&hot, DictKind::Module, &["free.tok"])[0];
+        let names: Vec<String> = (0..500).map(|i| format!("old{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let old = intern(&hot, DictKind::Account, &refs);
+        let tip = intern(&hot, DictKind::Account, &["miner", "recv"]);
+        assert!(refill(&hot, 16, 4).unwrap().is_empty());
+        {
+            let mut txn = hot.rw().unwrap();
+            for (i, &a) in old.iter().enumerate() {
+                balances::mark_dirty(&mut txn, a, coin, (i % 3) as u8, 10 + i as u32).unwrap();
+                balances::mark_dirty(&mut txn, a, tok, 1, 10 + i as u32).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        // Marked last, at the chain's newest height.
+        mark(&hot, tip[0], coin, 1, 5000);
+        mark(&hot, tip[1], tok, 1, 5000);
+        let b = refill(&hot, 16, 4).unwrap();
+        assert_eq!(b.len(), 16);
+        let has = |k: [u8; 9]| b.iter().any(|d| d.key == k && !d.seed);
+        assert!(
+            has(balances::bal_key(tip[0], coin, 1)),
+            "miner in the first batch"
+        );
+        // The rest of the batch is still the oldest coin backlog, coin first.
+        assert!(has(balances::bal_key(old[0], coin, 0)));
+        let coin_rows = b.iter().filter(|d| module_of(&d.key) == coin).count();
+        assert!(coin_rows >= 16 - TIP_SHARE_PCT * 16 / 100, "{coin_rows}");
+    }
+
     /// I-7, R-P5P9-8 #1: older marks of a spam module do not delay a coin mark past the first
     /// batch; the spam module gets its share; tail marks go before the seed backlog, coin first.
     #[test]
@@ -3583,10 +3803,14 @@ mod miner_rows {
     }
 
     /// A fresh store (seed done, D1 done, the first D3 pass pending): `run` reconciles the
-    /// miner's tail mark while the first D3 receivers pass is still walking. The pass is held
-    /// mid-walk on the shared dictionary lock (its first chunk write takes it; the loop never
-    /// does), so the order is deterministic: the miner row must appear with
-    /// `balances_seed_token_receivers` still absent, and the pass must then finish.
+    /// miner's tail mark while the first D3 receivers pass is pending. The test holds the
+    /// shared dictionary lock, so the pass blocks at its start (`run` snapshots the dictionary
+    /// before it walks anything; the loop never takes the lock here), and the order is
+    /// deterministic: the miner row must appear with `balances_seed_token_receivers` still
+    /// absent, and the pass must then finish once the lock is released. On the old inline
+    /// order the loop never starts and the test times out. It proves the loop is not gated on
+    /// the pass; no real pass mark interleaves with a loop batch here (the interleave test
+    /// covers the three orders against the pass's write).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tail_marks_are_reconciled_while_the_first_d3_pass_runs() {
         let dir = tempfile::tempdir().unwrap();

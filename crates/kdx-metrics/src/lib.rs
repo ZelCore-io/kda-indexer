@@ -83,6 +83,9 @@ pub struct Metrics {
     pub balance_dirty_rows: Gauge,
     /// 1 while a balance receivers pass walks (`rules` = d1 | d3), else 0.
     pub balance_receivers_pass: Gau,
+    /// 1 while the last attempt of a receivers pass (`rules` = d1 | d3) failed, 0 after one
+    /// succeeds (PR #66 review I2).
+    pub balance_receivers_pass_failed: Gau,
     /// `/local` reconcile outcomes: `result` = ok | absent | error | invalid | skipped | parked.
     pub balance_reconcile: Count,
     /// Duration of one `/local` reconcile call (`result` as above).
@@ -313,6 +316,11 @@ impl Metrics {
             "1 while a balance receivers pass walks the stored history (rules d1|d3)",
             Gau::default()
         );
+        let balance_receivers_pass_failed = reg!(
+            "kdx_balance_receivers_pass_failed",
+            "1 while the last attempt of a balance receivers pass failed and retries (rules d1|d3)",
+            Gau::default()
+        );
         let balance_reconcile = reg!(
             "kdx_balance_reconcile",
             "Balance reconcile outcomes (result ok|absent|error|invalid|skipped|parked)",
@@ -459,6 +467,7 @@ impl Metrics {
             dict_snapshot_names,
             balance_dirty_rows,
             balance_receivers_pass,
+            balance_receivers_pass_failed,
             balance_reconcile,
             balance_reconcile_seconds,
             graphql_requests,

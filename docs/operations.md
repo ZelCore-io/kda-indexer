@@ -532,12 +532,15 @@ node_exporter textfile when `metrics.textfile` is set (see [install.md](install.
 | `kdx_merkle_blocks_total` | result (verified, mismatch_legacy, mismatch) |
 | `kdx_chain_counters_unpriced_total` | mode (backfill, tail): user txs added to `countersOfEachChain` with 0 gas because their `gasPrice` did not parse |
 | `kdx_fill_failures_total`, `kdx_fill_failed`, `kdx_fill_timeouts_total` | fill (prices, dex, token_chains): failed attempts of a one-off fill (retried with backoff), 1 while the last attempt failed, attempts stopped by the 24 h per-attempt timeout |
+| `kdx_balance_receivers_pass`, `kdx_balance_receivers_pass_failed` | rules (d1, d3): 1 while a balances receivers pass walks; 1 while the last attempt of that pass failed and it retries a minute later, 0 after an attempt succeeds |
 | `kdx_dex_ranked_neighbors_capped_total` | price searches that ranked only the oldest 1,024 pairs of a token with more |
 
 Alerts to set up in your own alerting:
 
 - chain lag above 20 blocks for 5 minutes on any chain (`kdx_chain_lag_blocks`);
 - any `kdx_chain_halted` equal to 1 (see "Halted chains" above);
+- `kdx_balance_receivers_pass_failed` equal to 1 for 15 minutes (a receivers pass keeps
+  failing; the log line `balances: receivers pass failed` has the error);
 - any increase of `kdx_merkle_blocks_total` with `result` other than `verified`
   (`mismatch_legacy` or `mismatch`: every era must verify);
 - any increase of `kdx_chain_counters_unpriced_total` (`totalGasUsedInKda` is then short of
@@ -828,17 +831,29 @@ already has a `Balances` row is skipped (the tail keeps it correct). Fork height
 network; a network this build has no heights for uses mainnet01's and logs a warning.
 
 - **It runs beside the reconcile loop**, in the service's receivers task (D1, then D3, then
-  both again an hour after the round ended). The loop starts right after the posting seed, so
-  the tail's, the seed's and the GraphQL miss feed's dirty rows are reconciled while the pass
-  walks the segments (minutes to a few hours on mainnet); the rows it marks are read as the
-  loop reaches them. Before this change the pass ran inline and held every `Balances` and
-  `KeyAccounts` write until it ended. Its progress is logged every 1M txs, and the gauge
+  both again an hour after the round ended; a pass postponed because the store is not ready
+  or has no coin module yet also waits that full hour). The loop starts right after the
+  posting seed, so dirty rows are reconciled while the pass walks the segments (minutes to a
+  few hours on mainnet); the rows it marks are read as the loop reaches them. Before this
+  change the pass ran inline and held every `Balances` and `KeyAccounts` write until it
+  ended. Its progress is logged every 1M txs, and the gauge
   `kdx_balance_receivers_pass{rules="d1"}` is 1 while it walks.
+- **Batch order while the passes mark.** D1 and D3 mark rows at the credit's historic
+  height, and the loop takes coin marks oldest first, so a large pass backlog would hold the
+  tip back. Each batch therefore reserves a quarter of its slots for the newest tail marks of
+  each chain (round-robin over chains, coin first, then the other modules within their
+  share): a miner's or a recent receiver's coin row is read within a batch or two. The other
+  three quarters go to the oldest coin marks, then the other modules round-robin; tail marks
+  of tokens outside the tip share, and the seed backlog, wait until the older coin backlog
+  drains. Watch `kdx_balance_dirty_rows` fall, against the pass report's `dirty_inserted`.
 - The pass and the loop may touch the same row in either order: a row the loop read at or
   above the credit's height is skipped, and a mark the pass writes after the loop read the
   old one survives the loop's compare-and-clear, so the row is read again. The final value is
   exact either way. A failed pass is logged (`balances: receivers pass failed`) and retried a
-  minute later from its cursor; it does not stop the loop.
+  minute later from its cursor; it does not stop the loop, and a D1 failure does not keep D3
+  from running in the same round (separate cursors). While the last attempt failed,
+  `kdx_balance_receivers_pass_failed{rules="d1|d3"}` is 1 (0 after an attempt succeeds);
+  alert on it staying 1, since the walk gauge alone reads 0 between attempts.
 - Count it first, read-only (no lock, beside the service):
   `reconcile-balances --seed --dry-run` prints `candidates`, `new_accounts`, `skipped_existing`
   and `dirty_inserted` (rows it would mark). The posting seed does not run.
@@ -870,9 +885,15 @@ The token receivers pass marks the same rows for stored history, with its own fl
 (resumable, `stop` polled per chunk, refused until the backfill is complete and the tail has
 started, run beside the reconcile loop in the same receivers task right after D1). It walks
 every stored height, not only those below coin v3. On a fresh store that first walk takes
-hours; the loop reconciles the tail's marks (miners included) and the seed backlog meanwhile,
+hours; the loop reconciles meanwhile, the newest tail marks of each chain (miners included)
+in each batch's tip share and the rest after the older coin marks (see *Batch order* above),
 and `kdx_balance_receivers_pass{rules="d3"}` is 1 while it walks (`--status`:
-`seed_token_receivers_in_progress`). A restart resumes it from its cursor; no reindex. Each row is marked at the
+`seed_token_receivers_in_progress`). A restart resumes it from its cursor; no reindex. The
+first pass stores the tokens queued for a history walk when it started
+(`Meta balances_seed_token_receivers_start`) and clears only their queue entries at its end: a
+token tracked while it ran (by the pass itself, the tail or a confirmed discovery) was walked
+only from the cursor of a resumed attempt, so it keeps its entry and the history walk covers
+it from height 0. Each row is marked at the
 height of the latest tx that names it, like a posting; a verified `Balances` row is skipped only
 when it was read at or above that height (`as_of`), so a row read before the credit is re-read.
 After the first walk it is pending again whenever the tail grew, and the service's hourly
@@ -1010,8 +1031,9 @@ node reads the pass would cause. `--status` shows `seed_token_receivers_height`,
 `seed_token_receivers_in_progress`, `seed_token_receivers_errors`, `d3_discover_queued`,
 `d3_discover_pending` and `d3_rewalk_pending`. To force a rerun, delete `Meta balances_seed_token_receivers`.
 
-Run the first pass with the service stopped, or restart the service in a quiet window: the
-service runs it inline at start (about 2.4 h on mainnet) and the reconcile loop waits for it.
+The service runs the first pass by itself in its receivers task (about 2.4 h on mainnet),
+beside the reconcile loop, which does not wait for it. Running it by hand with the service
+stopped (`reconcile-balances --seed`) is still possible.
 After the repair, the verify scan must show 0 missing rows, including indirect token credits
 with no event of the token after the events fork (another module crediting it, review L4).
 
@@ -1182,7 +1204,8 @@ opened before that `run` sees the table only after a restart, as with the P6 tab
   namespace, seen on chain 1) is not trusted by default: it is not the `marmalade-v2`
   deployment. Add it to `[nft] ledgers` to index it; its rows keep its own ledger id.
 - Metrics: `kdx_balance_dirty_rows`, `kdx_balance_receivers_pass{rules="d1|d3"}` (1 while a
-  receivers pass walks), `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
+  receivers pass walks), `kdx_balance_receivers_pass_failed{rules="d1|d3"}` (1 while the last
+  attempt of that pass failed and retries, like `kdx_fill_failed`), `kdx_balance_reconcile_total{result="ok|other_branch|absent|error|invalid|skipped|parked|capped|not_fungible"}`
   and `kdx_balance_reconcile_seconds`. A dirty count that only grows while the rate is zero
   means the node is refusing `/local` calls (see the log line `balances: node errors`).
 
