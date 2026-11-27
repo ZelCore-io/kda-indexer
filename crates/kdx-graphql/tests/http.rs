@@ -907,3 +907,128 @@ async fn an_integer_id_beyond_i64_is_a_200_null() {
     .await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// `[api.request_log]` on the GraphQL router: posts each body from a given peer and returns
+/// the log lines written.
+async fn logged_lines(posts: Vec<(&'static str, String)>, max_body_bytes: usize) -> Vec<Value> {
+    use kdx_api::reqlog::{layer, ClientIp, RequestLog, Settings};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let log = RequestLog::start(Settings {
+        path: path.clone(),
+        max_bytes: 1 << 20,
+        keep: 1,
+        sample_rate: 1.0,
+        max_body_bytes,
+        queue: 64,
+        queue_max_bytes: 8 << 20,
+        client_ip: ClientIp::Hash,
+    })
+    .unwrap();
+    let api = Api::new(
+        Arc::new(
+            Store::open(
+                Arc::new(
+                    kdx_hot::HotStore::open(
+                        &dir.path().join("hot"),
+                        kdx_hot::Geometry {
+                            max_gb: 1,
+                            growth_mb: 16,
+                        },
+                    )
+                    .unwrap(),
+                ),
+                dir.path(),
+            )
+            .unwrap(),
+        ),
+        ApiSettings {
+            network: "mainnet01".into(),
+            deadline: Duration::from_secs(5),
+            max_in_flight: 16,
+            max_body_bytes: 8 << 20,
+            v1txs_max_body_bytes: 8 << 20,
+            v1txs_deadline: Duration::from_secs(30),
+            rate_per_ip: 20,
+            rate_burst: 40,
+            trusted_proxies: Vec::new(),
+            read_threads: 2,
+            ready_max_lag: 10,
+            max_event_lists: 64,
+        },
+        TipWatch::default(),
+    )
+    .request_log(log.clone());
+    let st = api.state();
+    let n = posts.len();
+    for (peer, body) in posts {
+        let app = router(build_schema(st.clone(), GraphqlSettings::default(), None))
+            .layer(axum::middleware::from_fn_with_state(
+                ("graphql", log.clone(), st.clone()),
+                layer,
+            ))
+            .with_state(st.clone());
+        let mut req = Request::post("/graphql")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            format!("{peer}:4000")
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        ));
+        let _ = app.oneshot(req).await.unwrap();
+    }
+    let t = Instant::now();
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if lines.len() >= n || t.elapsed() > Duration::from_secs(10) {
+            return lines;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_log_marks_loopback_and_keeps_a_non_json_body_length() {
+    let lines = logged_lines(
+        vec![
+            (
+                "127.0.0.1",
+                json!({ "query": "{ __typename }" }).to_string(),
+            ),
+            ("[::1]", json!({ "query": "{ __typename }" }).to_string()),
+            (
+                "198.51.100.7",
+                json!({ "query": "{ __typename }" }).to_string(),
+            ),
+            ("198.51.100.7", "this is not json".to_string()),
+            ("127.0.0.1", "[]".to_string()),
+            ("127.0.0.1", "{\"query\": 1}".to_string()),
+        ],
+        4096,
+    )
+    .await;
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines[0]["local"], true);
+    assert_eq!(lines[1]["local"], true);
+    assert!(lines[2].get("local").is_none());
+    assert!(lines[2].get("gql").is_some());
+    // A 400 for a body that is not JSON still carries its length, as the docs promise.
+    assert_eq!(lines[3]["status"], 400);
+    assert_eq!(lines[3]["gql_cut"], true);
+    assert_eq!(lines[3]["gql_len"], "this is not json".len());
+    assert!(lines[3].get("gql").is_none() && lines[3].get("local").is_none());
+    // Other 400s (empty batch, a request with a bad field) are logged with their body too.
+    assert_eq!(lines[4]["status"], 400);
+    assert_eq!(lines[4]["gql"], json!([]));
+    assert_eq!(lines[4]["local"], true);
+    assert_eq!(lines[5]["status"], 400);
+    assert_eq!(lines[5]["gql"]["query"], 1);
+    let all = serde_json::to_string(&lines).unwrap();
+    assert!(!all.contains("127.0.0.1") && !all.contains("198.51.100.7"));
+}

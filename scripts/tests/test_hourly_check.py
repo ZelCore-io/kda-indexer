@@ -63,6 +63,21 @@ class WindowAndFiles(unittest.TestCase):
             self.assertEqual([e["t"] for e in got], [T0 + 5])
             self.assertEqual(c["bad-line"], 3)
 
+    def test_local_lines_are_skipped_and_counted(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "r.jsonl")
+            lines = [rest("/stats", "/stats", t=T0 + 1),
+                     rest("/stats", "/stats", t=T0 + 2, local=True),
+                     rest("/txs/recent", "/txs/recent", t=T0 + 3, local=False),
+                     rest("/stats", "/stats", t=T0 + 3_600_001, local=True)]  # outside the hour
+            with open(p, "w") as f:
+                f.write("".join(json.dumps(e) + "\n" for e in lines))
+            os.utime(p, (T0 / 1000 + 60, T0 / 1000 + 60))
+            c = H.collections.Counter()
+            got = list(H.read_window(H.log_files(p), T0, T0 + 3_600_000, c))
+            self.assertEqual([e["t"] for e in got], [T0 + 1, T0 + 3])
+            self.assertEqual(c["skipped-local"], 1)
+
 
 class Shapes(unittest.TestCase):
     def test_rest_shape_is_route_and_param_names(self):
@@ -282,6 +297,15 @@ class EndToEnd(unittest.TestCase):
         return dict(H.DEFAULTS, log=log, compare_bin=fake, compare_config="x.toml", out_dir=d,
                     recheck_delay_s=0, native_url="http://127.0.0.1:9", admin_url="http://127.0.0.1:9",
                     node_url="http://127.0.0.1:9")
+
+    def test_local_lines_never_reach_the_sample_or_report(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {"FAKE_STATE": os.path.join(d, "n")}):
+            cfg = self.setup(d, rest("/txs/events", "/txs/events", local=True),
+                             rest("/txs/search", "/txs/search", local=True))
+            rep = H.run(cfg, "2026-11-27T12", T0, T0 + 3_600_000, True)
+            self.assertEqual((rep["lines"], rep["sampled"], rep["skipped_local"]), (3, 3, 2))
+            self.assertIn("skipped_local 2", H.summary_text(dict(rep, status="PASS", reasons=[])))
 
     def test_replay_recheck_and_report(self):
         with tempfile.TemporaryDirectory() as d, \

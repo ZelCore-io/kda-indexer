@@ -159,6 +159,27 @@ async fn post_handler(
             );
         }
     };
+    // `[api.request_log]`: the body goes to the log through the response, kept only when it
+    // fits the log's body cap (else just its length), so the queue never holds a large body.
+    // Taken before parsing, so a body that is not JSON or is rejected (a 400) is logged too.
+    let logged = st.request_log().map(|l| l.graphql_body(&bytes));
+    let mut resp = post_parsed(schema, &st, peer, &headers, s, bytes, run).await;
+    if let Some(b) = logged {
+        resp.extensions_mut().insert(b);
+    }
+    resp
+}
+
+/// The rest of a POST once the body is read: parse, then execute.
+async fn post_parsed(
+    schema: Arc<KdxSchema>,
+    st: &Arc<ApiState>,
+    peer: Option<SocketAddr>,
+    headers: &axum::http::HeaderMap,
+    s: &crate::GraphqlSettings,
+    bytes: Bytes,
+    run: kdx_api::RunDeadline,
+) -> HttpResponse {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return bad("request body is not JSON");
     };
@@ -191,15 +212,8 @@ async fn post_handler(
             Err(m) => return bad(m),
         },
     };
-    // `[api.request_log]`: the body goes to the log through the response, kept only when it
-    // fits the log's body cap (else just its length), so the queue never holds a large body.
-    let logged = st.request_log().map(|l| l.graphql_body(&bytes));
     drop(bytes);
-    let mut resp = execute(schema, &st, peer, &headers, batch, run).await;
-    if let Some(b) = logged {
-        resp.extensions_mut().insert(b);
-    }
-    resp
+    execute(schema, st, peer, headers, batch, run).await
 }
 
 /// The request's shared deadline: the guard's, else (no guard, as in tests) one from now
