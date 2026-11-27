@@ -687,25 +687,6 @@ fn check_n(n: Option<i32>) -> ApiResult<()> {
 
 /// Stock's `getPaginationParams` + `getPageInfo` over `items` sorted by rank descending
 /// (default page `default`).
-/// The rows a page serves as [`crate::connection::served_page`] counts them (the query gates'
-/// count): `first: 0` / `last: 0` with a cursor is 0 rows, without one the default page.
-fn page_rows(
-    first: Option<i32>,
-    last: Option<i32>,
-    after: bool,
-    before: bool,
-    default: usize,
-) -> u64 {
-    crate::connection::served_page(
-        first.map(i64::from),
-        last.map(i64::from),
-        after,
-        before,
-        default as u64,
-    )
-    .1
-}
-
 pub fn stock_page<T: Clone>(
     items: &[(u128, T)],
     after: Option<&str>,
@@ -716,10 +697,6 @@ pub fn stock_page<T: Clone>(
 ) -> ApiResult<(Vec<(String, T)>, PageInfo)> {
     check_n(first)?;
     check_n(last)?;
-    // A zero page with a cursor serves no rows, as both query gates price it.
-    if page_rows(first, last, after.is_some(), before.is_some(), default) == 0 {
-        return Ok((Vec::new(), PageInfo::default()));
-    }
     let n = |x: Option<i32>| x.filter(|v| *v > 0).map_or(default, |v| v as usize);
     let (limit, desc, rows): (usize, bool, Vec<&(u128, T)>) = if let Some(a) = after {
         let a = parse_int(a).unwrap_or(0);
@@ -988,12 +965,6 @@ pub fn pool_transactions(
         .filter(|n| *n > 0)
         .or(a.last.filter(|n| *n > 0))
         .unwrap_or(10) as usize;
-    // A zero page with a cursor serves no rows, as both query gates price it.
-    let limit = if page_rows(a.first, a.last, after.is_some(), before.is_some(), 10) == 0 {
-        0
-    } else {
-        limit
-    };
     let desc = a.last.is_none_or(|n| n <= 0) || a.first.is_some_and(|n| n > 0);
     let mut got: Vec<(u128, StoredEvent)> = Vec::new();
     let mut total = 0i64;
@@ -1743,24 +1714,20 @@ mod paging_tests {
         (0..50u32).rev().map(|i| (u128::from(i), i)).collect()
     }
 
-    /// A zero page with a cursor serves no rows, as `connection::served_page` (and so both
-    /// query gates) count it; without a cursor it is the default page.
+    /// Stock's `getPaginationParams`: `first: 0` / `last: 0` is the default page, with a
+    /// cursor or without (M-1: stock-exact; the served budget prices it at the default page).
     #[test]
-    fn a_zero_page_with_a_cursor_serves_no_rows() {
+    fn a_zero_page_is_the_default_page() {
         let it = items();
         let after = enc(999_999);
         let before = enc(0);
         let (p, _) = stock_page(&it, Some(&after), None, Some(0), None, 20).unwrap();
-        assert!(p.is_empty(), "{}", p.len());
+        assert_eq!(p.len(), 20);
         let (p, _) = stock_page(&it, None, Some(&before), None, Some(0), 20).unwrap();
-        assert!(p.is_empty(), "{}", p.len());
+        assert_eq!(p.len(), 20);
         let (p, _) = stock_page(&it, None, None, Some(0), None, 20).unwrap();
         assert_eq!(p.len(), 20);
         let (p, _) = stock_page(&it, Some(&after), None, None, None, 20).unwrap();
         assert_eq!(p.len(), 20);
-        assert_eq!(page_rows(Some(0), None, true, false, 10), 0);
-        assert_eq!(page_rows(None, Some(0), false, true, 10), 0);
-        assert_eq!(page_rows(Some(0), None, false, false, 10), 10);
-        assert_eq!(page_rows(Some(3), None, true, false, 10), 3);
     }
 }

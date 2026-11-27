@@ -79,6 +79,20 @@ const PAGED: &[&str] = &[
     "tokens",
 ];
 
+/// Stock's DEX lists (`Query.pools`, `liquidityPositions`, `poolTransactions`, `tokens`, and
+/// `Pool.transactions`, also when it serves the page of `Query.pool`): a page of 0 is their
+/// default page, cursor or not.
+fn dex_list(name: &str, parent: Option<&str>) -> bool {
+    match parent {
+        Some("Query") => matches!(
+            name,
+            "pools" | "liquidityPositions" | "poolTransactions" | "tokens"
+        ),
+        Some("Pool") => name == "transactions",
+        _ => false,
+    }
+}
+
 /// Lists that clamp at `wide_page` instead of `max_page`: the block lists and account
 /// balances (R-P5P9-20).
 const WIDE: &[&str] = &[
@@ -603,6 +617,13 @@ impl<'a> Walk<'a> {
         }
         let first = fa.val().and_then(Self::int);
         let last = la.val().and_then(Self::int);
+        // Stock's DEX lists serve their default page for `first: 0` / `last: 0`, with a
+        // cursor or without (their `getPaginationParams`): priced so (M-1).
+        let (first, last) = if dex_list(name, parent) {
+            (first.filter(|n| *n > 0), last.filter(|n| *n > 0))
+        } else {
+            (first, last)
+        };
         let asked = |n: Option<i64>| n.map_or(0, |n| n.max(0) as u64);
         let q = match self.arg(f, "quantity") {
             Arg::Val(v) => Self::int(&v),
@@ -1476,8 +1497,12 @@ mod tests {
         };
         let absent = charts("").unwrap_or(u64::MAX);
         assert!(absent >= 20 * 10 * DEX_LIST_COST, "{absent}");
-        // The list read itself, and no `charts` (no pool is served).
-        assert!(charts("(first: 0, after: \"OTk5OTk5\")").unwrap() < 2 * DEX_LIST_COST);
+        // A zero page with a cursor serves the default page (stock), and is priced so: the
+        // aliased charts of every served pool count (M-1).
+        let zero = charts("(first: 0, after: \"OTk5OTk5\")").unwrap_or(u64::MAX);
+        assert!(zero >= 20 * 10 * DEX_LIST_COST, "{zero}");
+        let zero = charts("(last: 0, before: \"MA==\")").unwrap_or(u64::MAX);
+        assert!(zero >= 20 * 10 * DEX_LIST_COST, "{zero}");
         for f in ["liquidityPositions", "poolTransactions", "tokens"] {
             let one = served(
                 &format!("{{ {f}(first: 1) {{ edges {{ cursor }} }} }}"),
@@ -1498,6 +1523,8 @@ mod tests {
         };
         // Each of the 1000 forwarded rows is priced (at least 1 per edge).
         assert!(pool(", first: 1000") >= pool(", first: 1") + 999);
+        // A forwarded zero page with a cursor is the default page.
+        assert!(pool(", first: 0, after: \"OTk5OTk5\"") >= pool(", first: 1") + 9);
         // Arguments of its own win over the forwarded ones.
         let own = served(
             "{ pool(id: \"x\", first: 1000) { transactions(first: 1) { edges { node { c: __typename } } } } }",
