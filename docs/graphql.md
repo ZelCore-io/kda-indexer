@@ -209,7 +209,11 @@ These refusals are safety, not parity: each is a document stock answers slowly, 
 runs out of memory on, or that only an attack sends. Stock has none of them:
 - 20,000 fields after fragment expansion, 8 directives, the introspection cost of 100,000, the
   parser nesting of 64, and the query, variables and body size caps (attack shapes);
-- more than 2 deferred `totalCount` walks in one operation (each walks a whole account list);
+- more than 2 deferred `totalCount` walks in one operation (each walks a whole account list).
+  Every list `totalCount` but a block's or a tx's own counts toward the 2, including those
+  that usually answer from stored counters (the all-history counts below): the limit is
+  priced from the document, before it is known whether the counters are ready, so a count
+  that would walk cannot be told from one that would not;
 - a request (a batch: all its operations together) whose read budget is over 1,100,000 rows,
   for example many aliases of `transactions(first: 0) { … events(first: 0) … }`, which stock's
   gate prices at 0 while each serves 20 × 20 rows;
@@ -535,7 +539,8 @@ the oracle puts them.
 - **`transactions` sources**: `requestKey`, else `blockHash`, else `accountName` (txs
   touching the account), else `fungibleName` (txs with a `<token>.TRANSFER` event, all
   history); with none of them, every user tx from the tip down (at most 20,000 heights), as
-  a latest-transactions list asks. Beside `accountName`, `requestKey` or `blockHash`,
+  a latest-transactions list asks (its `totalCount` still counts all history, as stock's:
+  see `totalCount`, all-history counts). Beside `accountName`, `requestKey` or `blockHash`,
   `fungibleName` keeps the txs with any event of that module, as stock does (`EXISTS` on
   `Events.module`, indexer-kadena `90a4be1`). **Known difference (deliberate):**
   `fungibleName` without those (alone, or with `chainId`, heights or `minimumDepth`) lists
@@ -654,17 +659,60 @@ the oracle puts them.
       `transactions(fungibleName)`; `transactionsByPublicKey`;
     - `events(qualifiedEventName)`;
     - each with `chainId`, and the transaction lists with `isCoinbase: true`.
+  - *All-history counts* (no walk): a `transactions` or fungible `transfers` list with no
+    selective argument (no account, key, event name, `fungibleName`, block or request key)
+    and no `minHeight`, `maxHeight` or `minimumDepth` answers stock's number, which counts
+    the whole history, not the 20,000 heights the list itself walks:
+    - `transactions` (with or without `chainId`): the user txs of the stored per-chain
+      counters (`countersOfEachChain.transactionCount`, coinbases excluded); with
+      `isCoinbase: true` plus one coinbase per block, genesis to the tip. Stock sums its
+      `Counters` table (`canonicalTransactions`, plus `canonicalBlocks` with `isCoinbase`)
+      the same way.
+    - `transfers` (with or without `chainId`, `isNFT` absent or `false`): the sum over every
+      token of the stored `transfers(fungibleName)` counts, coinbase transfers included.
+      Stock answers the last value of its `Transfers` id sequence: every transfer row it
+      ever inserted, NFT transfers and rows a reorg deleted included, an estimate that
+      counts rows ours does not (on 11-27 it answered 441,794,129; ours was not taken at
+      the same height, so the two are not compared here). **Known
+      difference:** a transfer row the list takes from an event whose name only ends in
+      `TRANSFER` (`<m>.WIZ_TRANSFER`), in a tx with no `<m>.TRANSFER` event, is listed by the
+      height walk and not counted here; stock keeps only events named `TRANSFER`, so it
+      counts none of them.
+
+    `transactions` reads O(chains) stored rows. `transfers` sums one stored row per token
+    and chain (one per token with `chainId`), streamed from a cursor; past the request
+    deadline it answers `COUNT_TIMEOUT`, never a partial sum. While the counters they read
+    are not ready (after `backfill`, `rebuild-range`, a startup guard mismatch, before the
+    first `reconcile-counts`), the 20,000-height walk answers only on a store whose history
+    fits in it (highest height minus the store's lowest at most 19,999); on a taller store
+    (mainnet) the count is `COUNT_TIMEOUT`, never the walk's partial number. A partial
+    store (started with `run --start-height`, or by `backfill --from H` above 0 into a new
+    data dir) has no all-history count at all: these unfiltered counts answer
+    `NOT_AVAILABLE`, whether the counters are ready or not, as its `countersOfEachChain` and
+    holders do. Its per-token, per-account and per-event counts still answer: they count
+    what its lists hold.
+
+    With a height or depth filter these lists keep the walk: stock answers those from its
+    height counters with a block-count formula, which we do not copy. So the count changes
+    meaning with the filter: `transactions { totalCount }` is all history, but
+    `transactions(minHeight: 0) { totalCount }` counts what the 20,000-height walk lists
+    (the newest 20,000 heights), as its edges do.
+
+    The operation limit of two list `totalCount`s ([limits](#limits)) counts these too: it
+    is priced before the counters' readiness is known.
 
     These keep the walk (and its `COUNT_TIMEOUT` on very long lists): `minHeight`,
     `maxHeight`, `minimumDepth`; `transactions(accountName, fungibleName)` (the module filter
     reads each record); `events` with `parametersFilter`, `orderIndex` or `moduleName`;
     `transfers(isNFT: true)`; sender lists on the old path (no sender index); lists without
-    a selective argument (the height walk); a block's or a request key's list (counted with
+    a selective argument with a height or depth filter, or with `isNFT: true` (the height
+    walk); a block's or a request key's list (counted with
     the page). Per-height buckets were left out: a height range would still walk its two edge
     buckets, which on the lists that need them (a popular event) is the same cut. While the
     counts are not ready (never built, or cleared by `backfill`, `rebuild-range`,
     `segments add-index` or `hot drop-family`), every list walks as above: slower, never
-    wrong.
+    wrong (the all-history counts above answer `COUNT_TIMEOUT` instead on a store taller
+    than their walk).
 - **Text forms.** `goodResult`, `badResult`, `continuation`, `metadata`, `Event.parameters`,
   payload `data` and capability `args` are compact JSON text of the node's values (numbers
   keep their exact text). `Transfer.amount` is the decimal of the event's amount parameter.

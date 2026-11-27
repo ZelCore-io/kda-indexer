@@ -3029,6 +3029,20 @@ mod stored_count {
         "events(qualifiedEventName: \"coin.COINBASE\", ARGS)",
     ];
 
+    /// Lists with no selective argument and no height or depth filter: all history from the
+    /// stored counters (chain counters for `transactions`, the token transfer counts for
+    /// `transfers`). The fixture's heights are far below the 20,000 the height walk lists,
+    /// so its walk sees all history too. Kept out of [`STORED`]: the reorg tests leave chain
+    /// 1's tip below a block it holds (its blocks are applied out of height order), which the
+    /// height walk, starting at the highest tip, does not list.
+    const ALL_HISTORY: &[&str] = &[
+        "transfers(ARGS)",
+        "transfers(chainId: \"1\", ARGS)",
+        "transfers(isNFT: false, ARGS)",
+        "transactions(ARGS)",
+        "transactions(chainId: \"0\", ARGS)",
+    ];
+
     /// Lists that keep the walk: heights, depth, `fungibleName` on an account's txs, event
     /// parameter / order filters, NFT transfers.
     const WALKED: &[&str] = &[
@@ -3038,6 +3052,9 @@ mod stored_count {
         "events(qualifiedEventName: \"coin.TRANSFER\", minHeight: 5, ARGS)",
         "events(qualifiedEventName: \"coin.TRANSFER\", orderIndex: 0, ARGS)",
         "transfers(accountName: \"k:alice\", isNFT: true, ARGS)",
+        "transfers(isNFT: true, ARGS)",
+        "transactions(minHeight: 5, ARGS)",
+        "transactions(minimumDepth: 1, ARGS)",
     ];
 
     fn field(l: &str) -> &str {
@@ -3218,7 +3235,7 @@ mod stored_count {
         let fx = fixture();
         let walked: Vec<i64> = {
             let mut v = Vec::new();
-            for l in STORED {
+            for l in STORED.iter().chain(ALL_HISTORY) {
                 v.push(walk(&fx.schema, l).await);
             }
             v
@@ -3226,7 +3243,7 @@ mod stored_count {
         assert!(!ready(&fx));
         let r = reconcile(&fx);
         assert!(r.frozen_txs > 0 && r.hot_txs > 0, "{r:?}");
-        for (l, w) in STORED.iter().zip(&walked) {
+        for (l, w) in STORED.iter().chain(ALL_HISTORY).zip(&walked) {
             assert_eq!(total(&fx.schema, l).await, *w, "{l}");
             assert_eq!(total_spent(&fx.schema, l).await, Some(*w), "{l}: stored");
         }
@@ -3582,6 +3599,220 @@ mod stored_count {
         // gives no number.
         for l in WALKED {
             assert_eq!(total_spent(&fx.schema, l).await, None, "{l}");
+        }
+        // The lists with no selective argument answer from the stored counters too, equal
+        // to their walk (G4 11-27: unfiltered `transfers { totalCount }` was cut at 4.9 s).
+        for l in ALL_HISTORY {
+            assert_eq!(
+                total_spent(&fx.schema, l).await,
+                Some(walk_all(&fx.schema, l).await),
+                "{l}"
+            );
+        }
+    }
+
+    /// `transactions(isCoinbase: true)` with no selective argument counts as stock's
+    /// `Counters` do: the user txs of the per-chain counters plus one coinbase per block
+    /// from genesis to the tip. Without the counters it walks.
+    #[tokio::test]
+    async fn unfiltered_coinbase_count_adds_one_per_block() {
+        let fx = fixture();
+        let l = "transactions(isCoinbase: true, ARGS)";
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::chaincount::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+        // Not ready: the walk, which lists the coinbases of the blocks the fixture holds
+        // (it holds a few heights only, so fewer than one per height).
+        let walked = walk(&fx.schema, l).await;
+        assert_eq!(total(&fx.schema, l).await, walked);
+        reconcile(&fx);
+        let user = total_spent(&fx.schema, "transactions(ARGS)").await.unwrap();
+        let ro = fx.store.hot.ro().unwrap();
+        let blocks: i64 = [0u8, 1]
+            .iter()
+            .map(|&c| {
+                i64::from(
+                    kdx_hot::checkpoint(&ro, kdx_hot::Stage::Tail, c)
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                ) + 1
+            })
+            .sum();
+        drop(ro);
+        assert_eq!(total_spent(&fx.schema, l).await, Some(user + blocks));
+        let l0 = "transactions(isCoinbase: true, chainId: \"0\", ARGS)";
+        let user0 = total_spent(&fx.schema, "transactions(chainId: \"0\", ARGS)")
+            .await
+            .unwrap();
+        assert_eq!(total_spent(&fx.schema, l0).await, Some(user0 + 13));
+    }
+
+    /// `totalCount` of `l` and the error codes of the request (generous deadline).
+    async fn total_or_codes(s: &KdxSchema, l: &str) -> (Option<i64>, Vec<String>) {
+        let q = format!("{{ {} {{ totalCount }} }}", l.replace("ARGS", "first: 1"));
+        let req = async_graphql::Request::new(q).data(kdx_graphql::ReqCtx {
+            deadline: Instant::now() + Duration::from_secs(60),
+        });
+        let r = s.execute(req).await;
+        let codes = r
+            .errors
+            .iter()
+            .filter_map(|e| e.extensions.as_ref()?.get("code").map(|c| c.to_string()))
+            .collect();
+        let d = serde_json::to_value(&r.data).unwrap();
+        let n = d
+            .get(field(l))
+            .and_then(|c| c.get("totalCount"))
+            .and_then(Value::as_i64);
+        (n, codes)
+    }
+
+    /// I-1: on a store taller than the height walk's window ([`MAX_HEIGHTS`] heights), an
+    /// all-history count the counters cannot answer is `COUNT_TIMEOUT`, never the window's
+    /// partial number; once they are ready it counts the heights below the window too, while
+    /// `minHeight: 0` keeps the windowed walk.
+    #[tokio::test]
+    async fn all_history_counts_on_a_store_taller_than_the_walk() {
+        let extra = kdx_graphql::txlist::MAX_HEIGHTS;
+        let base = {
+            let fx = fixture();
+            reconcile(&fx);
+            total_spent(&fx.schema, "transactions(ARGS)").await.unwrap()
+        };
+        let fx = fixture_big(GraphqlSettings::default(), extra);
+        let lists = [
+            "transactions(ARGS)",
+            "transactions(chainId: \"0\", ARGS)",
+            "transactions(isCoinbase: true, ARGS)",
+            "transfers(ARGS)",
+            "transfers(chainId: \"0\", ARGS)",
+        ];
+        assert!(!ready(&fx));
+        for l in lists {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert_eq!(n, None, "{l}: no partial count");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("COUNT_TIMEOUT")),
+                "{l}: {codes:?}"
+            );
+        }
+        reconcile(&fx);
+        let all = total_spent(&fx.schema, "transactions(ARGS)").await.unwrap();
+        assert_eq!(
+            all,
+            base + i64::from(extra),
+            "every height, below the window too"
+        );
+        // The window alone: the extra blocks' txs (heights 13 and up), not the fixture's.
+        let windowed = total(&fx.schema, "transactions(minHeight: 0, ARGS)").await;
+        assert_eq!(windowed, i64::from(extra));
+        assert!(all > windowed);
+        for l in lists {
+            assert!(total_spent(&fx.schema, l).await.is_some(), "{l}");
+        }
+        // Counters cleared again: the error comes back, not the window's number.
+        let mut t = fx.store.hot.rw().unwrap();
+        kdx_hot::chaincount::clear_ready(&mut t).unwrap();
+        t.commit().unwrap();
+        let (n, codes) = total_or_codes(&fx.schema, "transactions(ARGS)").await;
+        assert!(n.is_none() && codes.iter().any(|c| c.contains("COUNT_TIMEOUT")));
+    }
+
+    /// The unfiltered all-history lists: on a partial store none of them has a number.
+    const PARTIAL_LISTS: &[&str] = &[
+        "transactions(ARGS)",
+        "transactions(chainId: \"0\", ARGS)",
+        "transactions(isCoinbase: true, ARGS)",
+        "transfers(ARGS)",
+        "transfers(chainId: \"0\", ARGS)",
+    ];
+
+    /// Every list of [`PARTIAL_LISTS`] answers `NOT_AVAILABLE` and no number.
+    async fn no_all_history_count(fx: &Fx, why: &str) {
+        for l in PARTIAL_LISTS {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert_eq!(n, None, "{why}: {l}: no count of the store's own rows");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("NOT_AVAILABLE")),
+                "{why}: {l}: {codes:?}"
+            );
+        }
+    }
+
+    /// I1-b: a partial store (started above height 0) holds fewer than 20,000 heights, so the
+    /// walk would list all of them, but they are not all history: unfiltered `transactions`
+    /// and `transfers` `totalCount` are `NOT_AVAILABLE`, before and after `reconcile-counts`
+    /// (which marks the per-token counts ready there; one token's count is still served).
+    #[tokio::test]
+    async fn a_partial_store_has_no_all_history_count() {
+        // `run --start-height`: the meta marker.
+        let fx = fixture();
+        let mut t = fx.store.hot.rw().unwrap();
+        t.set_meta(kdx_hot::env::meta::PARTIAL_FROM, &5u32.to_be_bytes())
+            .unwrap();
+        t.commit().unwrap();
+        no_all_history_count(&fx, "marker, counts not ready").await;
+        reconcile(&fx);
+        assert!(ready(&fx), "per-token counts are ready on a partial store");
+        no_all_history_count(&fx, "marker, counts ready").await;
+        let one = "transfers(fungibleName: \"coin\", ARGS)";
+        assert_eq!(
+            total_spent(&fx.schema, one).await,
+            Some(walk(&fx.schema, one).await),
+            "one token's count: what the store lists"
+        );
+
+        // `backfill --from H` into a new data dir: no marker, the first range starts above 0.
+        let fx = fixture();
+        let mut m = Manifest::load(&fx.store.segdir).unwrap().unwrap();
+        m.entries.remove(0);
+        m.commit(&fx.store.segdir).unwrap();
+        let ro = fx.store.hot.ro().unwrap();
+        assert!(ro.meta(kdx_hot::env::meta::PARTIAL_FROM).unwrap().is_none());
+        drop(ro);
+        no_all_history_count(&fx, "floor above 0, counts not ready").await;
+        let r =
+            row_counts::reconcile(&fx.store.segdir, &fx.store.hot, 2, false, &|| false).unwrap();
+        assert!(r.ready && !r.chain_counters_ready, "{r:?}");
+        no_all_history_count(&fx, "floor above 0, counts ready").await;
+    }
+
+    /// The walk's boundary: a store spanning 19,999 heights above its floor (0) is listed
+    /// whole and its count answers; at 20,000 the count is `COUNT_TIMEOUT`.
+    #[tokio::test]
+    async fn the_walk_answers_up_to_a_span_of_19999_heights() {
+        let max = kdx_graphql::txlist::MAX_HEIGHTS;
+        // The fixture's tip is height 12; its extra blocks start at 13.
+        let fx = fixture_big(GraphqlSettings::default(), max - 1 - 12);
+        assert!(!ready(&fx));
+        let ro = fx.store.hot.ro().unwrap();
+        let top = kdx_hot::checkpoint(&ro, kdx_hot::Stage::Tail, 0)
+            .unwrap()
+            .unwrap()
+            .0;
+        drop(ro);
+        assert_eq!(top, max - 1, "span 19,999");
+        for l in ["transactions(ARGS)", "transfers(ARGS)"] {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert!(codes.is_empty(), "{l}: {codes:?}");
+            assert!(n.is_some_and(|n| n > i64::from(max) - 13), "{l}: {n:?}");
+        }
+        // One more height: span 20,000.
+        let mut t = fx.store.hot.rw().unwrap();
+        let mut dict = HotDict::load(&t).unwrap();
+        let (b, _) = decoded(0, max, &[Shape::One]);
+        let ib = index_block(&b, &VerifyReport::default(), &mut dict).unwrap();
+        kdx_hot::tail::apply(&mut t, &ib, &mut dict).unwrap();
+        dict.persist(&mut t).unwrap();
+        t.commit().unwrap();
+        for l in ["transactions(ARGS)", "transfers(ARGS)"] {
+            let (n, codes) = total_or_codes(&fx.schema, l).await;
+            assert_eq!(n, None, "{l}: span 20,000");
+            assert!(
+                !codes.is_empty() && codes.iter().all(|c| c.contains("COUNT_TIMEOUT")),
+                "{l}: {codes:?}"
+            );
         }
     }
 

@@ -109,6 +109,10 @@ const SUB_TXS_QUANTITY: i64 = 20;
 const NFT_HOLDINGS: &str = "nonFungibleTokenBalances";
 
 /// Deferred `totalCount`s (count walks) one operation may run, outer multipliers included.
+/// Lists whose count usually comes from stored counters (`transactions` and `transfers` with
+/// no selective argument, the per-key lists) count toward it too: whether the counters can
+/// answer is known only when the count runs (their readiness, variables), not when the
+/// document is priced, so the limit stays on every count that could walk.
 pub const MAX_COUNTS: u64 = 2;
 
 /// Connections whose `totalCount` is known with their page and needs no decoding (a block's

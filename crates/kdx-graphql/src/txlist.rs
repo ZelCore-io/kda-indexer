@@ -1458,6 +1458,9 @@ fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResu
     if f.min_h.is_some() || f.max_h.is_some() || f.depth.is_some() {
         return Ok(None);
     }
+    if let Src::Heights = src {
+        return all_history_count(view, f, rows);
+    }
     let &Src::Post(fam, e) = src else {
         return Ok(None);
     };
@@ -1533,16 +1536,132 @@ fn stored_count(view: &View, spec: &ListSpec, src: &Src, rows: &Rows) -> ApiResu
     Ok(Some(user.saturating_add(if with_cb { cb } else { 0 })))
 }
 
+/// The `totalCount` of a list with no selective argument (the height walk) and no height or
+/// depth filter, as stock counts it: over the whole history, not the 20,000 heights the walk
+/// lists ([`MAX_HEIGHTS`]). When the stored counters cannot answer, the walk serves the count
+/// only on a store whose history fits its window ([`walk_covers_history`]); on a taller store
+/// the count is [`ApiError::Deadline`] (`COUNT_TIMEOUT`), never the window's partial number.
+/// A partial store ([`partial_store`]: `run --start-height`, `backfill --from H` into a new
+/// data dir) has no all-time count at all: `NOT_AVAILABLE` ([`partial_store_error`]), as its
+/// `countersOfEachChain` and holders.
+///
+/// - `transactions`: the user txs of the per-chain counters (`kdx_hot::chaincount`, the
+///   `countersOfEachChain.transactionCount` numbers), plus one coinbase per block with
+///   `isCoinbase: true`; stock sums its `Counters.canonicalTransactions` (and
+///   `canonicalBlocks`) the same way.
+/// - `transfers` (fungible): the sum over every token of the stored
+///   `transfers(fungibleName)` counts (`TokenXfer`), coinbase transfers included. Stock
+///   answers the last value of its `Transfers` id sequence, an all-history estimate.
+fn all_history_count(view: &View, f: &KeyFilter, rows: &Rows) -> ApiResult<Option<u64>> {
+    match rows {
+        Rows::Txs {
+            sender: None,
+            nft: false,
+            module: None,
+            coinbase,
+        } => {
+            if !kdx_hot::chaincount::ready(&view.txn)? {
+                return walk_covers_history(view);
+            }
+            let counts = kdx_hot::chaincount::read_all(&view.txn)?;
+            let mut n = 0u64;
+            for (c, genesis, tip) in crate::types::block::tips_and_genesis(view)? {
+                if f.chain.is_some_and(|x| x != c) {
+                    continue;
+                }
+                // A chain without a row (or a damaged one) is not served as 0.
+                let Some(Some(k)) = counts.get(&c) else {
+                    return walk_covers_history(view);
+                };
+                n = n.saturating_add(k.user_txs);
+                if *coinbase && !f.user_only {
+                    n = n.saturating_add((tip + 1).saturating_sub(genesis));
+                }
+            }
+            Ok(Some(n))
+        }
+        Rows::Transfers {
+            module: None,
+            account: None,
+            nft: false,
+        } => {
+            // `row_counts::reconcile` marks the token transfer counts ready on a partial
+            // store too: per token they equal what its lists hold (its own history), which
+            // the per-token `totalCount`s serve. Their sum is not an all-history count there.
+            if partial_store(view)? {
+                return Err(partial_store_error());
+            }
+            let Some((user, cb)) =
+                view.row_count_kind(kdx_decode::rowcount::CountKind::TokenXfer, f.chain)?
+            else {
+                return walk_covers_history(view);
+            };
+            Ok(Some(user.saturating_add(if f.user_only { 0 } else { cb })))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `Ok(None)` (the caller walks) when the height walk lists the store's whole history: the
+/// store is not partial ([`partial_store`]) and its span, the highest height with data down
+/// to the store's floor, is at most [`MAX_HEIGHTS`] - 1 heights. On a taller store the walk
+/// would count the newest [`MAX_HEIGHTS`] heights only, a partial number for a count that
+/// means all history: [`ApiError::Deadline`] (`COUNT_TIMEOUT`) instead. On a partial store
+/// it would count the store's own history only: [`partial_store_error`] (`NOT_AVAILABLE`).
+fn walk_covers_history(view: &View) -> ApiResult<Option<u64>> {
+    if partial_store(view)? {
+        return Err(partial_store_error());
+    }
+    let Some(top) = view.max_data_height()? else {
+        return Ok(None);
+    };
+    if top.saturating_sub(kdx_api::compat::store_floor(view)) >= MAX_HEIGHTS {
+        return Err(ApiError::Deadline);
+    }
+    Ok(None)
+}
+
+/// Whether the store misses history below its floor: it was started at a height above 0
+/// (`run --start-height`, `META_PARTIAL_FROM`), or its lowest height is above 0 (`backfill
+/// --from H` into a new data dir). The lowest height is the first range's start, else (no
+/// manifest, or an empty one) the hot floor. `row_counts::reconcile` and `holders_fill`
+/// withhold their all-time markers on the marker or a first range above 0 only, so with no
+/// range and a hot floor above 0 this test is stricter than theirs: the chain counters may
+/// be ready there, and this still refuses the all-history count.
+fn partial_store(view: &View) -> ApiResult<bool> {
+    use kdx_hot::Txn as _;
+    if view
+        .txn
+        .meta(kdx_hot::env::meta::PARTIAL_FROM)
+        .map_err(ApiError::Internal)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(kdx_api::compat::store_floor(view) > 0)
+}
+
+/// The text of the error an all-history count answers on a partial store; [`count_error`]
+/// gives it the `NOT_AVAILABLE` code (the count path carries only [`ApiError`]s).
+const PARTIAL_STORE_COUNT: &str =
+    "totalCount: this store holds no history below its start height, so it has no all-history count";
+
+fn partial_store_error() -> ApiError {
+    ApiError::Unavailable(PARTIAL_STORE_COUNT.into())
+}
+
 /// Keys a decoding count walk reads ahead at once ([`count`]).
 const COUNT_PREFETCH: usize = 256;
 
-/// The error of a count the deadline cut (`COUNT_TIMEOUT`): `totalCount` is exact or absent.
+/// The error of a count the deadline cut (`COUNT_TIMEOUT`), or of an all-history count on a
+/// partial store (`NOT_AVAILABLE`): `totalCount` is exact or absent.
 pub fn count_error(e: ApiError) -> async_graphql::Error {
     match e {
         ApiError::Deadline => err(
             Code::CountTimeout,
             "totalCount could not be counted exactly before the request deadline",
         ),
+        ApiError::Unavailable(t) if t == PARTIAL_STORE_COUNT => err(Code::NotAvailable, t),
         e => from_api(e),
     }
 }

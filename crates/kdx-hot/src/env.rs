@@ -62,6 +62,9 @@ pub mod meta {
     pub const GEOMETRY: &str = "geometry";
     /// u64 1 when every hot tx carries its `sndr` posting (FIX-2, `sndr::backfill`).
     pub const SNDR_HOT: &str = "sndr_hot";
+    /// The first height of a store started with `run --start-height` (dev): a partial store,
+    /// with no all-time counters.
+    pub const PARTIAL_FROM: &str = "partial_from";
 }
 
 pub struct HotStore {
@@ -281,6 +284,17 @@ pub(crate) fn be_u32(v: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(v.try_into().ok()?))
 }
 
+/// What [`Txn::walk_rows`] does after a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Walk {
+    /// The next row.
+    Next,
+    /// The first row at or above this key (above the current one).
+    Seek(Vec<u8>),
+    /// End the walk.
+    Stop,
+}
+
 /// Reads shared by `RoTxn` and `RwTxn`.
 pub trait Txn {
     type Kind: TransactionKind;
@@ -345,6 +359,37 @@ pub trait Txn {
                 break;
             }
             cur = c.next::<Vec<u8>, ()>()?;
+        }
+        Ok(())
+    }
+
+    /// Rows with `from <= key`, in key order, streamed from one cursor (nothing is collected):
+    /// `f` sees each row and answers [`Walk::Next`], [`Walk::Seek`] (to the first key at or
+    /// above the one given, which must be above the current key) or [`Walk::Stop`].
+    fn walk_rows(
+        &self,
+        t: Table,
+        from: &[u8],
+        mut f: impl FnMut(&[u8], &[u8]) -> Walk,
+    ) -> Result<()> {
+        let Some(dbi) = self.tables().dbi_opt(t) else {
+            return Ok(());
+        };
+        let mut c = self.raw().cursor(dbi)?;
+        let mut cur = if from.is_empty() {
+            c.first::<Vec<u8>, Vec<u8>>()?
+        } else {
+            c.set_range::<Vec<u8>, Vec<u8>>(from)?
+        };
+        while let Some((k, v)) = cur {
+            cur = match f(&k, &v) {
+                Walk::Next => c.next::<Vec<u8>, Vec<u8>>()?,
+                Walk::Seek(to) => {
+                    debug_assert!(to.as_slice() > k.as_slice(), "a seek moves forward");
+                    c.set_range::<Vec<u8>, Vec<u8>>(&to)?
+                }
+                Walk::Stop => break,
+            };
         }
         Ok(())
     }
