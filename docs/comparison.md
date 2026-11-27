@@ -573,7 +573,7 @@ heavy endpoints, at no more than 2 requests per second to stock.
 `minerAccount` and `parametersFilter` forms, the balance reconciler running beside the
 receivers passes, faster balance drain with extra read nodes, optional `networkInfo` node
 fields); the first rows, before an 11:12Z swap, ran on `7db6e5b` (#65, #66). `main` is now
-`bc69c50`, which adds #69–#72 (audit items N-16 to N-26 with a 4 s count window, the reconcile
+`bc69c50`, which adds #69–#72 (security hardening with a 4 s count window, the reconcile
 refill window with a per-batch tip share, and all-history unfiltered counts). No rows ran on
 `ea0c4fe` (#69, #70), so its 4 s count window was not measured live.
 
@@ -621,7 +621,7 @@ endpoint), because the stock GraphQL indexer answers most heavy requests with a 
 | (c) harness, timing, stock timeout | 936 | 31 | Tip races, reads before our queue drained, comparing by position, and stock timing out. |
 | (d) balance drain in progress | 41 | 5 | Our stored balance rows were not filled yet when the case ran. |
 
-- **(a)** JS floats (#11, 162 rows); kda-txs pairing, event order and missing rows (#31 177,
+- **(a)** JS floats (#11, 162 rows across endpoints, 156 of them `fungibleAccount`); kda-txs pairing, event order and missing rows (#31 177,
   #32 29, #34 39); the nested block page (#7, 4); `NetworkInfo` node fields (50, below);
   the guard shape and the `"coin "` name (5, [graphql.md](graphql.md#accounts)); and three
   groups run 2 met too that were not on this page yet: input validation (119), malformed
@@ -633,8 +633,8 @@ endpoint), because the stock GraphQL indexer answers most heavy requests with a 
   which counts unfiltered `transactions` and `transfers` over all history from stored
   counters. After the swap to `bc69c50`, unfiltered `transfers` answers 441,469,276 in
   1.44 ms (before: `COUNT_TIMEOUT` after 4.90 s), unfiltered `transactions` 230,519,399 in
-  0.50 ms (before: 50,619 over the last 20,000 heights, 3.39 s; it equals the
-  `countersOfEachChain` sum), and `transactions(isCoinbase: true)` 370,837,002 in 0.71 ms
+  0.50 ms, equal to the `countersOfEachChain` sum (before: 50,619 over the last 20,000
+  heights, 3.39 s), and `transactions(isCoinbase: true)` 370,837,002 in 0.71 ms
   (before: 450,589, 3.40 s). The stock GraphQL indexer now times out (504 at 30 s) on these
   counts, so they were not compared with stock live.
 - **(c)** kda-txs 404 after 30 s (#33, 407 rows); `/txs/recent` by position (#36, 417);

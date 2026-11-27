@@ -89,7 +89,7 @@ footer{color:var(--muted);font-size:.82rem}
   </div>
   <div class="card">
     <h3>Build under test</h3>
-    <p><code>9b96aba</code> for most of the run (PRs #65–#68: stock-exact <code>minerAccount</code> and <code>parametersFilter</code> forms, the balance reconciler running beside the receivers passes, a faster balance drain with extra read nodes, optional <code>networkInfo</code> node fields). The first rows, before an 11:12Z swap, ran on <code>7db6e5b</code> (#65, #66). <code>main</code> is now <code>bc69c50</code>, which adds #69–#72: audit items N-16 to N-26 with a 4 s count window, the reconcile refill window with a per-batch tip share, and all-history unfiltered counts. No rows ran on <code>ea0c4fe</code>, so the 4 s count window was not measured live.</p>
+    <p><code>9b96aba</code> for most of the run (PRs #65–#68: stock-exact <code>minerAccount</code> and <code>parametersFilter</code> forms, the balance reconciler running beside the receivers passes, a faster balance drain with extra read nodes, optional <code>networkInfo</code> node fields). The first rows, before an 11:12Z swap, ran on <code>7db6e5b</code> (#65, #66). <code>main</code> is now <code>bc69c50</code>, which adds #69–#72: security hardening with a 4 s count window, the reconcile refill window with a per-batch tip share, and all-history unfiltered counts. No rows ran on <code>ea0c4fe</code>, so the 4 s count window was not measured live.</p>
     <p>46,571 rows kept after dropping the swap windows, the pauses and 327 rows of chainweb-data endpoints taken off a stock host when they timed out (as in run 2). Node checks 3,271 of 3,271 ok, cross-checks 3,333 of 3,333 ok, 0 open harness errors.</p>
   </div>
 
