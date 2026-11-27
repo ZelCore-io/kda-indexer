@@ -2,8 +2,10 @@
 //! Task 9, rulings B-1 and H-1).
 //!
 //! Safety (B-1):
-//! - Only six code forms are ever sent, each a fixed text with names passed in `data`:
-//!   `({m}.details (read-msg "a"))`, `(describe-keyset (read-msg "k"))`,
+//! - Only seven code forms are ever sent, each a fixed text with names passed in `data`:
+//!   `({m}.details (read-msg "a"))`, its batched form
+//!   `(map (lambda (a) (try {"account": a, "absent": true} ({m}.details a))) (read-msg "as"))`,
+//!   `(describe-keyset (read-msg "k"))`,
 //!   `({m}.get-balance (read-msg "t") (read-msg "a"))`, the fungible check
 //!   `(contains "fungible-v2" (at 'interfaces (describe-module (read-msg "m"))))`, and the two
 //!   GQ-15 forms for a trusted NFT ledger, `({m}.details (read-msg "t") (read-msg "a"))` and
@@ -416,6 +418,117 @@ impl LocalClient {
         let code = format!("({module}.details (read-msg \"a\"))");
         let (r, secs) = self.call_timed(chain, &code, json!({ "a": account })).await;
         (r.and_then(details_of), secs)
+    }
+}
+
+/// Most accounts one [`LocalClient::details_many`] call reads (`balances.local_batch_keys` is
+/// capped at this).
+pub const MAX_BATCH_KEYS: usize = 100;
+
+impl LocalClient {
+    /// `(map (lambda (a) (try {"account": a, "absent": true} ({module}.details a)))
+    /// (read-msg "as"))` with `data {"as": [accounts…]}`: the `details` of up to
+    /// [`MAX_BATCH_KEYS`] accounts of one module on one chain, read in one call, so all at the
+    /// same block (one `metaData` for the whole answer). Account names still travel only in
+    /// `data` (B-1).
+    ///
+    /// `try` keeps one missing row from failing the whole call (measured on mainnet: plain
+    /// `map` fails the call, with no `metaData`, on the first absent account). It also catches
+    /// any other recoverable error of that entry, so a marker never means "absent" here: it
+    /// is [`BatchEntry::Marker`], and the caller reads that account again on its own.
+    ///
+    /// `Found` carries one entry per account, in order. A Pact failure is the whole call's; an
+    /// answer that is not a list of `accounts.len()` entries is [`LocalError::Invalid`].
+    pub async fn details_many(
+        &self,
+        chain: u8,
+        module: &str,
+        accounts: &[&str],
+    ) -> (LocalResult<Vec<BatchEntry>>, f64) {
+        if accounts.is_empty() || accounts.len() > MAX_BATCH_KEYS {
+            return (
+                Err(LocalError::Skipped(format!(
+                    "a batch holds 1..={MAX_BATCH_KEYS} accounts"
+                ))),
+                0.0,
+            );
+        }
+        if let Err(e) = check_module(module)
+            .and_then(|_| accounts.iter().try_for_each(|a| check_name("account", a)))
+        {
+            return (Err(e), 0.0);
+        }
+        let code = format!(
+            "(map (lambda (a) (try {{\"account\": a, \"absent\": true}} ({module}.details a))) (read-msg \"as\"))"
+        );
+        let (r, secs) = self
+            .call_timed(chain, &code, json!({ "as": accounts }))
+            .await;
+        (r.and_then(|r| details_list_of(r, accounts)), secs)
+    }
+
+    /// Free concurrency slots (`local_concurrency` minus the calls in flight).
+    pub fn free_slots(&self) -> usize {
+        self.sem.available_permits()
+    }
+}
+
+/// One entry of a batched `details` answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchEntry {
+    /// The account's details, checked like a single answer.
+    Found(Details),
+    /// The `try` marker (or any entry with an `absent` field): this call does not decide the
+    /// account. Never read as absent: the caller reads it alone on the primary node.
+    Marker,
+    /// Unusable on its own (names another account or none, no decimal balance): read alone.
+    Unusable(String),
+}
+
+/// One `details` entry of a batched answer.
+fn one_details(v: &Value, account: &str) -> BatchEntry {
+    if v.get("absent").is_some() {
+        return BatchEntry::Marker;
+    }
+    // The entry must name the account asked for: a module whose `details` does not echo
+    // `account` is read one key at a time.
+    if v.get("account").and_then(Value::as_str) != Some(account) {
+        return BatchEntry::Unusable("details: entry does not name the account asked".into());
+    }
+    let Some(balance) = v.get("balance").and_then(decimal_text) else {
+        return BatchEntry::Unusable("details: no decimal balance".into());
+    };
+    let (guard, guard_capped) = capped_guard(v.get("guard").cloned().unwrap_or(Value::Null));
+    BatchEntry::Found(Details {
+        balance,
+        guard,
+        guard_capped,
+    })
+}
+
+fn details_list_of(r: Local<Value>, accounts: &[&str]) -> LocalResult<Vec<BatchEntry>> {
+    match r {
+        Local::Absent => Ok(Local::Absent),
+        Local::Found {
+            value,
+            height,
+            prev_hash,
+        } => {
+            let list = value
+                .as_array()
+                .filter(|l| l.len() == accounts.len())
+                .ok_or_else(|| invalid("details batch: not one entry per account"))?;
+            let value = list
+                .iter()
+                .zip(accounts)
+                .map(|(v, a)| one_details(v, a))
+                .collect();
+            Ok(Local::Found {
+                value,
+                height,
+                prev_hash,
+            })
+        }
     }
 }
 
@@ -1255,5 +1368,65 @@ mod tests {
             println!("{acct}: {d:?}");
             assert!(matches!(d, Local::Found { .. }));
         }
+    }
+
+    /// A batched `details` answer: one entry per account in order, each checked like a single
+    /// answer; an entry naming another account or none, or with no balance, is unusable on its
+    /// own; any entry with an `absent` field is a marker (never "absent"); a list of the wrong
+    /// length makes the whole answer invalid.
+    #[test]
+    fn details_batch_answers_are_checked_per_entry() {
+        let found = |v: Value| Local::Found {
+            value: v,
+            height: 10,
+            prev_hash: Some("h".into()),
+        };
+        let g = json!({"keys": ["k1"], "pred": "keys-all"});
+        let r = details_list_of(
+            found(json!([
+                {"account": "a", "balance": 1.5, "guard": g},
+                {"account": "x", "balance": 2.0, "guard": g},
+                {"account": "c", "guard": g},
+                {"balance": {"decimal": "3.25"}, "guard": g},
+                {"account": "e", "balance": {"decimal": "3.25"}, "guard": g},
+                {"account": "f", "absent": true},
+                {"account": "x", "absent": true},
+                {"account": "h", "absent": false, "balance": 1.0, "guard": g},
+            ])),
+            &["a", "b", "c", "d", "e", "f", "g", "h"],
+        )
+        .unwrap();
+        let Local::Found {
+            value,
+            height,
+            prev_hash,
+        } = r
+        else {
+            panic!("found")
+        };
+        assert_eq!((height, prev_hash.as_deref()), (10, Some("h")));
+        let bal = |e: &BatchEntry| match e {
+            BatchEntry::Found(d) => d.balance.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(bal(&value[0]), "1.5");
+        assert!(
+            matches!(value[1], BatchEntry::Unusable(_)),
+            "another account"
+        );
+        assert!(matches!(value[2], BatchEntry::Unusable(_)), "no balance");
+        assert!(matches!(value[3], BatchEntry::Unusable(_)), "no account");
+        assert_eq!(bal(&value[4]), "3.25");
+        assert_eq!(value[5], BatchEntry::Marker);
+        assert_eq!(value[6], BatchEntry::Marker, "a marker is never accepted");
+        assert_eq!(value[7], BatchEntry::Marker);
+        assert!(matches!(
+            details_list_of(found(json!([{"balance": 1.0}])), &["a", "b"]),
+            Err(LocalError::Invalid(_))
+        ));
+        assert!(matches!(
+            details_list_of(Local::Absent, &["a"]),
+            Ok(Local::Absent)
+        ));
     }
 }

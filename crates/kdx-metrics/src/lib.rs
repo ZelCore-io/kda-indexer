@@ -90,6 +90,13 @@ pub struct Metrics {
     pub balance_reconcile: Count,
     /// Duration of one `/local` reconcile call (`result` as above).
     pub balance_reconcile_seconds: Hist,
+    /// Balance `/local` reads per read node (`node` = n0, n1, … in `balances.local_urls`
+    /// order; `result` = ok | absent | error | invalid | node_error | lagging | ahead).
+    pub balance_local_node_calls: Count,
+    /// Balance keys answered per read node (`node`); its rate is the node's rows/s.
+    pub balance_local_node_keys: Count,
+    /// 1 while a read node is in use, 0 while it is skipped after an error or lag (`node`).
+    pub balance_local_node_up: Gau,
     /// GraphQL requests: `kind` = query | batch | subscription, `result` = ok | error |
     /// rejected | timeout.
     pub graphql_requests: Count,
@@ -366,6 +373,21 @@ impl Metrics {
             "Balance reconcile call duration (result ok|absent|error|skipped)",
             hist(seconds)
         );
+        let balance_local_node_calls = reg!(
+            "kdx_balance_local_node_calls",
+            "Balance /local reads per read node (node, result ok|absent|error|invalid|node_error|lagging|ahead)",
+            Count::default()
+        );
+        let balance_local_node_keys = reg!(
+            "kdx_balance_local_node_keys",
+            "Balance keys answered per read node (node)",
+            Count::default()
+        );
+        let balance_local_node_up = reg!(
+            "kdx_balance_local_node_up",
+            "1 while a balance read node is in use, 0 while it is skipped (node)",
+            Gau::default()
+        );
         let alloc_allocated_bytes = reg!(
             "kdx_alloc_allocated_bytes",
             "Bytes the application has allocated and not freed (jemalloc stats.allocated)",
@@ -470,6 +492,9 @@ impl Metrics {
             balance_receivers_pass_failed,
             balance_reconcile,
             balance_reconcile_seconds,
+            balance_local_node_calls,
+            balance_local_node_keys,
+            balance_local_node_up,
             graphql_requests,
             graphql_rejected,
             graphql_pact,
@@ -591,6 +616,25 @@ impl Metrics {
         self.balance_reconcile_seconds
             .get_or_create(&l)
             .observe(secs);
+    }
+
+    /// One balance `/local` read on read node `node` that answered `keys` keys.
+    pub fn balance_local_node(&self, node: &str, result: &'static str, keys: u64) {
+        let n: Labels = vec![("node", node.to_owned())];
+        let mut l = n.clone();
+        l.push(("result", result.into()));
+        self.balance_local_node_calls.get_or_create(&l).inc();
+        if keys > 0 {
+            self.balance_local_node_keys.get_or_create(&n).inc_by(keys);
+        }
+    }
+
+    /// Read node `node` is in use (`up`) or skipped.
+    pub fn balance_local_node_up(&self, node: &str, up: bool) {
+        let n: Labels = vec![("node", node.to_owned())];
+        self.balance_local_node_up
+            .get_or_create(&n)
+            .set(i64::from(up));
     }
 
     pub fn graphql_request(&self, kind: &'static str, result: &'static str) {
