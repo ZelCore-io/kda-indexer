@@ -3739,6 +3739,9 @@ pub struct BatchItem {
     pub query: Option<String>,
     #[serde(default)]
     pub variables: Option<serde_json::Map<String, Value>>,
+    /// The client's `operationName`, sent along with the document.
+    #[serde(default, rename = "operationName")]
+    pub operation_name: Option<String>,
 }
 
 /// The verdict line `replay-batch` prints for one item: the outcomes of every pair (class,
@@ -3781,8 +3784,13 @@ pub async fn replay_batch(
                 let o = ctx.process(&req).await;
                 batch_line(&it.id, None, &o)
             } else if let Some(q) = it.query.as_deref() {
-                let (skip, o) =
-                    crate::graphql::replay_one(ctx, q, it.variables.unwrap_or_default()).await;
+                let (skip, o) = crate::graphql::replay_one(
+                    ctx,
+                    q,
+                    it.operation_name.as_deref(),
+                    it.variables.unwrap_or_default(),
+                )
+                .await;
                 batch_line(&it.id, skip, &o)
             } else {
                 batch_line(&it.id, Some("empty"), &[])

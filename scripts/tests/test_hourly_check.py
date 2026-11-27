@@ -3,12 +3,17 @@
 Run: python3 -m unittest discover -s scripts/tests
 """
 
+import contextlib
+import fcntl
+import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -44,10 +49,15 @@ class WindowAndFiles(unittest.TestCase):
     def test_rotations_oldest_first_and_window_filter(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "r.jsonl")
-            for name, t in ((p + ".2", T0 - 10), (p + ".1", T0 + 5), (p, T0 + 3_600_000)):
+            for name, t in ((p + ".3", T0 + 7), (p + ".2", T0 - 10), (p + ".1", T0 + 5),
+                            (p, T0 + 3_600_000)):
                 with open(name, "w") as f:
                     f.write(json.dumps(rest("/stats", "/stats", t=t)) + "\nnot json\n")
-            self.assertEqual(H.log_files(p), [p + ".2", p + ".1", p])
+            # `.3` was last written before the hour began, so it is not opened (its in-window
+            # line is a plant to prove that).
+            old = T0 / 1000 - 60
+            os.utime(p + ".3", (old, old))
+            self.assertEqual(H.log_files(p), [p + ".3", p + ".2", p + ".1", p])
             c = H.collections.Counter()
             got = list(H.read_window(H.log_files(p), T0, T0 + 3_600_000, c))
             self.assertEqual([e["t"] for e in got], [T0 + 5])
@@ -68,7 +78,7 @@ class Shapes(unittest.TestCase):
         b = H.route_of(gql("query  Q($h: Int!) {\n block(height: $h) { hash } }", {"h": 2}, "Q"))
         self.assertEqual(a[0], "graphql:block")
         self.assertEqual(a[1], b[1], "whitespace does not make a new shape")
-        self.assertEqual(a[2], {"query": q, "variables": {"h": 1}})
+        self.assertEqual(a[2], {"query": q, "variables": {"h": 1}, "operationName": "Q"})
         cut = gql(q)
         cut.pop("gql")
         cut["gql_cut"] = True
@@ -79,6 +89,34 @@ class Shapes(unittest.TestCase):
         get = dict(t=T0, listener="graphql", method="GET", route="/graphql", status=200, ms=1,
                    uri="/graphql?query=%7B%20lastBlockHeight%20%7D")
         self.assertEqual(H.route_of(get)[2], {"query": "{ lastBlockHeight }", "variables": {}})
+
+    def test_only_query_documents_are_replayed(self):
+        q = "query Q($h: Int!) { block(height: $h) { hash } }"
+        for doc in ("mutation M { transfer { ok } }",
+                    "# kdx:oracle\nmutation M { x }",
+                    "subscription S { newBlocks { hash } }",
+                    "query A { lastBlockHeight } mutation B { x }",
+                    "query A { lastBlockHeight }\nsubscription B { events { name } }",
+                    "fragment F on Block { hash } mutation M { x }"):
+            for op in (None, "A", "B"):
+                self.assertEqual(H.route_of(gql(doc, op=op))[2], "not-query", doc)
+        get = dict(t=T0, listener="graphql", method="GET", route="/graphql", status=200, ms=1,
+                   uri="/graphql?query=mutation%20M%20%7B%20x%20%7D")
+        self.assertEqual(H.route_of(get)[2], "not-query")
+        # Strings, comments and argument objects do not fake a definition.
+        for doc in ('query A { a(s: "mutation { x }") }', "# mutation M { x }\n{ a }",
+                    "query Q($x: In = {a: 1}) { b }", '"""mutation""" query A { a }'):
+            self.assertEqual(H.operation_types(doc), ["query"], doc)
+
+    def test_operation_name_is_kept(self):
+        multi = "query A { lastBlockHeight } query B($h: Int!) { block(height: $h) { hash } }"
+        it = H.route_of(gql(multi, {"h": 1}, "B"))[2]
+        self.assertEqual(it, {"query": multi, "variables": {"h": 1}, "operationName": "B"})
+        get = dict(t=T0, listener="graphql", method="GET", route="/graphql", status=200, ms=1,
+                   uri="/graphql?query=query%20A%20%7B%20a%20%7D&operationName=A")
+        self.assertEqual(H.route_of(get)[2]["operationName"], "A")
+        items, _, _ = H.sample([gql(multi, {"h": 1}, "B")], budget=10, per_route=10, seed="h")
+        self.assertEqual(items[0]["operationName"], "B")
 
 
 class Sampling(unittest.TestCase):
@@ -141,9 +179,10 @@ class Metrics(unittest.TestCase):
 
 
 def base_report(**kw):
-    rep = {"replay": {"classes": {"equal": 5}}, "follow": {"chains": {"0": {"ours": 10, "lag": 1, "hash_ok": True}},
-                                                         "errors": []},
-           "served_lag_max": 2, "served": {"compat /stats": {"n": 1000, "5xx": 1}}, "lines": 10}
+    rep = {"replay": {"classes": {"equal": 300}}, "follow": {"chains": {"0": {"ours": 10, "lag": 1, "hash_ok": True}},
+                                                           "errors": []},
+           "served_lag_max": 2, "served": {"compat /stats": {"n": 1000, "5xx": 1}}, "lines": 10,
+           "sampled": 300}
     rep.update(kw)
     return rep
 
@@ -152,8 +191,8 @@ class Verdict(unittest.TestCase):
     cfg = dict(H.DEFAULTS)
 
     def test_pass(self):
-        ok, why = H.verdict(base_report(), self.cfg)
-        self.assertTrue(ok, why)
+        status, why = H.verdict(base_report(), self.cfg)
+        self.assertEqual(status, "PASS", why)
 
     def test_each_failure(self):
         cases = [
@@ -169,14 +208,39 @@ class Verdict(unittest.TestCase):
             base_report(lines=0),
         ]
         for rep in cases:
-            ok, why = H.verdict(rep, self.cfg)
-            self.assertFalse(ok, rep)
+            status, why = H.verdict(rep, self.cfg)
+            self.assertEqual(status, "FAIL", rep)
             self.assertTrue(why)
 
-    def test_stock_unavailable_and_timing_pass(self):
-        ok, _ = H.verdict(base_report(replay={"classes": {"stock-unavailable": 3, "timing": 2, "allowlisted": 4}}),
-                          self.cfg)
-        self.assertTrue(ok)
+    def test_enough_compared_passes_with_some_stock_unavailable(self):
+        rep = base_report(sampled=320, replay={"classes": {"stock-unavailable": 10, "timing": 100,
+                                                           "allowlisted": 150, "equal": 60}})
+        status, why = H.verdict(rep, self.cfg)
+        self.assertEqual(status, "PASS", why)
+
+    def test_too_few_compared_is_inconclusive(self):
+        cases = [
+            # stock down all hour
+            base_report(replay={"classes": {"stock-unavailable": 300}}),
+            # the deadline hit before any answer came back
+            base_report(replay={"classes": {"not-run": 300}, "deadline_hit": True}),
+            # under 60% of the sample compared
+            base_report(sampled=500, replay={"classes": {"equal": 250, "not-compared": 250}}),
+            # under the absolute floor of 200
+            base_report(sampled=150, replay={"classes": {"equal": 150}}),
+        ]
+        for rep in cases:
+            status, why = H.verdict(rep, self.cfg)
+            self.assertEqual(status, "INCONCLUSIVE", rep)
+            self.assertIn("below the floor", why[0])
+        self.assertEqual(H.EXIT["INCONCLUSIVE"], 3)
+        # A failure wins over too few compared.
+        status, _ = H.verdict(base_report(replay={"classes": {"stock-unavailable": 299, "unexplained": 1}}),
+                              self.cfg)
+        self.assertEqual(status, "FAIL")
+        # A dry run compares nothing by design.
+        status, _ = H.verdict(base_report(replay={"classes": {}, "dry_run": True}), self.cfg)
+        self.assertEqual(status, "PASS")
 
 
 FAKE = r'''#!/usr/bin/env python3
@@ -191,6 +255,10 @@ for line in sys.stdin:
         cls = "diff" if n == 0 else "match"   # differs once, equal on the re-check
     if "recent" in it.get("path", ""):
         cls = "diff"                          # differs every time
+    if "events" in it.get("path", ""):
+        cls = "diff" if n == 0 else "a-error"  # differs, then ours fails on the re-check
+    if "search" in it.get("path", ""):
+        cls = "diff" if n == 0 else "b-error"  # differs, then stock fails on the re-check
     rec = {"a_target": "compat", "b_target": "cwd", "diff": [{"path": "/x", "kind": "Changed"}]}
     out = {"id": it["id"], "skip": None, "outcomes": [{"class": cls, "allowlist": []}]}
     if cls != "match":
@@ -200,31 +268,106 @@ for line in sys.stdin:
 
 
 class EndToEnd(unittest.TestCase):
+    def setup(self, d, *extra):
+        log = os.path.join(d, "r.jsonl")
+        with open(log, "w") as f:
+            for e in (rest("/stats", "/stats"), rest("/txs/recent", "/txs/recent"),
+                      rest("/txs/tx?requestkey=abc", "/txs/tx")) + extra:
+                f.write(json.dumps(e) + "\n")
+        os.utime(log, (T0 / 1000 + 60, T0 / 1000 + 60))
+        fake = os.path.join(d, "fake-compare")
+        with open(fake, "w") as f:
+            f.write(FAKE)
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+        return dict(H.DEFAULTS, log=log, compare_bin=fake, compare_config="x.toml", out_dir=d,
+                    recheck_delay_s=0, native_url="http://127.0.0.1:9", admin_url="http://127.0.0.1:9",
+                    node_url="http://127.0.0.1:9")
+
     def test_replay_recheck_and_report(self):
-        with tempfile.TemporaryDirectory() as d:
-            log = os.path.join(d, "r.jsonl")
-            with open(log, "w") as f:
-                for e in (rest("/stats", "/stats"), rest("/txs/recent", "/txs/recent"),
-                          rest("/txs/tx?requestkey=abc", "/txs/tx")):
-                    f.write(json.dumps(e) + "\n")
-            fake = os.path.join(d, "fake-compare")
-            with open(fake, "w") as f:
-                f.write(FAKE)
-            os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
-            os.environ["FAKE_STATE"] = os.path.join(d, "n")
-            cfg = dict(H.DEFAULTS, log=log, compare_bin=fake, compare_config="x.toml", out_dir=d,
-                       recheck_delay_s=0, native_url="http://127.0.0.1:9", admin_url="http://127.0.0.1:9",
-                       node_url="http://127.0.0.1:9")
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {"FAKE_STATE": os.path.join(d, "n")}):
+            cfg = self.setup(d, rest("/txs/events", "/txs/events"), rest("/txs/search", "/txs/search"))
             rep = H.run(cfg, "2026-11-27T12", T0, T0 + 3_600_000, False)
-            self.assertEqual(rep["replay"]["classes"], {"equal": 1, "timing": 1, "unexplained": 1})
+            # stats: equal on the re-check -> timing; events: ours-error on the re-check ->
+            # ours-error; search: stock failed on the re-check -> still unexplained.
+            self.assertEqual(rep["replay"]["classes"],
+                             {"equal": 1, "timing": 1, "unexplained": 2, "ours-error": 1})
             self.assertEqual(rep["replay"]["per_route"]["compat:/txs/recent"], {"unexplained": 1})
+            self.assertEqual(rep["replay"]["per_route"]["compat:/txs/events"], {"ours-error": 1})
+            self.assertEqual(rep["replay"]["per_route"]["compat:/txs/search"], {"unexplained": 1})
             self.assertTrue(rep["replay"]["examples"][0]["new"])
+            self.assertEqual(rep["status"], "FAIL")
             self.assertFalse(rep["pass"])
             self.assertIn("FAIL", H.summary_text(rep))
+            state = os.path.join(d, "hourly-state.json")
+            self.assertEqual(stat.S_IMODE(os.stat(state).st_mode), 0o640)
             # The next hour, the same difference is not new.
             os.remove(os.environ["FAKE_STATE"])
             rep2 = H.run(cfg, "2026-11-27T12", T0, T0 + 3_600_000, False)
             self.assertFalse(rep2["replay"]["examples"][0]["new"])
+
+    def test_newest_signatures_are_kept(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {"FAKE_STATE": os.path.join(d, "n")}):
+            cfg = self.setup(d)
+            old = ["zzz%05d" % i for i in range(H.SIGNATURES_KEPT)]
+            with open(os.path.join(d, "hourly-state.json"), "w") as f:
+                json.dump({"signatures": old}, f)
+            rep = H.run(cfg, "2026-11-27T12", T0, T0 + 3_600_000, False)
+            sig = rep["replay"]["examples"][0]["signature"]
+            with open(os.path.join(d, "hourly-state.json")) as f:
+                kept = json.load(f)["signatures"]
+            self.assertEqual(len(kept), H.SIGNATURES_KEPT)
+            self.assertEqual(kept[-1], sig, "the newest signature is kept although it sorts first")
+            self.assertNotIn("zzz00000", kept, "the oldest goes")
+
+    def test_recheck_shares_the_one_deadline(self):
+        clock, timeouts = [0.0], []
+
+        def fake_run(cmd, input, capture_output, text, timeout):  # noqa: A002
+            timeouts.append(timeout)
+            clock[0] += 2000
+            out = "".join(json.dumps(verdict_line(json.loads(x)["id"], "diff")) + "\n"
+                          for x in input.splitlines())
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(H.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(H.subprocess, "run", fake_run), \
+                mock.patch.object(H.time, "sleep", lambda s: None):
+            cfg = self.setup(d)
+            rep = H.run(cfg, "2026-11-27T12", T0, T0 + 3_600_000, False)
+            self.assertEqual(timeouts, [3000, 1000], "the re-check gets only what is left of 50 min")
+            clock[0], timeouts[:] = 0.0, []
+            cfg["deadline_minutes"] = 30
+            rep = H.run(cfg, "2026-11-27T12", T0, T0 + 3_600_000, False)
+            self.assertEqual(timeouts, [1800], "no time left: no re-check")
+            self.assertTrue(rep["replay"]["deadline_hit"])
+            self.assertEqual(rep["replay"]["classes"], {"unexplained": 3})
+
+    def test_main_writes_0640_and_a_second_run_is_busy(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self.setup(d)
+            conf = os.path.join(d, "hourly.toml")
+            with open(conf, "w") as f:
+                f.write('log = "%s"\nout_dir = "%s"\nnative_url = "http://127.0.0.1:9"\n'
+                        'admin_url = "http://127.0.0.1:9"\nnode_url = "http://127.0.0.1:9"\n'
+                        % (cfg["log"], d))
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = H.main(["--config", conf, "--hour", "2026-11-27T12", "--dry-run"])
+            self.assertEqual(code, 1, "the follow check cannot reach the services")
+            report = os.path.join(d, "hourly-2026-11-27T12.json")
+            self.assertEqual(stat.S_IMODE(os.stat(report).st_mode), 0o640)
+            fd = os.open(os.path.join(d, "hourly.lock"), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    code = H.main(["--config", conf, "--hour", "2026-11-27T12", "--dry-run"])
+                self.assertEqual(code, 2)
+                self.assertIn("busy", err.getvalue())
+            finally:
+                os.close(fd)
 
 
 if __name__ == "__main__":

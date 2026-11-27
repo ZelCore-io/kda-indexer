@@ -206,7 +206,13 @@ fn open_append(path: &Path) -> std::io::Result<File> {
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(d)?;
     }
-    OpenOptions::new().create(true).append(true).open(path)
+    let mut o = OpenOptions::new();
+    o.create(true).append(true);
+    // The log holds request paths and GraphQL variables: owner and group only, whatever the
+    // umask of the process that opens it.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o640);
+    o.open(path)
 }
 
 fn rotated(path: &Path, i: u32) -> PathBuf {
@@ -662,6 +668,12 @@ mod tests {
         assert_eq!(lines(&rotated(&s.path, 1)), 3);
         assert_eq!(lines(&rotated(&s.path, 2)), 3);
         assert!(!rotated(&s.path, 3).exists());
+        #[cfg(unix)]
+        for p in [s.path.clone(), rotated(&s.path, 1), rotated(&s.path, 2)] {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o007, 0, "{} is {mode:o}", p.display());
+        }
         for l in std::fs::read_to_string(&s.path).unwrap().lines() {
             let v: Value = serde_json::from_str(l).unwrap();
             assert_eq!(v["route"], "/graphql");

@@ -10,23 +10,31 @@ Inputs: the indexer's request log (`[api.request_log]`, operations.md "Request l
 the indexer's native and admin listeners, and the node.
 
 Steps:
-  1. Read the hour's lines from the log and its rotations (`<log>`, `<log>.1`, ...).
+  1. Read the hour's lines from the log and its rotations (`<log>`, `<log>.1`, ...); a file
+     last written before the hour began is not opened.
   2. Sample: one request of every distinct query shape (route, query-parameter names; for
      GraphQL the operation's document and variable names), then up to `per_route` per route,
-     at most `budget` in all. Identical requests are replayed once.
+     at most `budget` in all. Identical requests are replayed once. Only GET/HEAD compat
+     requests and GraphQL documents whose every operation is a query are replayed (a mutation
+     or subscription anywhere in the document is skipped); `operationName` is kept.
   3. Replay the sample through `kda-compare replay-batch`: every configured pair (ours against
      chainweb-data, kda-txs, the GraphQL indexer and the node), with the harness's normalisers,
      allowlist, node oracles (tx existence by /poll, block hashes, balances) and its per-target
-     rate caps. A request that differs is asked again once after `recheck_delay_s`.
+     rate caps. A request that differs is asked again once after `recheck_delay_s`. The whole
+     run, re-check included, has one deadline (`deadline_minutes`), and one run at a time
+     holds `<out_dir>/hourly.lock`, so the stock rate caps hold across the run.
   4. Chain follow: our tip per chain (native `/status`) against the node's cut (height, lag, and
      the node's hash at our height), halted chains, restarts, 5xx and the balance drain from
      `/metrics`, compared with the previous hour's state.
-  5. Print a compact summary and write `<out_dir>/hourly-<hour>.json`. Exit 0 = pass, 1 = fail,
-     2 = the check itself could not run.
+  5. Print a compact summary and write `<out_dir>/hourly-<hour>.json` (mode 0640). Exit 0 =
+     pass, 1 = fail, 2 = the check itself could not run (or another run holds the lock:
+     "busy"), 3 = inconclusive (too few requests compared; not a pass).
 
 Classes (the G4 triage classes): equal; (a) allowlisted (a documented, accepted difference);
 (d) known-gap; (c) timing: a tip race or a balance row read while the drain had it stale
-(the harness's skew/reorg rules), or a difference the re-check no longer shows; stock-unavailable
+(the harness's skew/reorg rules), or a difference the re-check finds equal or allowlisted
+(a re-check that answers ours-error counts as ours-error; any other re-check keeps the
+difference unexplained); stock-unavailable
 (the stock side failed: not counted against us); ours-error; unexplained (open, the (b)
 candidates). The replay happens after the request was served (up to an hour later), so it
 judges the answer for the same request now, not the bytes served; tip-dependent answers move in
@@ -34,14 +42,19 @@ between, which is what the timing class and the re-check absorb.
 
 Pass = no unexplained difference and no ours-error, every chain's lag within `ready_max_lag`
 (now and in every logged request of the hour), no halted chain or hash mismatch, no restart,
-and no route above `max_5xx_share` of 5xx answers in the hour.
+and no route above `max_5xx_share` of 5xx answers in the hour. Inconclusive = no failure, but
+fewer requests compared (every class but stock-unavailable, not-compared and not-run) than
+`min_compared_share` of the sample or `min_compared`, whichever is higher: stock down all
+hour, or the deadline hit before the answers came back.
 """
 
 import argparse
 import calendar
 import collections
+import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -71,7 +84,10 @@ DEFAULTS = {
     "ready_max_lag": 20,
     "max_5xx_share": 0.005,
     "min_5xx": 2,
+    "min_compared_share": 0.6,
+    "min_compared": 200,
 }
+SIGNATURES_KEPT = 5000
 
 # Harness outcome classes (kda-compare) -> hourly classes. Anything else is a difference.
 EQUAL = {"match"}
@@ -85,6 +101,19 @@ OURS = {"a-error"}
 ORDER = ["ours-error", "unexplained", "timing", "known-gap", "allowlisted", "equal",
          "stock-unavailable", "not-compared"]
 LETTER = {"allowlisted": "a", "known-gap": "d", "timing": "c", "unexplained": "b?"}
+# Classes of an item whose answers were compared (a difference was compared too).
+COMPARED = ("equal", "allowlisted", "known-gap", "timing", "unexplained", "ours-error")
+# A re-check that answers one of these turns a difference into (c) timing.
+RECHECK_CLEARS = ("equal", "allowlisted")
+EXIT = {"PASS": 0, "FAIL": 1, "INCONCLUSIVE": 3}
+
+
+def write_private(path, text):
+    """Writes `path` with mode 0640: reports and state hold request paths and variables."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o640)
+        f.write(text)
 
 
 def hour_window(hour):
@@ -110,6 +139,11 @@ def log_files(path):
 
 def read_window(paths, start_ms, end_ms, counts):
     for p in paths:
+        try:
+            if os.path.getmtime(p) * 1000 < start_ms:
+                continue  # last written before the hour began: none of its lines are in it
+        except OSError:
+            continue
         with open(p, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
@@ -142,6 +176,55 @@ def gql_request(e):
     return (q["query"][0], v if isinstance(v, dict) else {}, (q.get("operationName") or [None])[0]), None
 
 
+def operation_types(query):
+    """Types of the top-level definitions of a GraphQL document, in order (`query`,
+    `mutation`, `subscription`, `fragment`; a `{` shorthand is a query). Comments and strings
+    are skipped, so neither a `# kdx:` line nor a string can hide or fake a definition."""
+    out, depth, paren, expect, i, n = [], 0, 0, True, 0, len(query)
+    while i < n:
+        c = query[i]
+        if c == "#":
+            j = query.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            if query.startswith('"""', i):
+                j = query.find('"""', i + 3)
+                while j > 0 and query[j - 1] == "\\":
+                    j = query.find('"""', j + 3)
+                i = n if j < 0 else j + 3
+            else:
+                j = i + 1
+                while j < n and query[j] not in '"\n':
+                    j += 2 if query[j] == "\\" else 1
+                i = j + 1
+            continue
+        if c == "(":
+            paren += 1
+        elif c == ")":
+            paren -= 1
+        elif c == "{" and paren == 0:
+            if depth == 0 and expect:
+                out.append("query")
+                expect = False
+            depth += 1
+        elif c == "}" and paren == 0:
+            depth -= 1
+            if depth == 0:
+                expect = True
+        elif (c.isalpha() or c == "_") and depth == 0 and paren == 0:
+            j = i
+            while j < n and (query[j].isalnum() or query[j] == "_"):
+                j += 1
+            if expect:
+                out.append(query[i:j])
+                expect = False
+            i = j
+            continue
+        i += 1
+    return out
+
+
 def doc_key(query):
     return hashlib.sha1(" ".join(query.split()).encode()).hexdigest()[:10]
 
@@ -154,10 +237,15 @@ def route_of(e):
         if r is None:
             return "graphql", None, why
         query, variables, op = r
+        if any(t not in ("query", "fragment") for t in operation_types(query)):
+            return "graphql", None, "not-query"
         root = re.search(r"\{\s*([A-Za-z_]\w*)", query)
         rkey = "graphql:" + (root.group(1) if root else "?")
         shape = "%s|%s|%s|%s" % (rkey, op or "", doc_key(query), ",".join(sorted(variables)))
-        return rkey, shape, {"query": query, "variables": variables}
+        it = {"query": query, "variables": variables}
+        if op:
+            it["operationName"] = op
+        return rkey, shape, it
     if listener != "compat":
         return str(listener), None, "listener"
     if e.get("method") not in ("GET", "HEAD"):
@@ -252,15 +340,18 @@ def signature(rkey, line):
     return rkey + " :: " + " + ".join(sorted(paths))
 
 
-def replay(cfg, items):
-    """Runs `kda-compare replay-batch` on `items`: {id: verdict line}. Stops feeding new work
-    at the deadline by sending only what fits: the caller passes items in priority order."""
+def replay(cfg, items, deadline):
+    """Runs `kda-compare replay-batch` on `items`: {id: verdict line}, with the time left
+    before `deadline` (time.monotonic()); what has not answered by then is not-run."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return {}, "deadline"
     cmd = [cfg["compare_bin"], "--config", cfg["compare_config"], "replay-batch",
            "--concurrency", str(cfg["concurrency"])]
     inp = "".join(json.dumps({k: v for k, v in it.items() if k != "route"}) + "\n" for it in items)
     try:
         p = subprocess.run(cmd, input=inp, capture_output=True, text=True,
-                           timeout=cfg["deadline_minutes"] * 60)
+                           timeout=left)
     except subprocess.TimeoutExpired as ex:
         out = ex.stdout.decode() if isinstance(ex.stdout, bytes) else (ex.stdout or "")
         return parse_verdicts(out), "deadline"
@@ -396,7 +487,8 @@ def served_stats(entries):
 
 
 def verdict(rep, cfg):
-    """(pass, reasons) of a report."""
+    """(status, reasons) of a report: PASS, FAIL, or INCONCLUSIVE (no failure, but too few
+    requests compared)."""
     why = []
     c = rep["replay"]["classes"]
     if c.get("unexplained"):
@@ -424,10 +516,26 @@ def verdict(rep, cfg):
             why.append("%s: %d of %d answers 5xx" % (k, s["5xx"], s["n"]))
     if rep["lines"] == 0:
         why.append("no request log lines in the hour (log off, wrong path, or no traffic)")
-    return not why, why
+    if why:
+        return "FAIL", why
+    if not rep["replay"].get("dry_run"):
+        compared = sum(c.get(k, 0) for k in COMPARED)
+        need = max(math.ceil(cfg["min_compared_share"] * rep.get("sampled", 0)), cfg["min_compared"])
+        if compared < need:
+            return "INCONCLUSIVE", [
+                "%d of %d sampled requests compared, below the floor of %d (stock-unavailable %d, "
+                "not-compared %d, not-run %d%s)" % (
+                    compared, rep.get("sampled", 0), need, c.get("stock-unavailable", 0),
+                    c.get("not-compared", 0), c.get("not-run", 0),
+                    ", deadline hit" if rep["replay"].get("deadline_hit") else "")]
+    return "PASS", why
 
 
-def run(cfg, label, start_ms, end_ms, dry):
+def run(cfg, label, start_ms, end_ms, dry, deadline=None):
+    """One hour's check. `deadline` (time.monotonic()) bounds the replay and the re-check
+    together; default `deadline_minutes` from now."""
+    if deadline is None:
+        deadline = time.monotonic() + cfg["deadline_minutes"] * 60
     counts = collections.Counter()
     entries = list(read_window(log_files(cfg["log"]), start_ms, end_ms, counts))
     items, routes, skipped = sample(entries, cfg["budget"], cfg["per_route"], label)
@@ -442,30 +550,38 @@ def run(cfg, label, start_ms, end_ms, dry):
             state = json.load(f)
     except (OSError, ValueError):
         state = {}
-    seen = set(state.get("signatures", []))
+    # Oldest first; a signature seen again moves to the end, so the newest are kept.
+    seen = dict.fromkeys(s for s in state.get("signatures", []) if isinstance(s, str))
+    if dry:
+        rep["replay"]["dry_run"] = True
     if not dry and items:
-        got, err = replay(cfg, items)
+        got, err = replay(cfg, items, deadline)
         diffs = [it for it in items if it["id"] in got and item_class(got[it["id"]]) == "unexplained"]
         if diffs:
-            time.sleep(cfg["recheck_delay_s"])
-            again, _ = replay(cfg, diffs)
+            time.sleep(max(0.0, min(cfg["recheck_delay_s"], deadline - time.monotonic())))
+            again, err2 = replay(cfg, diffs, deadline)
+            err = err or err2
             for it in diffs:
                 v = again.get(it["id"])
-                if v is not None and item_class(v) != "unexplained":
+                if v is not None:
                     got[it["id"]] = dict(got[it["id"]], recheck=item_class(v))
         cls = collections.Counter()
         per = collections.defaultdict(collections.Counter)
         for it in items:
             v = got.get(it["id"])
             c = "not-run" if v is None else item_class(v)
-            if v is not None and v.get("recheck"):
+            r = v.get("recheck") if v is not None else None
+            if r in RECHECK_CLEARS:
                 c = "timing"
+            elif r == "ours-error":
+                c = "ours-error"
             cls[c] += 1
             per[it["route"]][c] += 1
             if c == "unexplained":
                 sig = signature(it["route"], v)
                 new = sig not in seen
-                seen.add(sig)
+                seen.pop(sig, None)
+                seen[sig] = True
                 if len(rep["replay"]["examples"]) < 20:
                     rec = next((o.get("record") for o in v.get("outcomes") or [] if o.get("record")), {}) or {}
                     rep["replay"]["examples"].append({
@@ -507,21 +623,21 @@ def run(cfg, label, start_ms, end_ms, dry):
                 p.get("NRestarts"), unit.get("NRestarts"), p.get("MainPID"), unit.get("MainPID"))
     if unit and unit.get("ActiveState") not in (None, "active"):
         rep["restarts"] = "unit %s" % unit.get("ActiveState")
-    rep["pass"], rep["reasons"] = verdict(rep, cfg)
+    rep["status"], rep["reasons"] = verdict(rep, cfg)
+    rep["pass"] = rep["status"] == "PASS"
     if not dry:
-        state = {"signatures": sorted(seen)[-5000:],
+        state = {"signatures": list(seen)[-SIGNATURES_KEPT:],
                  "last": {"hour": label, "unit": unit,
                           "dirty_rows": m["dirty_rows"] if m else None,
                           "http_5xx": dict(m["http_5xx"]) if m else {}}}
-        with open(state_path + ".tmp", "w") as f:
-            json.dump(state, f)
+        write_private(state_path + ".tmp", json.dumps(state))
         os.replace(state_path + ".tmp", state_path)
     return rep
 
 
 def summary_text(rep):
     out = ["hour %s  %s  lines %d  sampled %d  not-run %d" % (
-        rep["hour"], "PASS" if rep["pass"] else "FAIL", rep["lines"], rep["sampled"],
+        rep["hour"], rep["status"], rep["lines"], rep["sampled"],
         rep["replay"].get("not_run", 0))]
     c = rep["replay"]["classes"]
     out.append("classes " + " ".join("%s=%d" % (k, c[k]) for k in ORDER + ["not-run"] if c.get(k))
@@ -563,13 +679,24 @@ def main(argv=None):
     if not cfg["log"] or (not a.dry_run and not cfg["compare_config"]):
         print("config needs log and compare_config", file=sys.stderr)
         return 2
+    deadline = time.monotonic() + cfg["deadline_minutes"] * 60
     start, end, label = hour_window(a.hour)
     os.makedirs(cfg["out_dir"], exist_ok=True)
-    rep = run(cfg, label, start, end, a.dry_run)
-    with open(os.path.join(cfg["out_dir"], "hourly-%s.json" % label), "w") as f:
-        json.dump(rep, f, indent=1, sort_keys=True)
+    lock_path = os.path.join(cfg["out_dir"], "hourly.lock")
+    lock = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o640)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("busy: another hourly check holds %s" % lock_path, file=sys.stderr)
+            return 2
+        rep = run(cfg, label, start, end, a.dry_run, deadline)
+        write_private(os.path.join(cfg["out_dir"], "hourly-%s.json" % label),
+                      json.dumps(rep, indent=1, sort_keys=True))
+    finally:
+        os.close(lock)
     print(summary_text(rep))
-    return 0 if rep["pass"] else 1
+    return EXIT[rep["status"]]
 
 
 if __name__ == "__main__":

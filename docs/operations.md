@@ -520,7 +520,11 @@ never waits for the disk. The GraphQL handler hands the log a body only when it 
 `max_body_bytes`; a larger body is released with its request and only its length is queued,
 so the queue never holds more than about `queue_mb`, whatever the request-body limit. At 50
 requests/s a line is about 300 bytes (GraphQL lines more), about 1.3 GB a day: size `max_mb`
-and `keep` for the hours you need, or lower `sample_rate`.
+and `keep` for the hours you need, or lower `sample_rate`. The default path is under the data
+dir, so with the defaults the log takes up to `max_mb × (keep + 1)` = 2.3 GB on the same disk
+as the store, inside the headroom the disk guard watches (`kdx_disk_free_bytes`); point `path`
+at another volume, or lower `max_mb`/`keep`, when that headroom is tight. The file is created
+mode 0640 (`keep` is at most 1000; `max_body_bytes` at most `queue_mb`).
 
 ## Hourly validation
 
@@ -536,22 +540,30 @@ python3 /usr/share/kda-indexer/compare/hourly_check.py --config /etc/kda-indexer
 ```
 
 Without `--hour` it checks the last full hour (UTC); run it a few minutes past each hour (a
-cron line or a systemd timer). `--dry-run` samples and runs the chain checks without
-replaying.
+systemd timer with a oneshot service, or a cron line). One run at a time: a run holds
+`<out_dir>/hourly.lock` (flock), and a second run exits 2 with "busy", so two runs never add
+up their stock rates. `--dry-run` samples and runs the chain checks without replaying.
 
 1. **Sample.** It reads the hour's lines from the log and its rotations and takes one request
    of every distinct query shape (route and query-parameter names; for GraphQL the document and
    its variable names), then up to `per_route` per route, `budget` in all (default 2,000).
    Identical requests are replayed once. Non-GET REST requests (they stay on the old backends),
-   GraphQL batches and bodies over the log's cap are counted, not replayed.
+   GraphQL batches and bodies over the log's cap are counted, not replayed. Only GraphQL
+   documents whose every operation is a query are replayed: a mutation or subscription anywhere
+   in the document is skipped (`not-query`), here and again in `kda-compare`. The client's
+   `operationName` is replayed with the document. The document is parsed as GraphQL, so a
+   comment in it (a `# kdx:` directive of the compare harness included) changes nothing.
 2. **Replay.** `kda-compare replay-batch` sends each request to kda-indexer and to the stock
    side the compare config pairs it with (chainweb-data, kda-txs, the GraphQL indexer), and to
    the node where a node check applies (transaction existence by `/poll`, block hashes,
-   balances). It uses the harness's normalisers, field rules, allowlist and node oracles, and
+   balances). GraphQL `pactQuery`/`gasLimitEstimate` requests run the client's Pact code through
+   the stock side's node `/local` (read-only and gas-capped, but the client's code). It uses
+   the harness's normalisers, field rules, allowlist and node oracles, and
    each target's `rate_rps`: keep chainweb-data at 1 r/s and kda-txs and the GraphQL indexer at
    2 r/s or less; `concurrency` (default 2) bounds the requests in flight. A request that
-   differs is asked again once after `recheck_delay_s`. The replay stops at
-   `deadline_minutes`; what it did not reach counts as `not-run`.
+   differs is asked again once after `recheck_delay_s`. The whole run, re-check included, has
+   one deadline, `deadline_minutes` (default 50) from the start: the re-check only gets the
+   time left. What did not answer by then counts as `not-run`.
 3. **Classify.** Each request takes the worst class of its pairs:
 
    | Class | Meaning | Fails the hour |
@@ -559,11 +571,14 @@ replaying.
    | `equal` | same answer | no |
    | `allowlisted` (a) | a documented difference ([comparison.md](comparison.md)) | no |
    | `known-gap` (d) | a known gap the allowlist names | no |
-   | `timing` (c) | a tip race, a balance row read while the drain had it stale, or a difference the re-check no longer shows | no |
+   | `timing` (c) | a tip race, a balance row read while the drain had it stale, or a difference the re-check finds `equal` or `allowlisted` | no |
    | `stock-unavailable` | the stock side failed | no |
    | `not-compared` | nothing to compare (a tip-only GraphQL document, no oracle) | no |
    | `ours-error` | kda-indexer failed | yes |
    | `unexplained` | any other difference | yes |
+
+   A re-check that answers `ours-error` makes the request `ours-error`; any other re-check
+   (stock failed, not compared, still different, no answer) keeps it `unexplained`.
 
    The replay runs after the request was served, up to an hour later. It checks the same
    request's answer now, not the bytes that were served: what moved with the tip in between is
@@ -576,14 +591,20 @@ replaying.
 The hour **passes** with no `unexplained` and no `ours-error`, every chain within
 `ready_max_lag` (default 20) now and in every logged request of the hour, no halted chain or
 hash mismatch, no restart since the last run, and no route with more than `max_5xx_share`
-(0.5%, at least 2) of its answers 5xx. Exit 0 = pass, 1 = fail, 2 = the check could not run.
+(0.5%, at least 2) of its answers 5xx. An hour with no failure but too few requests compared is
+**inconclusive**, not a pass: compared (every class except `stock-unavailable`,
+`not-compared` and `not-run`) below `min_compared_share` (default 0.6) of the sample or below
+`min_compared` (default 200), whichever is higher. That covers stock down all hour and a
+deadline hit before the answers came back; a quiet hour with a small sample is inconclusive
+too (lower `min_compared` if such hours are expected). Exit 0 = pass, 1 = fail, 2 = the check
+could not run (or "busy"), 3 = inconclusive.
 
 Output: a short summary on stdout (pass or fail, counts per class, a line per route, the chain
 line, up to five difference examples marked `NEW` when that route and set of differing fields
 was not seen in an earlier hour, and the reasons for a fail), and the full report as
 `<out_dir>/hourly-<hour>.json`. `<out_dir>/hourly-state.json` carries the restart counters,
-the drain level and the differences already seen to the next run. The report holds request
-paths and GraphQL variables: keep it on the host.
+the drain level and the newest 5,000 differences seen to the next run. The report holds
+request paths and GraphQL variables: both files are written mode 0640; keep them on the host.
 
 ## `/stats` freshness
 

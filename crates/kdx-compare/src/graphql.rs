@@ -119,6 +119,8 @@ pub struct GqlOp {
     pub kind: OpKind,
     pub roots: Vec<String>,
     pub captured: bool,
+    /// `operationName` sent with the document (a replayed multi-operation document).
+    pub operation_name: Option<String>,
 }
 
 impl GqlOp {
@@ -183,7 +185,29 @@ pub fn parse_op(stem: &str, text: &str, captured: bool) -> anyhow::Result<GqlOp>
         }
     }
     let roots = root_fields(&query);
-    let kind = match directive.as_deref() {
+    let kind = op_kind(stem, directive.as_deref(), is_sub, &roots, &vars)?;
+    Ok(GqlOp {
+        stem: stem.to_string(),
+        query,
+        vars,
+        example: Map::new(),
+        kind,
+        roots,
+        captured,
+        operation_name: None,
+    })
+}
+
+/// The kind of an operation from its `# kdx:` directive (captured documents only), whether it
+/// is a subscription, its root fields and its variables.
+fn op_kind(
+    stem: &str,
+    directive: Option<&str>,
+    is_sub: bool,
+    roots: &[String],
+    vars: &[VarDef],
+) -> anyhow::Result<OpKind> {
+    Ok(match directive {
         Some("oracle") => OpKind::Oracle,
         Some("tip") => OpKind::Tip,
         Some("node-tx") => OpKind::NodeTx,
@@ -219,15 +243,85 @@ pub fn parse_op(stem: &str, text: &str, captured: bool) -> anyhow::Result<GqlOp>
                 OpKind::Tip
             }
         }
+    })
+}
+
+/// Why a logged client document is not replayed (`replay_op`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayReject {
+    /// Not a valid executable document, or `operationName` does not select one operation.
+    NotParsed,
+    /// The document holds a mutation or a subscription (anywhere, in any operation).
+    NotQuery,
+}
+
+impl ReplayReject {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NotParsed => "not-parsed",
+            Self::NotQuery => "not-query",
+        }
+    }
+}
+
+/// The operation a logged client document runs, for `replay-batch`. The document is parsed as
+/// GraphQL: comments, and with them any `# kdx:` directive, are ignored, so a client cannot
+/// steer how its request is classified. Every operation in the document must be a query;
+/// `operation_name` selects one of several and is sent along with the document.
+pub(crate) fn replay_op(query: &str, operation_name: Option<&str>) -> Result<GqlOp, ReplayReject> {
+    use async_graphql_parser::types::{DocumentOperations, OperationType, Selection};
+    let doc = async_graphql_parser::parse_query(query).map_err(|_| ReplayReject::NotParsed)?;
+    if doc
+        .operations
+        .iter()
+        .any(|(_, op)| op.node.ty != OperationType::Query)
+    {
+        return Err(ReplayReject::NotQuery);
+    }
+    // The parser keeps an anonymous operation as `Single` and named ones in `Multiple`.
+    let op = match (&doc.operations, operation_name) {
+        (DocumentOperations::Single(op), _) => op,
+        (DocumentOperations::Multiple(ops), Some(n)) => ops
+            .iter()
+            .find(|(k, _)| k.as_str() == n)
+            .map(|(_, op)| op)
+            .ok_or(ReplayReject::NotParsed)?,
+        (DocumentOperations::Multiple(ops), None) if ops.len() == 1 => {
+            ops.values().next().ok_or(ReplayReject::NotParsed)?
+        }
+        (DocumentOperations::Multiple(_), None) => return Err(ReplayReject::NotParsed),
     };
+    let vars: Vec<VarDef> = op
+        .node
+        .variable_definitions
+        .iter()
+        .map(|v| VarDef {
+            name: v.node.name.node.to_string(),
+            required: !v.node.var_type.node.nullable,
+        })
+        .collect();
+    let roots: Vec<String> = op
+        .node
+        .selection_set
+        .node
+        .items
+        .iter()
+        .filter_map(|s| match &s.node {
+            Selection::Field(f) => Some(f.node.name.node.to_string()),
+            _ => None,
+        })
+        .collect();
+    let kind =
+        op_kind("replay", None, false, &roots, &vars).map_err(|_| ReplayReject::NotParsed)?;
     Ok(GqlOp {
-        stem: stem.to_string(),
-        query,
+        stem: "replay".to_string(),
+        query: query.trim().to_string(),
         vars,
         example: Map::new(),
         kind,
         roots,
-        captured,
+        captured: true,
+        operation_name: operation_name.map(str::to_string),
     })
 }
 
@@ -971,7 +1065,10 @@ impl Answer {
 }
 
 fn body_of(op: &GqlOp, vars: &Map<String, Value>) -> Value {
-    json!({ "query": op.query, "variables": vars })
+    match &op.operation_name {
+        Some(n) => json!({ "query": op.query, "variables": vars, "operationName": n }),
+        None => json!({ "query": op.query, "variables": vars }),
+    }
 }
 
 fn curl_of(op: &GqlOp, vars: &Map<String, Value>, var: &str) -> String {
@@ -3636,18 +3733,21 @@ pub async fn once(cfg: CompareConfig, stem: &str) -> anyhow::Result<Vec<Outcome>
     Ok(out)
 }
 
-/// `replay-batch`: one logged GraphQL request (document and variables as the client sent
-/// them) through every GraphQL pair whose B is an oracle. The operation keeps the stem of the
+/// `replay-batch`: one logged GraphQL request (document, `operationName` and variables as the
+/// client sent them; [`replay_op`] rejects anything but queries and ignores `# kdx:` comments)
+/// through every GraphQL pair whose B is an oracle. The operation keeps the stem of the
 /// captured document with the same root fields, so the allowlist entries scoped to that
 /// document apply; other documents get the stem `replay`. Returns `(class, outcomes)`:
 /// `class` is set (and `outcomes` empty) when the request is not compared, with the reason.
 pub(crate) async fn replay_one(
     ctx: &Ctx,
     query: &str,
+    operation_name: Option<&str>,
     vars: Map<String, Value>,
 ) -> (Option<&'static str>, Vec<Outcome>) {
-    let Ok(parsed) = parse_op("replay", query, true) else {
-        return (Some("not-parsed"), Vec::new());
+    let parsed = match replay_op(query, operation_name) {
+        Ok(p) => p,
+        Err(e) => return (Some(e.reason()), Vec::new()),
     };
     let stem = ctx
         .gql
@@ -3781,6 +3881,71 @@ pub fn page_data(v: &Value) -> Result<Value, PageError> {
 
 #[cfg(test)]
 mod tests {
+    /// PR 76 fix round 1: a replayed client document is parsed as GraphQL, so a `# kdx:`
+    /// comment does not change its kind; a mutation or subscription anywhere in the document
+    /// is not replayed; `operationName` selects one of several queries and is sent along.
+    #[test]
+    fn replay_op_ignores_directives_and_rejects_non_queries() {
+        use super::{body_of, replay_op, OpKind, ReplayReject};
+        let bounded = "query Q($height: Int!) { block(height: $height) { hash } }";
+        let plain = replay_op(bounded, None).unwrap();
+        assert_eq!(plain.kind, OpKind::Oracle);
+        assert_eq!(plain.roots, ["block"]);
+        assert!(plain.vars[0].required);
+        for d in ["tip", "pact", "node-tx", "oracle", "bogus"] {
+            let doc = format!("# kdx:{d}\n{bounded}");
+            let op = replay_op(&doc, None).unwrap();
+            assert_eq!(op.kind, OpKind::Oracle, "# kdx:{d} was obeyed");
+        }
+        let tip = replay_op("# kdx:oracle\n{ lastBlockHeight }", None).unwrap();
+        assert_eq!(
+            tip.kind,
+            OpKind::Tip,
+            "a directive cannot turn a tip query into a compared one"
+        );
+        for doc in [
+            "mutation M { x }",
+            "subscription S { newBlocks { hash } }",
+            "query A { lastBlockHeight } mutation B { x }",
+            "query A { lastBlockHeight } subscription B { events { name } }",
+            "query A { lastBlockHeight }\n# kdx:oracle\nmutation B { x }",
+        ] {
+            for name in [None, Some("A"), Some("B")] {
+                assert_eq!(
+                    replay_op(doc, name).unwrap_err(),
+                    ReplayReject::NotQuery,
+                    "{doc} / {name:?}"
+                );
+            }
+        }
+        assert_eq!(
+            replay_op("query {", None).unwrap_err(),
+            ReplayReject::NotParsed
+        );
+        let multi = "query A { lastBlockHeight } query B($requestKey: String!) { transaction(requestKey: $requestKey) { hash } }";
+        assert_eq!(replay_op(multi, None).unwrap_err(), ReplayReject::NotParsed);
+        assert_eq!(
+            replay_op(multi, Some("C")).unwrap_err(),
+            ReplayReject::NotParsed
+        );
+        let b = replay_op(multi, Some("B")).unwrap();
+        assert_eq!(
+            (b.kind, b.roots.clone()),
+            (OpKind::Oracle, vec!["transaction".to_string()])
+        );
+        let body = body_of(&b, &serde_json::Map::new());
+        assert_eq!(body["operationName"], "B");
+        assert_eq!(body["query"], multi);
+        assert_eq!(replay_op(multi, Some("A")).unwrap().kind, OpKind::Tip);
+        assert_eq!(
+            replay_op(bounded, Some("Other")).unwrap_err(),
+            ReplayReject::NotParsed
+        );
+        assert!(body_of(&plain, &serde_json::Map::new())
+            .get("operationName")
+            .is_none());
+    }
+
     /// FIX-3 (O1): `data` when there is some; else the `errors` text, and whether one is a
     /// complexity `LIMIT` (in `extensions`, as ours sends it, or at the error's top level).
     #[test]

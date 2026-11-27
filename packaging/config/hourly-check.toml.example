@@ -2,7 +2,7 @@
 # the hourly answer check after a cutover (docs/operations.md "Hourly validation").
 # Run it a few minutes past each hour for the previous hour:
 #   python3 /usr/share/kda-indexer/compare/hourly_check.py --config /etc/kda-indexer/hourly-check.toml
-# Exit 0 = pass, 1 = fail, 2 = could not run. Output: a summary on stdout and
+# Exit 0 = pass, 1 = fail, 2 = could not run or busy, 3 = inconclusive. Output: a summary on stdout and
 # <out_dir>/hourly-<YYYY-MM-DDTHH>.json.
 
 # The indexer's request log ([api.request_log] path, resolved under the data dir).
@@ -23,11 +23,13 @@ out_dir = "/var/lib/kda-indexer/hourly"
 budget = 2000            # requests replayed per hour at most
 per_route = 300          # per route at most, after one of every distinct query shape
 concurrency = 2          # requests compared at the same time (each target keeps its rate cap)
-deadline_minutes = 50    # the replay stops here; the rest counts as not-run
+deadline_minutes = 50    # one deadline for the whole run, re-check included; the rest is not-run
 recheck_delay_s = 30     # a differing request is asked again once after this
 ready_max_lag = 20       # api.ready_max_lag
 max_5xx_share = 0.005    # per route, with at least min_5xx answers
 min_5xx = 2
+min_compared_share = 0.6 # inconclusive (exit 3) below this share of the sample compared ...
+min_compared = 200       # ... or below this many, whichever is higher
 
 # The compare config (/etc/kda-indexer/compare-hourly.toml), in the format of
 # compare.toml.example, with the stock caps: chainweb-data 1 r/s, kda-txs and the GraphQL

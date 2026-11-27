@@ -68,8 +68,8 @@ pub struct Metrics {
     pub disk_free_bytes: Gauge,
     pub mdbx_commit_seconds: Histogram,
     pub http_requests: Count,
-    /// `[api.request_log]` lines per result: `written`, `dropped` (queue full) or `error`
-    /// (the write failed).
+    /// `[api.request_log]` lines per result: `written`, `dropped` (queue full: lines),
+    /// `dropped_bytes` (queue full: bytes) or `error` (the write failed).
     pub request_log_lines: Count,
     pub http_request_seconds: Hist,
     pub search_rejected: Count,
@@ -277,7 +277,7 @@ impl Metrics {
         );
         let request_log_lines = reg!(
             "kdx_request_log_lines",
-            "Request log lines per result (written, dropped on a full queue, error)",
+            "Request log lines per result (written, dropped or dropped_bytes on a full queue, error)",
             Count::default()
         );
         let http_request_seconds = reg!(

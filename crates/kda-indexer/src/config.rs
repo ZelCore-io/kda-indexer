@@ -385,6 +385,9 @@ impl Default for RequestLogConfig {
     }
 }
 
+/// Most rotated request log files (`api.request_log.keep`): every rotation renames them all.
+pub const MAX_REQUEST_LOG_KEEP: u32 = 1000;
+
 impl RequestLogConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -399,6 +402,15 @@ impl RequestLogConfig {
         anyhow::ensure!(
             (1..=1024).contains(&self.queue_mb),
             "api.request_log.queue_mb must be between 1 and 1024"
+        );
+        anyhow::ensure!(
+            self.keep <= MAX_REQUEST_LOG_KEEP,
+            "api.request_log.keep must be at most {MAX_REQUEST_LOG_KEEP}"
+        );
+        anyhow::ensure!(
+            u64::try_from(self.max_body_bytes).unwrap_or(u64::MAX) <= self.queue_mb << 20,
+            "api.request_log.max_body_bytes must be at most queue_mb ({} MB)",
+            self.queue_mb
         );
         anyhow::ensure!(
             matches!(self.client_ip.as_str(), "hash" | "omit"),
@@ -1604,11 +1616,18 @@ mod api_tests {
             "queue_mb = 0",
             "client_ip = \"raw\"",
             "path = \"\"",
+            "keep = 1001",
+            "max_body_bytes = 8388609",
+            "queue_mb = 1\nmax_body_bytes = 1048577",
         ] {
             let c = api(&format!("[request_log]\n{bad}")).unwrap().request_log;
             assert!(c.validate().is_err(), "{bad}");
         }
         assert!(api("[request_log]\nheaders = true").is_err());
+        for ok in ["keep = 1000", "max_body_bytes = 8388608"] {
+            let c = api(&format!("[request_log]\n{ok}")).unwrap().request_log;
+            assert!(c.validate().is_ok(), "{ok}");
+        }
     }
 
     /// Task 10: a listener takes one address or an array; every address is in `Binds`.
