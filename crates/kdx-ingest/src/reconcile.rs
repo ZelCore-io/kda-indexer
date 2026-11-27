@@ -521,10 +521,8 @@ pub const MAX_REFILL_WINDOW: usize = 32;
 /// A refill window older than this (counted from the end of its walk) is taken again even
 /// with keys left. A tip mark made just after a walk passed its key waits at most about this
 /// long plus that walk, the next walk or the batch it overlaps (the longer) and the batch that
-/// reads it. Long enough for a window to serve several batches of 4 to 12 s (KDA mainnet): at
-/// 5 s every batch walked the table again. A stale mark in an old window costs one extra read
-/// at most (compare-and-clear on the exact mark), never a wrong row.
-pub const WINDOW_MAX_AGE: Duration = Duration::from_secs(30);
+/// reads it.
+pub const WINDOW_MAX_AGE: Duration = Duration::from_secs(5);
 
 /// The refill of `k` batches at once: [`refill_with`] for `k × n` keys, `k × share` per
 /// module and `k` batches' tip shares. One refill walks all of `BalanceDirty` whatever `n`
@@ -591,7 +589,9 @@ impl RefillWindow {
     }
 
     /// The next batch: up to `n` keys. At most the tip share of `n` tip keys first, then the
-    /// rest in the window's order; when the rest runs out, more tip keys fill the batch.
+    /// rest in the window's order; when the rest runs out, more tip keys fill the batch, but
+    /// those surplus keys are marked `tip: false` (like a per-batch refill's: they go through
+    /// [`ReadPool::pick_batch`], not the primary).
     pub fn next_batch(&mut self, n: usize) -> Vec<Dirty> {
         let n = n.max(1);
         let tip_left = self.tip.len() - self.tip_pos;
@@ -600,6 +600,9 @@ impl RefillWindow {
         let tip = tip_left.min(n - rest);
         let mut out = Vec::with_capacity(tip + rest);
         out.extend_from_slice(&self.tip[self.tip_pos..self.tip_pos + tip]);
+        for d in out.iter_mut().skip(tip_share(n)) {
+            d.tip = false;
+        }
         out.extend_from_slice(&self.rest[self.rest_pos..self.rest_pos + rest]);
         self.tip_pos += tip;
         self.rest_pos += rest;

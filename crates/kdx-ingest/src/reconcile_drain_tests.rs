@@ -211,6 +211,34 @@ fn window_starts_with_the_tip_share() {
 
 /// A window is refilled when it is used up or [`WINDOW_MAX_AGE`] old, not before; an empty
 /// or cleared window is always due.
+/// When the backlog runs out and tip keys fill the rest of a batch, those surplus tip keys
+/// are marked `tip: false` (they go through `pick_batch` like a per-batch refill's), while the
+/// batch's own tip share keeps `tip: true`.
+#[test]
+fn surplus_tip_keys_lose_the_tip_flag() {
+    let k = |i: u8, tip: bool| Dirty {
+        key: [i; 9],
+        mark: Mark { height: 1, seq: 1 },
+        seed: false,
+        tip,
+    };
+    let mut w = RefillWindow::default();
+    // 2 backlog keys and 10 tip keys; a batch of 8 has a tip share of 2.
+    let mut keys: Vec<Dirty> = (0..10).map(|i| k(i, true)).collect();
+    keys.extend((10..12).map(|i| k(i, false)));
+    w.set(keys, Instant::now());
+    let b = w.next_batch(8);
+    assert_eq!(b.len(), 8);
+    assert_eq!(b.iter().filter(|d| d.tip).count(), tip_share(8));
+    assert!(b[..tip_share(8)].iter().all(|d| d.tip));
+    assert!(b[tip_share(8)..].iter().all(|d| !d.tip), "surplus");
+    assert_eq!(
+        b.iter().map(|d| d.key[0]).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5, 10, 11],
+        "the tip keys, then the whole backlog"
+    );
+}
+
 #[test]
 fn window_is_due_when_used_up_or_old() {
     let t = Instant::now();
@@ -224,7 +252,9 @@ fn window_is_due_when_used_up_or_old() {
     };
     w.set(vec![d(1), d(2), d(3)], t);
     assert!(!w.due(t, WINDOW_MAX_AGE));
+    assert_eq!(WINDOW_MAX_AGE, Duration::from_secs(5));
     assert!(!w.due(t + Duration::from_millis(4_999), WINDOW_MAX_AGE));
+    assert!(w.due(t + Duration::from_millis(5_001), WINDOW_MAX_AGE));
     assert!(
         w.due(t + WINDOW_MAX_AGE, WINDOW_MAX_AGE),
         "old: refilled with keys left"

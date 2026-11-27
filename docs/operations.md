@@ -861,13 +861,13 @@ at the 50/s cap drains about 38 rows/s, about 3 days. Two settings shorten that:
   keys for this many batches at once. Each batch of the window keeps its own write
   transaction, bookkeeping and backoff, and clears only the exact mark it read, so a key the
   tail marks again meanwhile is read again later. The window is taken again once used up or
-  30 s old (counted from the end of its walk). The walk takes the window's batches' tip
+  5 s old (counted from the end of its walk). The walk takes the window's batches' tip
   shares, and every batch of the window takes its own: at most 25% tip keys (the newest marks
   of each chain), the rest from the old backlog, oldest first, as with a walk per batch. The
   next window's walk runs while the window's last batch reads, and leaves that batch's keys
   out. A tip mark made just after a walk passed its key is picked up by the next window's
-  walk, so it waits at most about that walk, 30 s, the next walk or the batch it overlaps
-  (the longer of the two) and the batch that reads it: a few seconds past 30 s on a large
+  walk, so it waits at most about that walk, 5 s, the next walk or the batch it overlaps
+  (the longer of the two) and the batch that reads it: a few seconds past 5 s on a large
   backlog. A mark that changes while its window is in use costs one more read at most, never
   a wrong row (each batch clears only the exact mark it read). 1 walks the table before every
   batch (the behaviour before windows). Batched `details` calls go to the `local_urls` nodes other than
