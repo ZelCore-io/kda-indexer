@@ -15,8 +15,6 @@ pub enum Code {
     Timeout,
     /// `totalCount` could not be counted exactly before the request deadline (GQ-10).
     CountTimeout,
-    /// An `events.parametersFilter` form that is not served (GQ-11).
-    UnsupportedFilter,
     /// Stored data a field needs is not there (yet): NFT `guard`/`info` before the reconciler
     /// read them, or when the node had no usable answer (GQ-15).
     NotAvailable,
@@ -31,7 +29,6 @@ impl Code {
             Code::Limit => "LIMIT",
             Code::Timeout => "TIMEOUT",
             Code::CountTimeout => "COUNT_TIMEOUT",
-            Code::UnsupportedFilter => "UNSUPPORTED_FILTER",
             Code::NotAvailable => "NOT_AVAILABLE",
             Code::Internal => "INTERNAL",
         }
@@ -114,18 +111,17 @@ pub fn codeless_request_error(r: &async_graphql::Response) -> bool {
 /// `extensions.code`s of the errors this indexer raises itself on a field: a cut
 /// `totalCount` (`COUNT_TIMEOUT`), a cap or a busy slot (`LIMIT`: the search slot, page and
 /// item caps, DEX budgets), a passed deadline (`TIMEOUT`) and data still being built
-/// (`NOT_AVAILABLE`: a fill or readiness wait), and a field or filter this indexer does not
-/// serve (`NOT_SUPPORTED`, `UNSUPPORTED_FILTER`). Stock never raises these, so on a non-null
+/// (`NOT_AVAILABLE`: a fill or readiness wait), and a field this indexer does not serve
+/// (`NOT_SUPPORTED`). Stock never raises these, so on a non-null
 /// field they null that field in place and keep the rest of the page (the behaviour before
 /// #60) instead of bubbling to the nearest nullable parent ([`crate::order`]). Every other
 /// error, async-graphql's own included, bubbles as the spec says.
-pub const IN_PLACE_CODES: [&str; 6] = [
+pub const IN_PLACE_CODES: [&str; 5] = [
     "COUNT_TIMEOUT",
     "LIMIT",
     "TIMEOUT",
     "NOT_AVAILABLE",
     "NOT_SUPPORTED",
-    "UNSUPPORTED_FILTER",
 ];
 
 /// Whether an error with these extensions is nulled in place rather than bubbled: its code
@@ -301,16 +297,11 @@ mod in_place_tests {
         x
     }
 
-    /// PR #62 review I-a: an unserved field (`minerAccount`, a search left off) or filter
-    /// keeps the rest of the page like the other indexer-raised codes.
+    /// PR #62 review I-a: an unserved field (a search left off) keeps the rest of the page
+    /// like the other indexer-raised codes.
     #[test]
     fn unserved_fields_and_filters_null_in_place() {
-        for c in [
-            "NOT_SUPPORTED",
-            "UNSUPPORTED_FILTER",
-            "COUNT_TIMEOUT",
-            "NOT_AVAILABLE",
-        ] {
+        for c in ["NOT_SUPPORTED", "COUNT_TIMEOUT", "NOT_AVAILABLE"] {
             assert!(nulls_in_place(Some(&ext(c))), "{c}");
         }
         for c in ["BAD_USER_INPUT", "INTERNAL", INTERNAL_SERVER_ERROR] {

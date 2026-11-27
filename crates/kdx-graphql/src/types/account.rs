@@ -186,7 +186,7 @@ fn all_chains(ctx: &Context<'_>) -> Vec<u8> {
     (0..n).collect()
 }
 
-/// `Block.minerAccount`, the `FungibleChainAccount` node and other single chain-account
+/// The `FungibleChainAccount` node and other single chain-account
 /// lookups inside a read (any balance, as every list).
 pub fn chain_account_in(
     view: &View,
@@ -202,6 +202,46 @@ pub fn chain_account_in(
             module: module.to_owned(),
             row,
         }))
+}
+
+/// `Block.minerAccount`: the miner's `module` row on `chain`, as stock answers it. Stock reads
+/// `(coin.details "<miner>")` from the node for every block and, when that read fails for any
+/// reason (no row on the chain, a name that is no account, a timeout), answers balance 0 and
+/// a guard of `raw: "null"` (`formatBalance_NODE`, `formatGuard_NODE`). Ours: the stored row
+/// (any balance); with none, one node read through [`crate::miss`] (its budgets and cache;
+/// a refused or failed read flags `nodeReadIncomplete`); with no row found, stock's zero row.
+pub async fn miner_chain_account(
+    ctx: &Context<'_>,
+    account: String,
+    chain: u8,
+    module: &str,
+) -> Result<FungibleChainAccount> {
+    let (acc, m) = (account.clone(), module.to_owned());
+    let (rows, ok) = gql(ctx)
+        .state()?
+        .read(move |view| stored_rows(view, &acc, &m, Some(&[chain])))
+        .await
+        .map_err(from_api)?;
+    let mut rows = rows;
+    if rows.is_empty() {
+        if ok && gql(ctx).miss.is_some() {
+            with_misses(ctx, &account, module, ok, &[chain], &mut rows).await;
+        } else {
+            // No node read to make (reads off, or a module the store does not serve): the
+            // zero below is unverified, so say so (PR #65 m-4).
+            crate::flags::mark(ctx, crate::flags::Flag::NodeReadIncomplete);
+        }
+    }
+    let row = rows.into_iter().next().unwrap_or_else(|| ChainRow {
+        chain,
+        balance: "0".into(),
+        guard: map_guard(&Value::Null, None),
+    });
+    Ok(FungibleChainAccount {
+        account,
+        module: module.to_owned(),
+        row,
+    })
 }
 
 /// Accounts whose guard holds `pk`, with only those rows (on `chain` when given): at most

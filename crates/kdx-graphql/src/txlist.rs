@@ -281,45 +281,174 @@ pub struct KeyFilter {
     pub user_only: bool,
 }
 
-/// `events.parametersFilter` (GQ-11): only `{"array_starts_with": <value or array>}`.
+/// `events.parametersFilter` (GQ-11). Stock documents a Prisma JSON filter here and then
+/// never reads the argument: every value, malformed included, answers the unfiltered events.
+/// We serve the Prisma JSON filter forms on the params array (each a row predicate, so the
+/// list costs what the unfiltered list costs), ANDed when several keys are given:
+///
+/// - `array_starts_with`, `array_ends_with`: a value, or an array of values in order;
+/// - `array_contains`: a value, or an array whose every value is a member;
+/// - `equals`, `not`: the whole (or `path`ed) value equal / not equal;
+/// - `string_contains`, `string_starts_with`, `string_ends_with`: a string target;
+/// - `path`: an array of keys or indexes (`["0"]` is the first parameter) the other keys
+///   apply to.
+///
+/// Any other value (unknown key, wrong shape, not JSON, over 8 KB) is ignored as stock
+/// ignores it: the unfiltered events, with `extensions.parametersFilterIgnored: true`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParamFilter {
-    pub prefix: Vec<Value>,
+    path: Vec<String>,
+    preds: Vec<ParamPred>,
+    /// `mode: "insensitive"`: `equals` on a string and `string_*` compare lowercased (Unicode
+    /// lowercase of both sides; the operands are lowered once at parse). `not` and `array_*`
+    /// stay exact.
+    insensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ParamPred {
+    StartsWith(Vec<Value>),
+    EndsWith(Vec<Value>),
+    Contains(Vec<Value>),
+    Equals(Value),
+    Not(Value),
+    StrContains(String),
+    StrStarts(String),
+    StrEnds(String),
+}
+
+/// The values of an `array_*` operand: an array as its values (at most 16, at least one),
+/// any other value as itself.
+fn operand(v: &Value) -> Option<Vec<Value>> {
+    match v {
+        Value::Array(a) if !a.is_empty() && a.len() <= 16 => Some(a.clone()),
+        Value::Array(_) => None,
+        x => Some(vec![x.clone()]),
+    }
 }
 
 impl ParamFilter {
-    pub fn parse(s: &str) -> async_graphql::Result<ParamFilter> {
-        let unsupported = || {
-            err(
-                Code::UnsupportedFilter,
-                "parametersFilter: only {\"array_starts_with\": <value or array>} is served",
-            )
-        };
+    /// The filter `s` serves, or `None` when stock's answer (no filter) applies.
+    pub fn parse(s: &str) -> Option<ParamFilter> {
         if s.len() > 8 * 1024 {
-            return Err(bad_input("parametersFilter is longer than 8 KB"));
+            return None;
         }
-        let v: Value = serde_json::from_str(s).map_err(|_| unsupported())?;
-        let o = v.as_object().ok_or_else(unsupported)?;
-        if o.len() != 1 {
-            return Err(unsupported());
-        }
-        let prefix = match o.get("array_starts_with") {
-            Some(Value::Array(a)) if !a.is_empty() && a.len() <= 16 => a.clone(),
-            Some(Value::Array(_)) | None => return Err(unsupported()),
-            Some(x) => vec![x.clone()],
+        let v: Value = serde_json::from_str(s).ok()?;
+        let o = v.as_object()?;
+        let mut f = ParamFilter {
+            path: Vec::new(),
+            preds: Vec::new(),
+            insensitive: false,
         };
-        Ok(ParamFilter { prefix })
+        for (k, x) in o {
+            let text = || x.as_str().map(str::to_owned);
+            let p = match k.as_str() {
+                "path" => {
+                    let a = x.as_array().filter(|a| a.len() <= 16)?;
+                    f.path = a
+                        .iter()
+                        .map(|e| match e {
+                            Value::String(s) => Some(s.clone()),
+                            Value::Number(n) => n.as_u64().map(|n| n.to_string()),
+                            _ => None,
+                        })
+                        .collect::<Option<_>>()?;
+                    continue;
+                }
+                "mode" => {
+                    f.insensitive = match x.as_str()? {
+                        "insensitive" => true,
+                        "default" => false,
+                        _ => return None,
+                    };
+                    continue;
+                }
+                "array_starts_with" => ParamPred::StartsWith(operand(x)?),
+                "array_ends_with" => ParamPred::EndsWith(operand(x)?),
+                "array_contains" => ParamPred::Contains(operand(x)?),
+                "equals" => ParamPred::Equals(x.clone()),
+                "not" => ParamPred::Not(x.clone()),
+                "string_contains" => ParamPred::StrContains(text()?),
+                "string_starts_with" => ParamPred::StrStarts(text()?),
+                "string_ends_with" => ParamPred::StrEnds(text()?),
+                _ => return None,
+            };
+            f.preds.push(p);
+        }
+        if f.insensitive {
+            for p in &mut f.preds {
+                match p {
+                    ParamPred::StrContains(x) | ParamPred::StrStarts(x) | ParamPred::StrEnds(x) => {
+                        *x = x.to_lowercase();
+                    }
+                    ParamPred::Equals(Value::String(x)) => *x = x.to_lowercase(),
+                    _ => {}
+                }
+            }
+        }
+        (!f.preds.is_empty()).then_some(f)
+    }
+
+    /// [`ParamFilter::parse`] of an optional argument, marking the request when the argument
+    /// is ignored (`parametersFilterIgnored`).
+    pub fn arg(ctx: &async_graphql::Context<'_>, s: Option<&str>) -> Option<ParamFilter> {
+        let s = s?;
+        let f = ParamFilter::parse(s);
+        if f.is_none() {
+            crate::flags::mark(ctx, crate::flags::Flag::ParametersFilterIgnored);
+        }
+        f
     }
 
     pub fn matches(&self, params: &Value) -> bool {
-        params.as_array().is_some_and(|p| {
-            p.len() >= self.prefix.len() && self.prefix.iter().zip(p).all(|(a, b)| a == b)
+        let mut t = params;
+        for k in &self.path {
+            let next = match t {
+                Value::Array(a) => k.parse::<usize>().ok().and_then(|i| a.get(i)),
+                Value::Object(o) => o.get(k),
+                _ => None,
+            };
+            match next {
+                Some(n) => t = n,
+                None => return false,
+            }
+        }
+        let folded = if self.insensitive {
+            t.as_str().map(str::to_lowercase)
+        } else {
+            None
+        };
+        let text = folded.as_deref().or_else(|| t.as_str());
+        self.preds.iter().all(|p| match p {
+            ParamPred::StartsWith(x) => t
+                .as_array()
+                .is_some_and(|a| a.len() >= x.len() && x.iter().zip(a).all(|(x, y)| x == y)),
+            ParamPred::EndsWith(x) => t.as_array().is_some_and(|a| {
+                a.len() >= x.len() && x.iter().rev().zip(a.iter().rev()).all(|(x, y)| x == y)
+            }),
+            ParamPred::Contains(x) => t
+                .as_array()
+                .is_some_and(|a| x.iter().all(|x| a.contains(x))),
+            ParamPred::Equals(Value::String(x)) if self.insensitive => text == Some(x.as_str()),
+            ParamPred::Equals(x) => t == x,
+            ParamPred::Not(x) => t != x,
+            ParamPred::StrContains(x) => text.is_some_and(|s| s.contains(x.as_str())),
+            ParamPred::StrStarts(x) => text.is_some_and(|s| s.starts_with(x.as_str())),
+            ParamPred::StrEnds(x) => text.is_some_and(|s| s.ends_with(x.as_str())),
         })
     }
 
-    /// The first parameter when it is a string (an account reference candidate).
+    /// The first parameter every match has when it is a string (an account reference
+    /// candidate): `array_starts_with` at the root, or `equals` on `path: ["0"]`.
     pub fn first_str(&self) -> Option<&str> {
-        self.prefix.first().and_then(Value::as_str)
+        self.preds
+            .iter()
+            .find_map(|p| match (p, self.path.as_slice()) {
+                (ParamPred::StartsWith(x), []) => x.first().and_then(Value::as_str),
+                // Insensitive: the stored name's case is unknown, so no exact posting source.
+                (ParamPred::Equals(x), [z]) if z == "0" && !self.insensitive => x.as_str(),
+                _ => None,
+            })
     }
 }
 
@@ -1707,23 +1836,60 @@ mod tests {
         let f = ParamFilter::parse(r#"{"array_starts_with":["k:a","k:b"]}"#).unwrap();
         assert!(f.matches(&json!(["k:a", "k:b", {"decimal": "1.0"}])));
         assert!(!f.matches(&json!(["k:a"])));
-        for bad in [
-            r#"{"path":["0"],"equals":"x"}"#,
+        let f = ParamFilter::parse(r#"{"array_ends_with":1.5}"#).unwrap();
+        assert_eq!(f.first_str(), None);
+        assert!(f.matches(&json!(["k:a", "k:b", 1.5])));
+        assert!(!f.matches(&json!([1.5, "k:a"])));
+        let f = ParamFilter::parse(r#"{"array_contains":["k:b","k:a"]}"#).unwrap();
+        assert!(f.matches(&json!(["k:a", "k:b", 1.5])));
+        assert!(!f.matches(&json!(["k:a", 1.5])));
+        let f = ParamFilter::parse(r#"{"path":["0"],"equals":"k:a"}"#).unwrap();
+        assert_eq!(f.first_str(), Some("k:a"));
+        assert!(f.matches(&json!(["k:a", "k:b"])));
+        assert!(!f.matches(&json!(["k:b", "k:a"])));
+        let f = ParamFilter::parse(r#"{"path":[1],"string_starts_with":"k:"}"#).unwrap();
+        assert!(f.matches(&json!(["", "k:b", 1])));
+        assert!(!f.matches(&json!(["k:a", "w:b", 1])));
+        assert!(!f.matches(&json!(["k:a"])));
+        let f = ParamFilter::parse(r#"{"array_starts_with":"k:a","array_ends_with":2}"#).unwrap();
+        assert!(f.matches(&json!(["k:a", "k:b", 2])));
+        assert!(!f.matches(&json!(["k:a", "k:b", 1])));
+        let f = ParamFilter::parse(r#"{"not":[]}"#).unwrap();
+        assert!(f.matches(&json!(["x"])) && !f.matches(&json!([])));
+        // `mode: "insensitive"`: string_* and equals on a string compare lowercased; `not`
+        // and array_* stay exact; equals no longer names an exact posting source.
+        let f = ParamFilter::parse(
+            r#"{"path":["0"],"string_starts_with":"K:Ab","mode":"insensitive"}"#,
+        )
+        .unwrap();
+        assert!(f.matches(&json!(["k:aBc"])) && !f.matches(&json!([1])));
+        let f =
+            ParamFilter::parse(r#"{"path":["0"],"equals":"K:ΑΒ","mode":"insensitive"}"#).unwrap();
+        assert!(f.matches(&json!(["k:αβ"])) && !f.matches(&json!(["k:αβγ"])));
+        assert_eq!(f.first_str(), None);
+        let f = ParamFilter::parse(r#"{"path":["0"],"equals":"K:a","mode":"default"}"#).unwrap();
+        assert!(!f.matches(&json!(["k:a"])) && f.first_str() == Some("K:a"));
+        let f = ParamFilter::parse(r#"{"array_contains":"K:a","mode":"insensitive"}"#).unwrap();
+        assert!(!f.matches(&json!(["k:a"])));
+        // Stock ignores the argument: what we cannot serve is ignored too (no filter).
+        for ignored in [
+            r#"{"string_contains":"a","mode":"insensitive","gt":1}"#,
+            r#"{"string_contains":"a","mode":"loose"}"#,
+            r#"{"mode":"insensitive"}"#,
             r#"{"array_starts_with":"a","x":1}"#,
             r#"{"array_starts_with":[]}"#,
+            r#"{"path":["0"]}"#,
+            r#"{"string_contains":1}"#,
+            r#"{}"#,
             "[1]",
             "not json",
         ] {
-            let e = ParamFilter::parse(bad).unwrap_err();
-            assert_eq!(
-                e.extensions
-                    .as_ref()
-                    .and_then(|x| x.get("code"))
-                    .map(|v| v.to_string()),
-                Some("\"UNSUPPORTED_FILTER\"".into()),
-                "{bad}"
-            );
+            assert_eq!(ParamFilter::parse(ignored), None, "{ignored}");
         }
+        assert_eq!(
+            ParamFilter::parse(&format!("\"{}\"", "a".repeat(9000))),
+            None
+        );
     }
 
     #[test]
