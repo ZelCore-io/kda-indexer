@@ -172,9 +172,10 @@ impl Dec {
         Dec::parse(&n.to_string()).unwrap_or_default()
     }
 
-    /// `-?digits(.digits)?`, at most 256 bytes; digits past [`SCALE`] places are dropped.
+    /// `-?digits(.digits)?`, at most [`kdx_hot::dex::MAX_STORED_TEXT`] bytes (the longest
+    /// sum the store keeps); digits past [`SCALE`] places are dropped.
     pub fn parse(s: &str) -> Option<Dec> {
-        if s.is_empty() || s.len() > 256 {
+        if s.is_empty() || s.len() > kdx_hot::dex::MAX_STORED_TEXT {
             return None;
         }
         let (neg, body) = match s.strip_prefix('-') {
@@ -324,9 +325,13 @@ impl Dec {
         }
     }
 
-    /// The nearest double (for `Float` fields).
+    /// The nearest double (for `Float` fields); 0 past the double range (never infinite).
     pub fn to_f64(&self) -> f64 {
-        self.text().parse().unwrap_or(0.0)
+        self.text()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .unwrap_or(0.0)
     }
 }
 
@@ -383,5 +388,17 @@ mod tests {
         assert_eq!(big.mul(&d("2")).text(), format!("1{}", "9".repeat(60)));
         assert!(Dec::parse("1e5").is_none() && Dec::parse("").is_none());
         assert_eq!(d("1.123456789012345678901234567891234").text().len(), 32);
+    }
+
+    /// A stored sum may be as long as the hot store allows; it reads back exactly, and a
+    /// value past the double range reads as 0 rather than a non-finite float.
+    #[test]
+    fn stored_sums_up_to_the_store_bound_parse_and_floats_stay_finite() {
+        let long = "9".repeat(kdx_hot::dex::MAX_STORED_TEXT);
+        assert_eq!(Dec::parse(&long).map(|v| v.text()), Some(long.clone()));
+        assert!(Dec::parse(&"9".repeat(kdx_hot::dex::MAX_STORED_TEXT + 1)).is_none());
+        let huge = Dec::parse(&"9".repeat(400)).unwrap();
+        assert_eq!(huge.to_f64(), 0.0);
+        assert!(Dec::parse("1.5").unwrap().to_f64() == 1.5);
     }
 }
