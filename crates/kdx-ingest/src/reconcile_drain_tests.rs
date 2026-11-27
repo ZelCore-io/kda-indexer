@@ -209,8 +209,6 @@ fn window_starts_with_the_tip_share() {
     }
 }
 
-/// A window is refilled when it is used up or [`WINDOW_MAX_AGE`] old, not before; an empty
-/// or cleared window is always due.
 /// When the backlog runs out and tip keys fill the rest of a batch, those surplus tip keys
 /// are marked `tip: false` (they go through `pick_batch` like a per-batch refill's), while the
 /// batch's own tip share keeps `tip: true`.
@@ -239,6 +237,8 @@ fn surplus_tip_keys_lose_the_tip_flag() {
     );
 }
 
+/// A window is refilled when it is used up or [`WINDOW_MAX_AGE`] old, not before; an empty
+/// or cleared window is always due.
 #[test]
 fn window_is_due_when_used_up_or_old() {
     let t = Instant::now();
