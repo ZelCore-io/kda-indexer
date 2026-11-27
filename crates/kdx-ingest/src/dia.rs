@@ -250,9 +250,13 @@ pub fn parse_price(body: &[u8], s: &DiaSettings) -> Result<Amount, PollError> {
 pub struct Guard {
     /// The anchor: a persisted rate and when it became the anchor (unix s).
     anchor: Option<(Amount, f64, u64)>,
-    /// The `Time` of the last accepted answer.
+    /// The `Time` of the last accepted answer whose rate was stored.
     last_time: Option<u64>,
-    pending: Option<(f64, u32)>,
+    /// The `Time` of the answer the last check accepted, until its rate is stored.
+    accepted_time: Option<u64>,
+    /// A held jump: its first price, the agreeing polls so far, and the `Time` of the last
+    /// one (a repeat of that answer is a replay, not one more agreeing poll).
+    pending: Option<(f64, u32, u64)>,
     /// The last check accepted a confirmed jump (the anchor moves to it once persisted).
     jumped: bool,
 }
@@ -308,16 +312,19 @@ impl Guard {
         self.jumped = false;
         match &self.anchor {
             Some((_, af, _)) if !within(f, *af) => {
+                if self.pending.is_some_and(|(_, _, t)| q.time <= t) {
+                    return Err(PollError::Replay(shown()));
+                }
                 let n = match self.pending {
-                    Some((pf, n)) if within(f, pf) => n + 1,
+                    Some((pf, n, _)) if within(f, pf) => n + 1,
                     _ => 1,
                 };
                 let first = match self.pending {
-                    Some((pf, _)) if n > 1 => pf,
+                    Some((pf, _, _)) if n > 1 => pf,
                     _ => f,
                 };
                 if n < s.confirm_polls.max(1) {
-                    self.pending = Some((first, n));
+                    self.pending = Some((first, n, q.time));
                     return Err(PollError::Held(n));
                 }
                 self.jumped = true;
@@ -325,13 +332,18 @@ impl Guard {
             _ => {}
         }
         self.pending = None;
-        self.last_time = Some(q.time);
+        // `last_time` moves once the rate is stored ([`Guard::persisted`]): an answer whose
+        // store failed is taken again.
+        self.accepted_time = Some(q.time);
         Ok(q.price)
     }
 
     /// The rate `p` accepted by the last [`Guard::check`] was stored at `now`: it becomes the
     /// anchor when there is none, the anchor is an hour old, or `p` was a confirmed jump.
     pub fn persisted(&mut self, p: &Amount, now: u64) {
+        if let Some(t) = self.accepted_time.take() {
+            self.last_time = Some(self.last_time.map_or(t, |l| l.max(t)));
+        }
         let due = match &self.anchor {
             None => true,
             Some((_, _, at)) => now.saturating_sub(*at) >= ANCHOR_SECS,
@@ -578,6 +590,42 @@ mod tests {
         assert_eq!(take(&mut g, "1.6", t + 60, &st), Err(PollError::Held(1)));
     }
 
+    /// A held jump counts each answer once: the same quotation polled again (a stuck cache,
+    /// a replayed response) is a replay and never confirms the jump on its own.
+    #[test]
+    fn a_repeated_held_quotation_does_not_confirm_a_jump() {
+        let st = DiaSettings::default();
+        let mut g = Guard::default();
+        let t = 1_790_000_000;
+        take(&mut g, "0.005", t, &st).unwrap();
+        let glitch = t + 100;
+        assert_eq!(take(&mut g, "0.05", glitch, &st), Err(PollError::Held(1)));
+        for poll in [t + 300, t + 600, t + 900] {
+            let r = g.check(q("0.05", glitch), poll, &st);
+            assert!(matches!(r, Err(PollError::Replay(_))), "{r:?}");
+        }
+        assert_eq!(g.anchor().unwrap().to_text(), "0.005");
+        // Fresh answers that agree still confirm it.
+        assert_eq!(take(&mut g, "0.05", t + 1000, &st), Err(PollError::Held(2)));
+        assert_eq!(take(&mut g, "0.05", t + 1200, &st).unwrap(), "0.05");
+    }
+
+    /// An accepted answer whose rate was not stored is not yet the last accepted one: the
+    /// same answer is taken again on the next poll.
+    #[test]
+    fn the_last_time_moves_only_once_the_rate_is_stored() {
+        let st = DiaSettings::default();
+        let mut g = Guard::default();
+        let t = 1_790_000_000;
+        assert!(g.check(q("1", t), t, &st).is_ok(), "store fails after this");
+        assert!(g.check(q("1", t), t + 300, &st).is_ok(), "retried");
+        g.persisted(&Amount::parse("1").unwrap(), t + 300);
+        assert!(matches!(
+            g.check(q("1", t), t + 600, &st),
+            Err(PollError::Replay(_))
+        ));
+    }
+
     /// Stale, future and replayed answers are refused; the last good rate stays.
     #[test]
     fn stale_and_replayed_answers_are_refused() {
@@ -592,7 +640,7 @@ mod tests {
             g.check(q("1", now + 3_600), now, &st),
             Err(PollError::Stale(_))
         ));
-        assert!(g.check(q("1", now - 60), now, &st).is_ok());
+        assert!(take(&mut g, "1", now - 60, &st).is_ok());
         assert!(matches!(
             g.check(q("1", now - 60), now + 300, &st),
             Err(PollError::Replay(_))
