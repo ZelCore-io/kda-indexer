@@ -176,6 +176,12 @@ impl Extension for WsOpsExt {
         data.insert(Arc::new(crate::txlist::XchainBudget::default()));
         // And its own account-miss read budget and memo, as an HTTP request has (a request
         // that brings one keeps it; a subscription stream has none of its own).
+        // N-22 (M-3): a budget kept here must be the message's own. One in schema or
+        // connection data would be shared by every message of every subscription.
+        debug_assert!(
+            !holds_miss_budget(&ctx.schema_env.data) && !holds_miss_budget(ctx.session_data),
+            "a MissBudget in schema or connection data is shared across websocket messages"
+        );
         if ctx.data_opt::<crate::miss::MissBudget>().is_none() {
             data.insert(crate::miss::MissBudget::default());
         }
@@ -187,6 +193,21 @@ impl Extension for WsOpsExt {
             )]),
         }
     }
+}
+
+/// Whether `d` holds a [`crate::miss::MissBudget`].
+fn holds_miss_budget(d: &Data) -> bool {
+    d.contains_key(&std::any::TypeId::of::<crate::miss::MissBudget>())
+}
+
+/// The data of one websocket connection, shared by every message on it: never a
+/// [`crate::miss::MissBudget`] (each message gets its own, N-22).
+fn connection_data(per_conn: Arc<Semaphore>, ip: std::net::IpAddr) -> Data {
+    let mut data = Data::default();
+    data.insert(ConnSubs(per_conn));
+    // Per-client gates (search, S-5) key on it; operations over this socket carry it.
+    data.insert(crate::ClientIp(ip));
+    data
 }
 
 /// The slots one subscription holds; dropping it releases them and the gauge.
@@ -450,10 +471,7 @@ async fn drive(
             in_rx,
             |mut rx| async move { rx.recv().await.map(|m| (m, rx)) },
         );
-    let mut data = Data::default();
-    data.insert(ConnSubs(per_conn.clone()));
-    // Per-client gates (search, S-5) key on it; operations over this socket carry it.
-    data.insert(crate::ClientIp(ip));
+    let data = connection_data(per_conn.clone(), ip);
     let init_flag = inited.clone();
     let gql_ws = GqlWebSocket::new((*schema).clone(), incoming, protocol)
         .connection_data(data)
@@ -551,6 +569,18 @@ mod tests {
     use futures::stream::{self, Stream};
 
     use super::*;
+
+    /// N-22 (M-3): the data every message of a connection shares holds no miss budget, so
+    /// the per-message one is never shared across messages.
+    #[test]
+    fn connection_data_holds_no_miss_budget() {
+        let d = connection_data(Arc::new(Semaphore::new(1)), [127, 0, 0, 1].into());
+        assert!(!holds_miss_budget(&d));
+        assert!(d.contains_key(&std::any::TypeId::of::<crate::ClientIp>()));
+        let mut with = Data::default();
+        with.insert(crate::miss::MissBudget::default());
+        assert!(holds_miss_budget(&with), "the check sees one");
+    }
 
     struct Q;
 
