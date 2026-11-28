@@ -33,7 +33,7 @@ use crate::store::{PostingQuery, View};
 use crate::{ApiError, ApiResult};
 
 #[derive(Default)]
-struct Filter {
+pub(super) struct Filter {
     search: Option<Like>,
     param: Option<Like>,
     name: Option<Like>,
@@ -42,7 +42,7 @@ struct Filter {
 }
 
 impl Filter {
-    fn from_params(p: &Params) -> Filter {
+    pub(super) fn from_params(p: &Params) -> Filter {
         Filter {
             search: p.get("search").map(Like::new),
             param: p.get("param").map(Like::new),
@@ -197,7 +197,7 @@ pub fn search_scan(
     page(view, f, pg, settings, 0, native)
 }
 
-fn page(
+pub(super) fn page(
     view: &View,
     f: Filter,
     pg: &Paging,
@@ -364,7 +364,7 @@ pub async fn handler(
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
     let p = Params::new(q);
-    let pg = match paging(&p) {
+    let pg = match paging(&p, true) {
         Ok(pg) => pg,
         Err(r) => return r,
     };

@@ -249,6 +249,7 @@ pub async fn events(
                 limit: lp.limit,
                 offset: 0,
                 next: lp.cursor,
+                stock: None,
                 min_height: lp.min_height,
                 max_height: lp.max_height,
                 empty: false,

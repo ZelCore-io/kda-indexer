@@ -190,7 +190,7 @@ impl RowSource for Src {
     }
 }
 
-fn page(
+pub(super) fn page(
     view: &View,
     account: &str,
     token: &str,
@@ -264,7 +264,7 @@ pub async fn handler(
         Ok(c) => c,
         Err(r) => return r,
     };
-    let pg = match paging(&p) {
+    let pg = match paging(&p, true) {
         Ok(pg) => pg,
         Err(r) => return r,
     };

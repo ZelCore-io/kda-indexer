@@ -268,7 +268,7 @@
           {
             "name": "next",
             "in": "query",
-            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not\nchainweb-data's; treat them as opaque. A token that does not decode is\n`400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
+            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors;\ntreat them as opaque. A token chainweb-data issued is accepted too and resumes on\nthe page chainweb-data serves after it (chainweb-data does not accept ours). A token\nthat does not decode is `400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
             "required": false,
             "schema": {
               "type": "string"
@@ -475,7 +475,7 @@
           {
             "name": "next",
             "in": "query",
-            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not\nchainweb-data's; treat them as opaque. A token that does not decode is\n`400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
+            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors;\ntreat them as opaque. A token chainweb-data issued is accepted too and resumes on\nthe page chainweb-data serves after it (chainweb-data does not accept ours). A token\nthat does not decode is `400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
             "required": false,
             "schema": {
               "type": "string"
@@ -751,7 +751,7 @@
           {
             "name": "next",
             "in": "query",
-            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not\nchainweb-data's; treat them as opaque. A token that does not decode is\n`400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
+            "description": "The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors;\ntreat them as opaque. A token chainweb-data issued is accepted too and resumes on\nthe page chainweb-data serves after it (chainweb-data does not accept ours). A token\nthat does not decode is `400 Invalid next token: ...`; with `offset` it is\n`400 next token query parameter not allowed with offset`.",
             "required": false,
             "schema": {
               "type": "string"

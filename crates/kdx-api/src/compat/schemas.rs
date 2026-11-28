@@ -30,9 +30,10 @@ pub struct PagingParams {
     /// `next`). A negative value counts as 0. Not allowed together with `next`.
     #[param(default = 0, maximum = 10000, example = 0)]
     offset: Option<i64>,
-    /// The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors, not
-    /// chainweb-data's; treat them as opaque. A token that does not decode is
-    /// `400 Invalid next token: ...`; with `offset` it is
+    /// The `Chainweb-Next` token of the previous page. Tokens are kda-indexer cursors;
+    /// treat them as opaque. A token chainweb-data issued is accepted too and resumes on
+    /// the page chainweb-data serves after it (chainweb-data does not accept ours). A token
+    /// that does not decode is `400 Invalid next token: ...`; with `offset` it is
     /// `400 next token query parameter not allowed with offset`.
     next: Option<String>,
     /// Lowest block height (inclusive).
