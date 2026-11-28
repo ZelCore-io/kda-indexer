@@ -739,6 +739,7 @@ fn http_state(deadline: Duration) -> Http {
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
+        heavy_waiting_per_client: 32,
     };
     let st = kdx_api::Api::new(store, settings, kdx_api::TipWatch::default()).state();
     Http { _dir: d, st }

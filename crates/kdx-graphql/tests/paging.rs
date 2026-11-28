@@ -369,6 +369,7 @@ fn fixture_big(gs: GraphqlSettings, extra: u32) -> Fx {
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
+        heavy_waiting_per_client: 32,
     };
     let st = Api::new(store.clone(), settings, TipWatch::default()).state();
     Fx {

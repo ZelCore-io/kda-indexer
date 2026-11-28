@@ -41,6 +41,7 @@ fn fx() -> &'static Fx {
             read_threads: 2,
             ready_max_lag: 10,
             max_event_lists: 64,
+            heavy_waiting_per_client: 32,
         };
         let st: Arc<ApiState> = Api::new(store, settings, TipWatch::default()).state();
         let app = router(build_schema(st.clone(), GraphqlSettings::default(), None)).with_state(st);

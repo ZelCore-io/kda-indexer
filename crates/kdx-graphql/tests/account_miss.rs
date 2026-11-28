@@ -166,6 +166,7 @@ fn fixture_with(mode: Mode, s: MissSettings, extra: &[(u8, u64, &str)]) -> Fx {
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
+        heavy_waiting_per_client: 32,
     };
     let st = Api::new(store, settings, TipWatch::default()).state();
     let (mock, details) = mock(mode);

@@ -745,7 +745,7 @@ mod walk_tests {
         // A read that ends during the poll pass frees its place early, so up to 16 are refused.
         let v = post(format!("{{ {q} }}")).await;
         let refused = limits(&v);
-        let most = 20 - 1 - kdx_api::server::HEAVY_WAITING_PER_CLIENT;
+        let most = 20 - 1 - f.st.settings.heavy_waiting_per_client;
         assert!(refused > 0 && refused <= most, "{refused}: {v}");
     }
 

@@ -62,6 +62,7 @@ v1txs_deadline_ms = 30000 # read deadline of /v1/txs (kda-txs answers within 30 
 read_threads = 4          # concurrent store reads (half for heavy lists, a quarter for /v1/txs)
 ready_max_lag = 20        # /readyz: max blocks a chain may lag the node (a halted chain is never ready)
 max_event_lists = 256     # event-name lists one event query may expand to
+heavy_waiting_per_client = 32  # heavy reads one client may have waiting behind its running one (1 to 256); one more is refused at once (503)
 
 
 [graphql]

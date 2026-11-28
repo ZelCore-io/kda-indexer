@@ -340,6 +340,11 @@ pub struct ApiConfig {
     pub ready_max_lag: u32,
     /// Most event-name lists one event query expands to.
     pub max_event_lists: usize,
+    /// Heavy reads (event scans, account lists, `/v1/txs`) one client may have waiting
+    /// behind its running one (1 to 256). A client never runs more than one at a time; the
+    /// waiting ones are bounded by the request deadline, and one past this many is refused
+    /// at once (503, `Retry-After: 1`).
+    pub heavy_waiting_per_client: usize,
     /// Opt-in request log of the compat and GraphQL listeners (off by default).
     pub request_log: RequestLogConfig,
 }
@@ -462,6 +467,7 @@ impl Default for ApiConfig {
             read_threads: 4,
             ready_max_lag: 20,
             max_event_lists: 256,
+            heavy_waiting_per_client: 32,
             request_log: RequestLogConfig::default(),
         }
     }
@@ -571,6 +577,7 @@ impl ApiConfig {
             read_threads: self.read_threads,
             ready_max_lag: self.ready_max_lag,
             max_event_lists: self.max_event_lists,
+            heavy_waiting_per_client: self.heavy_waiting_per_client,
         })
     }
 }
@@ -1325,6 +1332,10 @@ impl Config {
                 && a.max_event_lists > 0,
             "api: deadline_ms and v1txs_deadline_ms must be >= 100 and the other limits > 0"
         );
+        anyhow::ensure!(
+            (1..=256).contains(&a.heavy_waiting_per_client),
+            "api.heavy_waiting_per_client must be 1 to 256"
+        );
         let g = &self.graphql;
         anyhow::ensure!(
             g.ws_subs_per_conn <= g.ws_subs_per_ip.min(100)
@@ -1844,6 +1855,58 @@ mod ws_bound_tests {
         let c = parse("sender_index = false");
         c.validate().unwrap();
         assert!(!c.graphql.sender_index);
+    }
+
+    /// `api.heavy_waiting_per_client` defaults to 32, reaches the API settings, and is
+    /// bounded to 1..=256; both example configs and the docs name it.
+    #[test]
+    fn heavy_waiting_per_client_parses_defaults_and_is_bounded() {
+        let parse = |a: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[api]\n{a}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        let c = parse("");
+        c.validate().unwrap();
+        assert_eq!(c.api.heavy_waiting_per_client, 32);
+        assert_eq!(
+            c.api
+                .settings("mainnet01")
+                .unwrap()
+                .heavy_waiting_per_client,
+            32
+        );
+        for ok in ["1", "256"] {
+            let c = parse(&format!("heavy_waiting_per_client = {ok}"));
+            c.validate().unwrap();
+        }
+        for bad in ["0", "257"] {
+            let c = parse(&format!("heavy_waiting_per_client = {bad}"));
+            let e = c.validate().expect_err(bad);
+            assert!(
+                format!("{e:#}").contains("heavy_waiting_per_client"),
+                "{e:#}"
+            );
+        }
+        for (name, text) in [
+            (
+                "mainnet01.toml.example",
+                include_str!("../../../packaging/config/mainnet01.toml.example"),
+            ),
+            (
+                "testnet.toml.example",
+                include_str!("../../../packaging/config/testnet.toml.example"),
+            ),
+            ("api.md", include_str!("../../../docs/api.md")),
+            ("operations.md", include_str!("../../../docs/operations.md")),
+        ] {
+            assert!(
+                text.contains("heavy_waiting_per_client"),
+                "{name} lacks heavy_waiting_per_client"
+            );
+        }
     }
 
     /// The ws opening borrow is `ws_subs_per_conn + 2` (R-P5P9-57): the bound keeps it inside
