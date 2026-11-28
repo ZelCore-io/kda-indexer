@@ -216,7 +216,7 @@ pub enum LimitErrors {
     #[response(
         status = 503,
         content_type = "text/plain",
-        headers(("Retry-After" = String, description = "Seconds to wait; absent on the in-flight and body-size refusals."))
+        headers(("Retry-After" = String, description = "Seconds to wait; absent on the body-size refusal."))
     )]
     Unavailable(String),
     /// A read failed; the cause is logged, the body is `internal error`.
