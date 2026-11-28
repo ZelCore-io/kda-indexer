@@ -296,14 +296,17 @@ fn search_resumes_from_stock_tokens() {
     );
 }
 
-/// The `next` parameter: ours first, then stock's; garbage keeps today's 400.
+/// The `next` parameter: ours first, then stock's in the shape the route takes; garbage and
+/// the other route's shape keep today's 400.
 #[test]
 #[allow(clippy::result_large_err)] // `paging`'s Err is the finished answer
 fn next_parameter_takes_both_formats() {
-    let p = |next: &str| super::paging(&Params::new(vec![("next".into(), next.into())]));
+    let p = |next: &str, idx: bool| {
+        super::paging(&Params::new(vec![("next".into(), next.into())]), idx)
+    };
     let real =
         "KCg3NDQwNjk4LCJmZWUrbzhFT2xKYS1PRzdHaTM5N0NWcjhmd2NMTUJYcHVBMGI0MkNCOHdWblVtbyIsMSksMCk";
-    let g = p(real).ok().unwrap();
+    let g = p(real, true).ok().unwrap();
     assert!(g.next.is_none());
     let s = g.stock.unwrap();
     assert_eq!((s.height, s.idx, s.offset), (7_440_698, Some(1), 0));
@@ -312,16 +315,112 @@ fn next_parameter_takes_both_formats() {
         sub: 0,
         fp: 7,
     };
-    let g = p(&ours.encode()).ok().unwrap();
-    assert_eq!((g.next, g.stock), (Some(ours), None));
+    // Ours is taken whichever shape the route wants.
+    for idx in [true, false] {
+        let g = p(&ours.encode(), idx).ok().unwrap();
+        assert_eq!((g.next, g.stock), (Some(ours), None));
+    }
     for bad in ["AQBx", "garbage!", &real[..20]] {
-        let r = p(bad).err().unwrap();
-        assert_eq!(r.status(), axum::http::StatusCode::BAD_REQUEST, "{bad}");
+        for idx in [true, false] {
+            invalid_next(p(bad, idx).err().unwrap(), bad);
+        }
     }
     // `next` with `offset` stays refused.
-    let both = super::paging(&Params::new(vec![
-        ("next".into(), real.into()),
-        ("offset".into(), "1".into()),
-    ]));
+    let both = super::paging(
+        &Params::new(vec![
+            ("next".into(), real.into()),
+            ("offset".into(), "1".into()),
+        ]),
+        true,
+    );
     assert!(both.is_err());
+}
+
+/// A stock token of the other route's shape gets the 400 garbage gets: account and events
+/// take `((height, request key, idx), offset)`, search `((height, request key), offset)`.
+#[test]
+#[allow(clippy::result_large_err)] // `paging`'s Err is the finished answer
+fn stock_token_shape_is_per_route() {
+    let p = |next: &str, idx: bool| {
+        super::paging(&Params::new(vec![("next".into(), next.into())]), idx)
+    };
+    // Real tokens: an account/events one with idx, a search one without.
+    let with_idx =
+        "KCg3NDQwNjk4LCJmZWUrbzhFT2xKYS1PRzdHaTM5N0NWcjhmd2NMTUJYcHVBMGI0MkNCOHdWblVtbyIsMSksMCk";
+    let without = "KCg3NDQzOTAzLCItZThfOElaQU9ub2RNQUFkNzJON21WN2JfWEpLVTJQSXpXS05yOXA0bDZ3IiksMCk";
+    assert!(p(with_idx, true).unwrap().stock.is_some());
+    assert!(p(without, false).unwrap().stock.is_some());
+    invalid_next(p(with_idx, false).err().unwrap(), with_idx);
+    invalid_next(p(without, true).err().unwrap(), without);
+}
+
+/// The 400 `Invalid next token: <token>` answer.
+fn invalid_next(r: axum::response::Response, tok: &str) {
+    assert_eq!(r.status(), axum::http::StatusCode::BAD_REQUEST, "{tok}");
+    let body = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(axum::body::to_bytes(r.into_body(), 1 << 16))
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.starts_with("Invalid next token: "), "{body}");
+    assert!(
+        body.contains(&tok.chars().take(100).collect::<String>()),
+        "{body}"
+    );
+}
+
+/// A bounded scan cut while a stock token is active and part of its offset is still owed:
+/// each cut page hands back our token with the owed rows, and following them lists exactly
+/// the rows after the stock offset, none lost or repeated.
+#[test]
+fn bounded_scan_cut_keeps_the_owed_stock_offset() {
+    let (_d, store) = store();
+    let v = view(&store);
+    let q = Params::new(vec![("search".into(), "alice".into())]);
+    let one = SearchSettings {
+        max_scan_heights: 1,
+        ..SearchSettings::default()
+    };
+    let fetch = |p: &Paging| {
+        super::events::page(
+            &v,
+            super::events::Filter::from_params(&q),
+            p,
+            one,
+            1000,
+            false,
+        )
+    };
+    let all = SearchSettings::default();
+    let full = super::events::page(
+        &v,
+        super::events::Filter::from_params(&q),
+        &pg(250, None, None),
+        all,
+        1000,
+        false,
+    )
+    .unwrap()
+    .rows;
+    // A position above every row, with more offset owed than the top height holds.
+    let top = place(&full[0]).0;
+    let at_top = full.iter().filter(|r| place(r).0 == top).count();
+    assert!(at_top < full.len());
+    let owed = at_top + 2;
+    let s = StockCursor::new(i64::from(top) + 1, b"~", Some(0), owed as u64).unwrap();
+    let mut page = fetch(&pg(250, None, Some(s))).unwrap();
+    assert!(page.truncated);
+    assert!(page.rows.is_empty());
+    let mut got = vec![];
+    let mut cuts = 1;
+    loop {
+        got.extend(page.rows);
+        let Some(n) = page.next else { break };
+        page = fetch(&pg(250, Some(n), None)).unwrap();
+        cuts += 1;
+        assert!(cuts < 50);
+    }
+    assert!(cuts > 2);
+    assert_eq!(got, full[owed..].to_vec());
 }

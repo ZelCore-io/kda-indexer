@@ -119,7 +119,7 @@ pub async fn handler(
         ),
         (None, Some(pid)) => by_pact(st, &p, pid.to_owned()).await,
         (Some(s), None) => {
-            let pg = match paging(&p) {
+            let pg = match paging(&p, false) {
                 Ok(pg) => pg,
                 Err(r) => return r,
             };

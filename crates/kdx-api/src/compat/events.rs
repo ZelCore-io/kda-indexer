@@ -364,7 +364,7 @@ pub async fn handler(
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
     let p = Params::new(q);
-    let pg = match paging(&p) {
+    let pg = match paging(&p, true) {
         Ok(pg) => pg,
         Err(r) => return r,
     };

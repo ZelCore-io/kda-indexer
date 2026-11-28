@@ -119,7 +119,9 @@ Every search route runs under one gate: at most `search.concurrency` (4) searche
   equal it in every field (the coinbase rows of other chains at that height, the second row
   of a transfer to oneself) are skipped as chainweb-data skips them. The request key need not
   be one that exists. That page's `Chainweb-Next` is a kda-indexer token. A token that is
-  neither format, an `offset` past 10,000, or a request key longer than 64 bytes is the same
+  neither format, one of the other route's shape (`/txs/search` takes `((height, request
+  key), offset)`, the other routes `((height, request key, idx), offset)`), an `offset` past
+  10,000, or a request key longer than 64 bytes is the same
   400 `Invalid next token: …` as before. The other direction cannot work: chainweb-data does
   not understand kda-indexer tokens, so a client whose route falls back to chainweb-data in
   the middle of paging gets its `Invalid next token` and has to start again from the first

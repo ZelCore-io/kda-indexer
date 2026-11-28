@@ -259,8 +259,11 @@ pub struct Paging {
 }
 
 /// Parse `limit`, `offset`, `next`, `minheight`, `maxheight` with chainweb-data's answers.
+/// `stock_idx` is the shape of stock token the route takes: `true` for `((height, request
+/// key, idx), offset)` (`/txs/account`, `/txs/events`), `false` for `((height, request
+/// key), offset)` (`/txs/search`). A token of the other shape is refused like garbage.
 #[allow(clippy::result_large_err)] // the Err is the finished answer
-pub fn paging(p: &Params) -> Result<Paging, Response> {
+pub fn paging(p: &Params, stock_idx: bool) -> Result<Paging, Response> {
     let limit = int_param(p, "limit")?;
     let offset = int_param(p, "offset")?;
     let minh = int_param(p, "minheight")?;
@@ -275,8 +278,8 @@ pub fn paging(p: &Params) -> Result<Paging, Response> {
         // Ours first, then one stock chainweb-data minted.
         (Some(t), None) => match (Cursor::decode(t), StockCursor::decode(t)) {
             (Ok(c), _) => (Some(c), None),
-            (Err(_), Some(s)) => (None, Some(s)),
-            (Err(_), None) => {
+            (Err(_), Some(s)) if s.idx.is_some() == stock_idx => (None, Some(s)),
+            (Err(_), _) => {
                 let shown: String = t.chars().take(100).collect();
                 return Err(text(
                     StatusCode::BAD_REQUEST,

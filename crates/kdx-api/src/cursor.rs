@@ -257,7 +257,10 @@ impl HsRead<'_> {
         Some(if neg { -n } else { n })
     }
 
-    /// A string literal with Haskell's escapes.
+    /// A string literal with the escapes `show` emits for the text stock mints (request
+    /// keys are base64url, or `cb`): `\\`, `\"`, `\'`, the one-letter ones, `\&`, and
+    /// decimal, `\x` and `\o` numbers. The mnemonic escapes (`\SOH`, `\DEL`, `\^A`) and
+    /// string gaps are not parsed and give `None`.
     fn string(&mut self) -> Option<String> {
         self.sym(b'"')?;
         let rest = std::str::from_utf8(&self.s[self.i..]).ok()?;
@@ -347,7 +350,7 @@ mod tests {
     #[test]
     fn stock_tokens_decode() {
         let real: [(&str, i64, &str, Option<i64>); 5] = [
-            // The brief's real case: `/txs/account/antpoolkda`.
+            // A stock token seen from a production client: `/txs/account/antpoolkda`.
             (
                 "KCg3NDQwNjk4LCJmZWUrbzhFT2xKYS1PRzdHaTM5N0NWcjhmd2NMTUJYcHVBMGI0MkNCOHdWblVtbyIsMSksMCk",
                 7_440_698,
