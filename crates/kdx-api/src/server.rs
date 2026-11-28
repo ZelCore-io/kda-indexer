@@ -196,7 +196,7 @@ impl HeavyClients {
             .or_insert_with(|| (Arc::new(Semaphore::new(1)), 0));
         if e.1 > HEAVY_WAITING_PER_CLIENT {
             tracing::debug!(client = %key, "api: heavy read refused, client queue full");
-            return Err(ApiError::Unavailable(HEAVY_BUSY.into()));
+            return Err(ApiError::Busy(crate::Limiter::HeavyQueue));
         }
         e.1 += 1;
         Ok(HeavyTicket {
@@ -257,6 +257,35 @@ impl ApiState {
             .await
     }
 
+    /// `read` bounded by `deadline` as well (the request's, for a read that started late, as
+    /// a search whose turn came after a wait): the slot waits and the view's deadline are
+    /// the earlier of `settings.deadline` from now and `deadline`, so the read and the
+    /// budgets derived from the view end before the listener cuts the request.
+    pub async fn read_until<T, F>(self: &Arc<Self>, deadline: Instant, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        let until = self.until(deadline);
+        self.read_slots_until(None, &self.reads, until, f).await
+    }
+
+    /// `read_heavy` bounded by `deadline` as well, as [`ApiState::read_until`].
+    pub async fn read_heavy_until<T, F>(self: &Arc<Self>, deadline: Instant, f: F) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
+        let until = self.until(deadline);
+        self.read_slots_until(Some(&self.heavy), &self.reads, until, f)
+            .await
+    }
+
+    /// `settings.deadline` from now, or `deadline` when it comes first.
+    fn until(&self, deadline: Instant) -> Instant {
+        (Instant::now() + self.settings.deadline).min(deadline)
+    }
+
     /// A `/v1/txs` read (FIX-4 part C, S-1): the client's heavy slot, then a slot of the
     /// `/v1/txs` pool (not a shared `heavy` one), then a read slot. Waiting for the slots is
     /// bounded by `settings.deadline` and answers 503 past it; the read itself has
@@ -271,7 +300,7 @@ impl ApiState {
             first: Some(&self.v1txs),
             pool: &self.reads,
             until: Instant::now() + s.deadline,
-            late: || ApiError::Unavailable(V1TXS_BUSY.into()),
+            late: || ApiError::Busy(crate::Limiter::V1txsSlots),
         };
         let t = Instant::now();
         let r = self.read_slots(wait, Some(s.v1txs_deadline), f).await;
@@ -362,10 +391,26 @@ impl ApiState {
         T: Send + 'static,
         F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
     {
+        self.read_slots_until(first, pool, Instant::now() + budget, f)
+            .await
+    }
+
+    /// As [`ApiState::read_on`], with the budget's end given.
+    async fn read_slots_until<T, F>(
+        self: &Arc<Self>,
+        first: Option<&Arc<Semaphore>>,
+        pool: &Arc<Semaphore>,
+        until: Instant,
+        f: F,
+    ) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&View) -> ApiResult<T> + Send + 'static,
+    {
         let wait = Slots {
             first,
             pool,
-            until: Instant::now() + budget,
+            until,
             late: || ApiError::Deadline,
         };
         self.read_slots(wait, None, f).await
@@ -460,17 +505,19 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(t) => (StatusCode::NOT_FOUND, t.clone()),
             ApiError::Deadline => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
             ApiError::Unavailable(t) => (StatusCode::SERVICE_UNAVAILABLE, t.clone()),
+            ApiError::Busy(l) => (StatusCode::SERVICE_UNAVAILABLE, l.text().to_owned()),
             ApiError::Internal(e) => {
                 tracing::error!(error = format!("{e:#}"), "api: internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
         };
-        // Our own limiters' 503s: which one refused, for the request log; the per-client
-        // heavy queue's carries `Retry-After` like the other limiter refusals.
+        // Which of our own limits refused (typed, not matched on the text), for the request
+        // log: a limiter's 503, or a read that ran out of the request deadline (the same
+        // `deadline` tag as the listener's cut). The per-client heavy queue's 503 carries
+        // `Retry-After` like the other limiter refusals.
         let reject = match &self {
-            ApiError::Unavailable(t) if t == HEAVY_BUSY => Some("heavy_queue"),
-            ApiError::Unavailable(t) if t == V1TXS_BUSY => Some("v1txs_slots"),
-            ApiError::Unavailable(t) if t == IN_FLIGHT_BUSY => Some("in_flight"),
+            ApiError::Busy(l) => Some(l.reject()),
+            ApiError::Deadline => Some("deadline"),
             _ => None,
         };
         let mut r = (
@@ -479,7 +526,7 @@ impl IntoResponse for ApiError {
             text,
         )
             .into_response();
-        if reject == Some("heavy_queue") {
+        if matches!(self, ApiError::Busy(crate::Limiter::HeavyQueue)) {
             r.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
@@ -561,7 +608,7 @@ impl RunDeadline {
 /// Limits of a data listener: in-flight cap, per-IP rate, deadline, body cap.
 pub async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
     let Ok(slot) = st.in_flight.clone().try_acquire_owned() else {
-        return ApiError::Unavailable(IN_FLIGHT_BUSY.into()).into_response();
+        return ApiError::Busy(crate::Limiter::InFlight).into_response();
     };
     if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
         let ip = client_ip(*peer, req.headers(), &st.settings.trusted_proxies);
@@ -1588,19 +1635,36 @@ pub(crate) mod tests {
     #[test]
     fn limiter_503s_name_the_limiter() {
         let reject = |r: &Response| r.extensions().get::<crate::reqlog::Reject>().map(|x| x.0);
-        let r = ApiError::Unavailable(HEAVY_BUSY.into()).into_response();
+        let r = ApiError::Busy(crate::Limiter::HeavyQueue).into_response();
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers()[header::RETRY_AFTER], "1");
         assert_eq!(reject(&r), Some("heavy_queue"));
-        let r = ApiError::Unavailable(IN_FLIGHT_BUSY.into()).into_response();
+        let r = ApiError::Busy(crate::Limiter::InFlight).into_response();
         assert_eq!(reject(&r), Some("in_flight"));
         assert!(r.headers().get(header::RETRY_AFTER).is_none());
-        let r = ApiError::Unavailable(V1TXS_BUSY.into()).into_response();
+        let r = ApiError::Busy(crate::Limiter::V1txsSlots).into_response();
         assert_eq!(reject(&r), Some("v1txs_slots"));
-        let r = ApiError::Unavailable("no code index is built".into()).into_response();
-        assert_eq!(reject(&r), None);
-        assert!(r.headers().get(header::RETRY_AFTER).is_none());
-        assert_eq!(reject(&ApiError::Deadline.into_response()), None);
+        // The tag is typed: another 503, even one with a limiter's text, carries none.
+        for t in [
+            "no code index is built",
+            HEAVY_BUSY,
+            V1TXS_BUSY,
+            IN_FLIGHT_BUSY,
+        ] {
+            let r = ApiError::Unavailable(t.into()).into_response();
+            assert_eq!(reject(&r), None, "{t}");
+            assert!(r.headers().get(header::RETRY_AFTER).is_none());
+        }
+        // The texts are unchanged.
+        let body = |l: crate::Limiter| ApiError::Busy(l).to_string();
+        assert_eq!(body(crate::Limiter::HeavyQueue), HEAVY_BUSY);
+        assert_eq!(body(crate::Limiter::V1txsSlots), V1TXS_BUSY);
+        assert_eq!(body(crate::Limiter::InFlight), IN_FLIGHT_BUSY);
+        // A read's own deadline 504 is tagged like the listener's cut.
+        assert_eq!(
+            reject(&ApiError::Deadline.into_response()),
+            Some("deadline")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1649,7 +1713,7 @@ pub(crate) mod tests {
         }
         let t = Instant::now();
         let r = as_client(a, st.read_heavy(|_| Ok(()))).await;
-        assert!(matches!(r, Err(ApiError::Unavailable(_))), "{r:?}");
+        assert!(matches!(r, Err(ApiError::Busy(_))), "{r:?}");
         assert!(t.elapsed() < Duration::from_millis(100));
         // Release the scans: every slot and every client entry comes back.
         for _ in 0..=HEAVY_WAITING_PER_CLIENT + 1 {
@@ -1660,6 +1724,68 @@ pub(crate) mod tests {
         }
         assert_eq!(st.heavy_clients.users(bucket_key(a)), 0);
         assert_eq!(st.heavy.available_permits(), 2);
+    }
+
+    /// Two pagers of one client search at once (`search.per_client = 1`); the first's search
+    /// takes most of the request deadline. The second's turn comes late, and its read still
+    /// ends by its own request deadline: the view's deadline is the request's, so the search
+    /// budget derived from it (`half_left`) stops the scan in time for a partial answer, and
+    /// the read frees the gate's, the heavy and the read slots when it ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_search_reads_only_until_the_request_deadline() {
+        let (_d, store) = crate::testutil::store();
+        // settings(): a 500 ms request deadline.
+        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let gate = Arc::new(crate::search::SearchGate::new(4, 1));
+        let ip = std::net::IpAddr::from([127, 0, 0, 1]);
+        let (heavy, reads) = (st.heavy.available_permits(), st.reads.available_permits());
+        // A pager: its search scans until `hold` from its start, or until its search budget.
+        let pager = |hold: Option<Duration>| {
+            let (st, gate) = (st.clone(), gate.clone());
+            tokio::spawn(async move {
+                let until = Instant::now() + st.settings.deadline;
+                let Ok(permit) = gate.acquire(ip, until).await else {
+                    panic!("no turn in time");
+                };
+                let r = as_client(
+                    ip,
+                    st.read_heavy_until(permit.deadline(), move |view| {
+                        let _permit = permit;
+                        let stop = match hold {
+                            Some(h) => Instant::now() + h,
+                            None => crate::compat::search::half_left(view),
+                        };
+                        while Instant::now() < stop {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Ok(view.deadline <= until)
+                    }),
+                )
+                .await;
+                (r, Instant::now() <= until)
+            })
+        };
+        let first = pager(Some(Duration::from_millis(400)));
+        while gate.in_flight() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let second = pager(None);
+        let (r1, in_time1) = first.await.unwrap();
+        assert!(matches!(r1, Ok(true)) && in_time1, "{r1:?}");
+        let (r2, in_time2) = second.await.unwrap();
+        assert!(
+            matches!(r2, Ok(true)),
+            "the late read's view ends by the request deadline: {r2:?}"
+        );
+        assert!(
+            in_time2,
+            "the late search answered after its request deadline"
+        );
+        // Every slot is back once the reads ended.
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(gate.clients(), 0);
+        assert_eq!(st.heavy.available_permits(), heavy);
+        assert_eq!(st.reads.available_permits(), reads);
     }
 
     /// FIX-4 part B (B1), part C (S-1): `read_v1txs` reads within `v1txs_deadline` (the
@@ -1752,7 +1878,7 @@ pub(crate) mod tests {
         let t = Instant::now();
         let r = st.read_v1txs(|_| Ok(())).await;
         let waited = t.elapsed();
-        assert!(matches!(r, Err(ApiError::Unavailable(_))), "{r:?}");
+        assert!(matches!(r, Err(ApiError::Busy(_))), "{r:?}");
         assert!(
             waited >= Duration::from_millis(450) && waited < Duration::from_secs(3),
             "{waited:?}"

@@ -1030,7 +1030,7 @@ pub async fn query_transactions_by_pact_code(
     let (rows, resume, truncated) = g
         .state()?
         .clone()
-        .read_heavy(move |view| {
+        .read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
             let pg = Paging {
                 limit: n,

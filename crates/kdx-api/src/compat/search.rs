@@ -136,7 +136,7 @@ pub async fn handler(
             };
             let raw = s.to_owned();
             let res = st
-                .read_heavy(move |view| {
+                .read_heavy_until(permit.deadline(), move |view| {
                     let _permit = permit;
                     search_page(view, &ctx, &raw, &pg)
                 })

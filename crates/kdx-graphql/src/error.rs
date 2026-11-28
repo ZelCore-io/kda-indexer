@@ -221,6 +221,7 @@ pub fn from_api(e: ApiError) -> async_graphql::Error {
         ApiError::NotFound(t) => err(Code::BadUserInput, t),
         ApiError::Deadline => err(Code::Timeout, "request deadline exceeded"),
         ApiError::Unavailable(t) => err(Code::Limit, t),
+        ApiError::Busy(l) => err(Code::Limit, l.text()),
         ApiError::Internal(e) => {
             tracing::error!(error = format!("{e:#}"), "graphql: internal error");
             err(Code::Internal, "internal error")

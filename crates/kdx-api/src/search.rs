@@ -6,9 +6,13 @@
 //! rate limiter: the IPv4 address or the IPv6 /64) runs `search.per_client` at once and queues
 //! up to [`SEARCH_WAITING_PER_CLIENT`] more until the request deadline (`429` only when that
 //! queue is full, `504` when a queued search's turn does not come in time); a queued search
-//! takes its global permit only when its turn comes. The permit moves into the blocking read and is dropped when that read ends: on completion, on
-//! its deadline, and after a client disconnect once the abandoned read stops (at most the
-//! request deadline), so a client that reconnects cannot run more scans than its share.
+//! takes its global permit only when its turn comes. A search that ends while its client has
+//! searches waiting hands its global permit to the next of them, so another client cannot
+//! take it in between. The permit moves into the blocking read, whose deadline is the
+//! request's ([`SearchPermit::deadline`], [`ApiState::read_heavy_until`]), and is dropped
+//! when that read ends: on completion, on its deadline, and after a client disconnect once
+//! the abandoned read stops (at most the request deadline), so a client that reconnects
+//! cannot run more scans than its share.
 //! Every refusal and every cut answer counts in `kdx_search_rejected_total{reason}`.
 
 use std::collections::HashMap;
@@ -81,9 +85,28 @@ pub struct SearchGate {
     global: Arc<Semaphore>,
     concurrency: usize,
     per_client: usize,
-    /// Per client key: its `per_client`-permit semaphore and its users (running and
-    /// waiting).
-    clients: Mutex<HashMap<IpAddr, (Arc<Semaphore>, usize)>>,
+    clients: Mutex<HashMap<IpAddr, Client>>,
+}
+
+/// One client key's searches.
+struct Client {
+    /// `per_client` permits.
+    slot: Arc<Semaphore>,
+    /// Running and waiting.
+    users: usize,
+    /// Running (holding a global permit).
+    running: usize,
+    /// Global permits handed on by its ended searches to its waiting ones: never more than
+    /// it has waiting, so the global limit stays exact.
+    handed: Vec<OwnedSemaphorePermit>,
+}
+
+impl Client {
+    /// Give back the handed-on permits no waiter is left for.
+    fn trim(&mut self) {
+        let waiting = self.users.saturating_sub(self.running);
+        self.handed.truncate(waiting);
+    }
 }
 
 /// A client's place among its searches (running or waiting): dropping it leaves the queue.
@@ -96,19 +119,60 @@ impl Drop for Ticket {
     fn drop(&mut self) {
         let mut m = self.gate.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = m.get_mut(&self.key) {
-            e.1 = e.1.saturating_sub(1);
-            if e.1 == 0 {
+            e.users = e.users.saturating_sub(1);
+            if e.users == 0 {
                 m.remove(&self.key);
+            } else {
+                e.trim();
             }
         }
     }
 }
 
-/// One running search. Dropping it frees the global slot, the client's slot and its place.
+/// One running search. Dropping it frees the client's slot and its place, and the global
+/// slot, which goes to the client's next waiting search when it has one.
 pub struct SearchPermit {
-    _global: OwnedSemaphorePermit,
-    _client: OwnedSemaphorePermit,
-    _ticket: Ticket,
+    global: Option<OwnedSemaphorePermit>,
+    client: Option<OwnedSemaphorePermit>,
+    deadline: Instant,
+    ticket: Ticket,
+}
+
+impl SearchPermit {
+    /// The request deadline the search waited until: its read must end by it
+    /// ([`ApiState::read_heavy_until`]).
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+impl Drop for SearchPermit {
+    fn drop(&mut self) {
+        {
+            let mut m = self
+                .ticket
+                .gate
+                .clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = m.get_mut(&self.ticket.key) {
+                e.running = e.running.saturating_sub(1);
+                // Waiting: the users other than the running ones and this one.
+                let waiting = e.users.saturating_sub(e.running + 1);
+                if let Some(g) = self.global.take() {
+                    if e.handed.len() < waiting {
+                        e.handed.push(g);
+                    } else {
+                        drop(g);
+                    }
+                }
+            }
+        }
+        // The client slot wakes the next waiter, which takes the handed-on global permit;
+        // the ticket then leaves (and gives back a permit no waiter is left for).
+        self.global.take();
+        self.client.take();
+    }
 }
 
 impl SearchGate {
@@ -136,10 +200,13 @@ impl SearchGate {
         let key = bucket_key(ip);
         let (ticket, slot) = {
             let mut m = self.clients.lock().unwrap_or_else(|e| e.into_inner());
-            let e = m
-                .entry(key)
-                .or_insert_with(|| (Arc::new(Semaphore::new(self.per_client)), 0));
-            if e.1 >= self.per_client + SEARCH_WAITING_PER_CLIENT {
+            let e = m.entry(key).or_insert_with(|| Client {
+                slot: Arc::new(Semaphore::new(self.per_client)),
+                users: 0,
+                running: 0,
+                handed: Vec::new(),
+            });
+            if e.users >= self.per_client + SEARCH_WAITING_PER_CLIENT {
                 rejected("client_busy");
                 return Err(refusal(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -147,13 +214,13 @@ impl SearchGate {
                     "search_client",
                 ));
             }
-            e.1 += 1;
+            e.users += 1;
             (
                 Ticket {
                     gate: self.clone(),
                     key,
                 },
-                e.0.clone(),
+                e.slot.clone(),
             )
         };
         let until = deadline.checked_sub(WAIT_MARGIN).unwrap_or(deadline);
@@ -169,7 +236,25 @@ impl SearchGate {
                 ));
             }
         };
-        let Ok(global) = self.global.clone().try_acquire_owned() else {
+        // A global permit handed on by the client's ended search, else a free one.
+        let global = {
+            let mut m = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+            // The entry is there: this search's ticket holds it.
+            match m.get_mut(&key) {
+                Some(e) => {
+                    let g = e
+                        .handed
+                        .pop()
+                        .or_else(|| self.global.clone().try_acquire_owned().ok());
+                    if g.is_some() {
+                        e.running += 1;
+                    }
+                    g
+                }
+                None => None,
+            }
+        };
+        let Some(global) = global else {
             rejected("busy");
             return Err(refusal(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -178,13 +263,15 @@ impl SearchGate {
             ));
         };
         Ok(SearchPermit {
-            _global: global,
-            _client: client,
-            _ticket: ticket,
+            global: Some(global),
+            client: Some(client),
+            deadline,
+            ticket,
         })
     }
 
-    /// Searches running now (tests and status).
+    /// Global slots taken now: searches running, and permits handed on to a client's next
+    /// waiting search (tests and status).
     pub fn in_flight(&self) -> usize {
         self.concurrency - self.global.available_permits()
     }
@@ -192,7 +279,7 @@ impl SearchGate {
     /// Searches of `ip`'s key running or waiting (tests).
     pub fn queued(&self, ip: IpAddr) -> usize {
         let m = self.clients.lock().unwrap_or_else(|e| e.into_inner());
-        m.get(&bucket_key(ip)).map_or(0, |e| e.1)
+        m.get(&bucket_key(ip)).map_or(0, |e| e.users)
     }
 
     /// Client keys with a search running or waiting (tests: no entry outlives its users).
@@ -493,6 +580,19 @@ mod tests {
         assert_eq!(g.clients(), 0);
     }
 
+    /// The permit carries the request deadline its wait used, for the read.
+    #[tokio::test]
+    async fn the_permit_carries_the_request_deadline() {
+        let g = Arc::new(SearchGate::new(4, 1));
+        let d = soon(5_000);
+        let p = g
+            .acquire(IpAddr::from([127, 0, 0, 1]), d)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(p.deadline(), d);
+    }
+
     /// `per_client` running plus `SEARCH_WAITING_PER_CLIENT` waiting; one more is a 429 at
     /// once, another client is unaffected.
     #[tokio::test]
@@ -563,10 +663,11 @@ mod tests {
         assert_eq!(g.clients(), 0);
     }
 
-    /// `search.concurrency` still bounds the searches running over every client; a search
-    /// whose turn comes while it is full answers 503 and frees its client's place.
+    /// `search.concurrency` still bounds the searches running over every client: a new
+    /// client finds it full and answers 503, leaving no client count behind; a client's waiting
+    /// search holds no global slot.
     #[tokio::test]
-    async fn the_global_limit_still_holds() {
+    async fn the_global_limit_holds_for_new_clients() {
         let g = Arc::new(SearchGate::new(2, 1));
         let a = IpAddr::from([127, 0, 0, 1]);
         let b = IpAddr::from([127, 0, 0, 2]);
@@ -586,7 +687,7 @@ mod tests {
             0,
             "a refused global slot leaves no client count behind"
         );
-        // `a`'s turn comes when `pa` ends, and it takes the freed global slot.
+        // `a`'s turn comes when `pa` ends, and it takes `pa`'s global slot.
         drop(pa);
         let pa2 = a2.await.unwrap().expect("a's second search runs");
         // Still two at most: `a`'s second search and `b`'s run; a third client is refused.
@@ -594,6 +695,76 @@ mod tests {
         assert!(g.acquire(c, soon(5_000)).await.is_err());
         drop((pa2, pb));
         assert_eq!(g.in_flight(), 0);
+        assert_eq!(g.clients(), 0);
+    }
+
+    /// A search ending while its client has one waiting hands its global slot to that one:
+    /// another client asking in between (before the waiter has run) finds the slots full and
+    /// is refused, and the waiter runs. The limit stays exact: the slot is taken once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_freed_slot_goes_to_the_clients_waiter() {
+        let g = Arc::new(SearchGate::new(1, 1));
+        let a = IpAddr::from([127, 0, 0, 1]);
+        let c = IpAddr::from([127, 0, 0, 3]);
+        let pa = g.acquire(a, soon(5_000)).await.ok().unwrap();
+        let g2 = g.clone();
+        let a2 = tokio::spawn(async move { g2.acquire(a, soon(5_000)).await.ok() });
+        queued_to(&g, a, 2).await;
+        // One thread: `a2` cannot run between this drop and `c`'s request.
+        drop(pa);
+        assert_eq!(g.in_flight(), 1, "the slot is held for the waiter");
+        let r = g.acquire(c, soon(5_000)).await.err().unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let pa2 = a2
+            .await
+            .unwrap()
+            .expect("the waiter gets the handed-on slot");
+        assert_eq!(g.in_flight(), 1);
+        drop(pa2);
+        assert_eq!(g.in_flight(), 0);
+        assert_eq!(g.clients(), 0);
+        // A waiter that leaves before taking a handed-on slot gives it back.
+        let pa = g.acquire(a, soon(5_000)).await.ok().unwrap();
+        let g2 = g.clone();
+        let a2 = tokio::spawn(async move { g2.acquire(a, soon(5_000)).await.ok() });
+        queued_to(&g, a, 2).await;
+        drop(pa);
+        a2.abort();
+        assert!(a2.await.is_err());
+        assert_eq!(g.in_flight(), 0, "no waiter left: the slot is free again");
+        assert_eq!(g.clients(), 0);
+        assert!(g.acquire(c, soon(5_000)).await.is_ok());
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// A waiting search whose turn comes while the global slots are full (no slot was handed
+    /// on to it) answers 503 and frees its client's place and slot: the client's next search
+    /// runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waiter_finding_the_global_slots_full_is_503() {
+        let g = Arc::new(SearchGate::new(1, 1));
+        let a = IpAddr::from([127, 0, 0, 1]);
+        let c = IpAddr::from([127, 0, 0, 3]);
+        let mut pa = g.acquire(a, soon(5_000)).await.ok().unwrap();
+        let g2 = g.clone();
+        let a2 = tokio::spawn(async move { g2.acquire(a, soon(5_000)).await.err() });
+        queued_to(&g, a, 2).await;
+        // `pa`'s global slot goes back on its own and another client takes it; then `pa`
+        // ends with no slot to hand on.
+        drop(pa.global.take());
+        let pc = g.acquire(c, soon(5_000)).await.ok().unwrap();
+        drop(pa);
+        let r = a2.await.unwrap().expect("the waiter is refused");
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(reject_of(&r), Some("search_global"));
+        assert_eq!(g.queued(a), 0, "the refused waiter left its client's queue");
+        assert_eq!(g.clients(), 1, "only `c` is left");
+        assert_eq!(g.in_flight(), 1);
+        drop(pc);
+        let p = g.acquire(a, soon(5_000)).await.ok().unwrap();
+        assert_eq!(g.in_flight(), 1);
+        drop(p);
         assert_eq!(g.clients(), 0);
     }
 

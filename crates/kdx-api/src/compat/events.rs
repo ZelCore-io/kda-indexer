@@ -268,7 +268,7 @@ fn page(
     }
     let limits = ScanLimits {
         max_heights: search.max_scan_heights.max(1),
-        until: Instant::now() + Duration::from_millis(search.timeout_ms),
+        until: (Instant::now() + Duration::from_millis(search.timeout_ms)).min(view.deadline),
     };
     let page = collect_page(
         view,
@@ -387,15 +387,18 @@ pub async fn handler(
     } else {
         None
     };
+    // A search read ends by the request deadline its gate wait used (it may start late).
+    let end = permit.as_ref().map(|p| p.deadline());
     let run = move |v: &View| {
         let _permit = permit;
         page(v, f, &pg, search, cap, false)
     };
     // Without modulename the request may take the scan path: an expensive class.
-    let res = if heavy {
-        st.read_heavy(run).await
-    } else {
-        st.read(run).await
+    let res = match (heavy, end) {
+        (true, Some(d)) => st.read_heavy_until(d, run).await,
+        (true, None) => st.read_heavy(run).await,
+        (false, Some(d)) => st.read_until(d, run).await,
+        (false, None) => st.read(run).await,
     };
     match res {
         Ok(p) => page_response(p),

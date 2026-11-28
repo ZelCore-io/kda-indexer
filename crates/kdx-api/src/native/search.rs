@@ -112,7 +112,7 @@ pub async fn code(
         Err(r) => return r,
     };
     let res =
-        st.0.read_heavy(move |view| {
+        st.0.read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
             let until = (Instant::now() + Duration::from_millis(ctx.settings.timeout_ms))
                 .min(view.deadline);
@@ -247,7 +247,7 @@ pub async fn events(
         Err(r) => return r,
     };
     let res =
-        st.0.read_heavy(move |view| {
+        st.0.read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
             let pg = Paging {
                 limit: lp.limit,
