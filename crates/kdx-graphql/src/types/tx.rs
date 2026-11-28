@@ -1025,6 +1025,7 @@ pub async fn query_transactions_by_pact_code(
                 limit: n,
                 offset: 0,
                 next,
+                stock: None,
                 min_height: None,
                 max_height: None,
                 empty: n == 0,

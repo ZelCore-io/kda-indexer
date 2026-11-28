@@ -269,6 +269,7 @@ pub(crate) fn token_rows(
         limit,
         offset: 0,
         next: None,
+        stock: None,
         min_height: None,
         max_height: None,
         empty: false,

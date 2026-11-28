@@ -1,6 +1,8 @@
 //! chainweb-data compatible routes (spec §5.2): `/txs/tx`, `/txs/txs`, `/txs/account`,
 //! `/txs/events`. Shapes, error texts and row order follow chainweb-data's `Server.hs` and
 //! `Queries.hs` and chainweb-api's records; `Chainweb-Next` tokens are our own `Cursor`s.
+//! A `next` token stock chainweb-data minted is accepted too (`StockCursor`): the page
+//! after it is the one stock serves, and its `Chainweb-Next` is ours.
 //!
 //! Row order of the paged routes is chainweb-data's: `height desc, requestkey desc, idx
 //! asc`, request keys compared bytewise (Postgres "C" collation, checked live), coinbase
@@ -16,6 +18,8 @@ pub mod schemas;
 pub mod search;
 pub mod shapes;
 pub mod stats;
+#[cfg(test)]
+mod stock_tests;
 pub mod tx;
 
 use std::cmp::Ordering;
@@ -32,7 +36,7 @@ use kdx_types::record::{BlockRecord, TxRecord};
 use kdx_types::TxKey;
 use serde_json::Value;
 
-use crate::cursor::Cursor;
+use crate::cursor::{Cursor, StockCursor};
 use crate::server::{ApiState, CHAINWEB_NEXT};
 use crate::store::View;
 use crate::{ApiError, ApiResult};
@@ -245,6 +249,8 @@ pub struct Paging {
     pub limit: usize,
     pub offset: u64,
     pub next: Option<Cursor>,
+    /// A `next` token minted by stock chainweb-data (never set with `next`).
+    pub stock: Option<StockCursor>,
     pub min_height: Option<u32>,
     /// Inclusive; `Some(None)`-like "nothing" is `empty`.
     pub max_height: Option<u32>,
@@ -259,21 +265,26 @@ pub fn paging(p: &Params) -> Result<Paging, Response> {
     let offset = int_param(p, "offset")?;
     let minh = int_param(p, "minheight")?;
     let maxh = int_param(p, "maxheight")?;
-    let next = match (p.get("next"), offset) {
+    let (next, stock) = match (p.get("next"), offset) {
         (Some(_), Some(_)) => {
             return Err(text(
                 StatusCode::BAD_REQUEST,
                 "next token query parameter not allowed with offset",
             ))
         }
-        (Some(t), None) => Some(Cursor::decode(t).map_err(|_| {
-            let shown: String = t.chars().take(100).collect();
-            text(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid next token: {shown}"),
-            )
-        })?),
-        (None, _) => None,
+        // Ours first, then one stock chainweb-data minted.
+        (Some(t), None) => match (Cursor::decode(t), StockCursor::decode(t)) {
+            (Ok(c), _) => (Some(c), None),
+            (Err(_), Some(s)) => (None, Some(s)),
+            (Err(_), None) => {
+                let shown: String = t.chars().take(100).collect();
+                return Err(text(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid next token: {shown}"),
+                ));
+            }
+        },
+        (None, _) => (None, None),
     };
     let offset = offset.unwrap_or(0).max(0) as u64;
     if offset > MAX_OFFSET {
@@ -297,6 +308,7 @@ pub fn paging(p: &Params) -> Result<Paging, Response> {
         limit,
         offset,
         next,
+        stock,
         min_height: minh.map(clamp),
         max_height: maxh.map(clamp),
         empty,
@@ -425,6 +437,10 @@ pub fn collect_page(
     let mut out = Vec::new();
     let mut skip = pg.offset;
     let mut after: Option<RowRef> = None;
+    if let Some(s) = &pg.stock {
+        // Stock's offset applies after its position.
+        skip = s.offset;
+    }
     if let Some(c) = pg.next {
         if c.sub == SUB_HEIGHT_DONE {
             // Rows of `offset` a cut scan still owed (R7).
@@ -568,6 +584,11 @@ pub fn collect_page(
                     continue;
                 }
             }
+            if let Some(s) = &pg.stock {
+                if !s.admits(h, &row.rk, row.idx) {
+                    continue;
+                }
+            }
             if skip > 0 {
                 skip -= 1;
                 continue;
@@ -603,6 +624,13 @@ pub fn collect_page(
 
 /// Upper height bound for a walk resuming at `next` within `max_height`.
 pub fn resume_max(pg: &Paging) -> Option<u32> {
+    if let Some(s) = &pg.stock {
+        // A height past u32 bounds nothing; a negative one is `resume_exhausted`.
+        return match u32::try_from(s.height.max(0)) {
+            Ok(h) => Some(pg.max_height.map_or(h, |m| m.min(h))),
+            Err(_) => pg.max_height,
+        };
+    }
     match pg.next {
         Some(c) if c.sub == SUB_HEIGHT_DONE => {
             let h = c.key.height().checked_sub(1);
@@ -619,6 +647,7 @@ pub fn resume_max(pg: &Paging) -> Option<u32> {
 /// True when a resumed walk has nothing left (a cut at the lowest height).
 pub fn resume_exhausted(pg: &Paging) -> bool {
     matches!(pg.next, Some(c) if c.sub == SUB_HEIGHT_DONE && c.key.height() == 0)
+        || pg.stock.is_some_and(|s| s.height < 0)
 }
 
 #[cfg(test)]

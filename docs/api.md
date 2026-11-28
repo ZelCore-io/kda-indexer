@@ -105,6 +105,25 @@ Every search route runs under one gate: at most `search.concurrency` (4) searche
       transactions' events in another order than the node's output; ours lists the newest
       transfer first and keeps the node's event order. kda-txs rows carry `_id`, its own
       database id, which ours does not have. The rows are the same as a set.
+- **`next` tokens from chainweb-data.** `/txs/account/{account}`, `/txs/events` and
+  `/txs/search` also accept a `next` token that chainweb-data issued, so a client that was
+  paging against chainweb-data keeps its place when its route moves to kda-indexer. Such a
+  token is standard base64 (no `=` padding) of Haskell `show` text of `(position, offset)`:
+  `position` is `(height, request key, idx)` on the account and events routes (`cb` stands
+  for a coinbase row) and `(height, request key)` on search, and `offset` is a count of rows
+  still to skip after it (usually 0). The real case was
+  `((7440698,"fee+o8EOlJa-OG7Gi397CVr8fwcLMBXpuA0b42CB8wVnUmo",1),0)` on
+  `/txs/account/antpoolkda`. The page after the token is the one chainweb-data serves: rows
+  strictly after `position` in its order (height desc, request key desc bytewise, idx asc),
+  the first `offset` skipped, then `limit` rows. The position names no chain, so rows that
+  equal it in every field (the coinbase rows of other chains at that height, the second row
+  of a transfer to oneself) are skipped as chainweb-data skips them. The request key need not
+  be one that exists. That page's `Chainweb-Next` is a kda-indexer token. A token that is
+  neither format, an `offset` past 10,000, or a request key longer than 64 bytes is the same
+  400 `Invalid next token: …` as before. The other direction cannot work: chainweb-data does
+  not understand kda-indexer tokens, so a client whose route falls back to chainweb-data in
+  the middle of paging gets its `Invalid next token` and has to start again from the first
+  page.
 - **chainweb-data account lists without `minheight`.** `/txs/account/{account}` with no
   `minheight` answers the account's whole history on ours, up to `limit`. chainweb-data
   answered only recent rows in the one case that was compared in full: the public `fluxteam`

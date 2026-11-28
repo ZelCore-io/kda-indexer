@@ -94,6 +94,227 @@ impl Cursor {
     }
 }
 
+/// Longest request key text a stock token may carry (real ones are 43 characters).
+const STOCK_RK_MAX: usize = 64;
+
+/// A `next` token minted by stock chainweb-data, so a client paging across a switch from
+/// stock to kda-indexer keeps its place. Stock's token is the standard base64 (no `=`) of
+/// the Haskell `show` text of `(position, offset)`: `position` is `(height, request key,
+/// idx)` on `/txs/account` and `/txs/events` (the request key is `cb` for a coinbase row)
+/// and `(height, request key)` on `/txs/search`; `offset` is the rows still to skip after
+/// it (0 when none). The page after it holds the rows that come strictly after
+/// `position` in stock's order (height desc, request key desc bytewise, idx asc), with the
+/// first `offset` of them skipped. Stock's cursor names no chain: rows that tie with it on
+/// every field (coinbase rows of several chains at one height, both sides of a transfer to
+/// oneself) are skipped with it, as stock skips them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StockCursor {
+    pub height: i64,
+    rk: [u8; STOCK_RK_MAX],
+    rk_len: u8,
+    /// `None` for the `(height, request key)` form of `/txs/search`.
+    pub idx: Option<i64>,
+    pub offset: u64,
+}
+
+impl StockCursor {
+    /// The request key text the cursor compares with (`cb` for coinbase).
+    pub fn rk(&self) -> &[u8] {
+        &self.rk[..usize::from(self.rk_len)]
+    }
+
+    /// Build one (tests and callers that already hold the fields). `None` when `rk` is
+    /// longer than stock ever mints.
+    pub fn new(height: i64, rk: &[u8], idx: Option<i64>, offset: u64) -> Option<StockCursor> {
+        if rk.len() > STOCK_RK_MAX {
+            return None;
+        }
+        let mut b = [0u8; STOCK_RK_MAX];
+        b[..rk.len()].copy_from_slice(rk);
+        Some(StockCursor {
+            height,
+            rk: b,
+            rk_len: rk.len() as u8,
+            idx,
+            offset,
+        })
+    }
+
+    /// Parse a stock token; `None` for anything that is not one. Like stock, characters
+    /// outside the base64 alphabet are ignored, and a space is read as the `+` an
+    /// unescaped query string turns into one.
+    pub fn decode(s: &str) -> Option<StockCursor> {
+        use base64::alphabet::STANDARD;
+        use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+        if s.is_empty() || s.len() > 512 {
+            return None;
+        }
+        let mut t: Vec<u8> = s
+            .bytes()
+            .map(|b| if b == b' ' { b'+' } else { b })
+            .filter(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+            .collect();
+        if t.len() % 4 == 1 {
+            t.pop();
+        }
+        let cfg = GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true);
+        let raw = GeneralPurpose::new(&STANDARD, cfg).decode(&t).ok()?;
+        let text = std::str::from_utf8(&raw).ok()?;
+        let mut p = HsRead {
+            s: text.as_bytes(),
+            i: 0,
+        };
+        p.sym(b'(')?;
+        p.sym(b'(')?;
+        let height = i64::try_from(p.int()?).ok()?;
+        p.sym(b',')?;
+        let rk = p.string()?;
+        let idx = if p.peek() == Some(b',') {
+            p.sym(b',')?;
+            Some(i64::try_from(p.int()?).ok()?)
+        } else {
+            None
+        };
+        p.sym(b')')?;
+        p.sym(b',')?;
+        let off = p.int()?;
+        p.sym(b')')?;
+        p.ws();
+        if p.i != p.s.len() {
+            return None;
+        }
+        // Stock reads an offset of 0 or less as none; one past our offset cap is refused
+        // (stock never mints one: its bounded scan owes at most the offset it was given).
+        let offset = u64::try_from(off.max(0)).ok()?;
+        if offset > crate::compat::MAX_OFFSET {
+            return None;
+        }
+        StockCursor::new(height, rk.as_bytes(), idx, offset)
+    }
+
+    /// True when a row at `(height, rk, idx)` comes strictly after the cursor in stock's
+    /// order.
+    pub fn admits(&self, height: u32, rk: &[u8], idx: i64) -> bool {
+        let h = i64::from(height);
+        if h != self.height {
+            return h < self.height;
+        }
+        match rk.cmp(self.rk()) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Equal => self.idx.is_some_and(|c| idx > c),
+            std::cmp::Ordering::Greater => false,
+        }
+    }
+}
+
+/// The part of Haskell's `Read` syntax `show` of a stock token uses: tuples, whole numbers
+/// (optionally negative, optionally in parentheses) and string literals.
+struct HsRead<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl HsRead<'_> {
+    fn ws(&mut self) {
+        while self.s.get(self.i).is_some_and(u8::is_ascii_whitespace) {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.ws();
+        self.s.get(self.i).copied()
+    }
+
+    fn sym(&mut self, c: u8) -> Option<()> {
+        (self.peek()? == c).then(|| self.i += 1)
+    }
+
+    /// A decimal whole number, `-` and parentheses allowed; at most 30 digits.
+    fn int(&mut self) -> Option<i128> {
+        if self.peek()? == b'(' {
+            self.i += 1;
+            let n = self.int()?;
+            self.sym(b')')?;
+            return Some(n);
+        }
+        let neg = self.peek()? == b'-';
+        if neg {
+            self.i += 1;
+            self.ws();
+        }
+        let start = self.i;
+        while self.s.get(self.i).is_some_and(u8::is_ascii_digit) {
+            self.i += 1;
+        }
+        let digits = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+        if digits.is_empty() || digits.len() > 30 {
+            return None;
+        }
+        let n: i128 = digits.parse().ok()?;
+        Some(if neg { -n } else { n })
+    }
+
+    /// A string literal with Haskell's escapes.
+    fn string(&mut self) -> Option<String> {
+        self.sym(b'"')?;
+        let rest = std::str::from_utf8(&self.s[self.i..]).ok()?;
+        let mut out = String::new();
+        let mut it = rest.char_indices().peekable();
+        while let Some((at, c)) = it.next() {
+            match c {
+                '"' => {
+                    self.i += at + 1;
+                    return Some(out);
+                }
+                '\\' => {
+                    let (_, e) = it.next()?;
+                    let num = |it: &mut std::iter::Peekable<std::str::CharIndices>, radix: u32| {
+                        let mut v: u32 = 0;
+                        let mut any = false;
+                        while let Some(d) = it.peek().and_then(|(_, c)| c.to_digit(radix)) {
+                            v = v.checked_mul(radix)?.checked_add(d)?;
+                            any = true;
+                            it.next();
+                        }
+                        any.then_some(v).and_then(char::from_u32)
+                    };
+                    match e {
+                        '\\' | '"' | '\'' => out.push(e),
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        'a' => out.push('\u{7}'),
+                        'b' => out.push('\u{8}'),
+                        'f' => out.push('\u{c}'),
+                        'v' => out.push('\u{b}'),
+                        '&' => {}
+                        'x' => out.push(num(&mut it, 16)?),
+                        'o' => out.push(num(&mut it, 8)?),
+                        d if d.is_ascii_digit() => {
+                            let mut v = d.to_digit(10)?;
+                            while let Some(d) = it.peek().and_then(|(_, c)| c.to_digit(10)) {
+                                v = v.checked_mul(10)?.checked_add(d)?;
+                                it.next();
+                            }
+                            out.push(char::from_u32(v)?);
+                        }
+                        _ => return None,
+                    }
+                }
+                c if c.is_control() => return None,
+                c => out.push(c),
+            }
+            if out.len() > STOCK_RK_MAX {
+                return None;
+            }
+        }
+        None
+    }
+}
+
 fn fingerprint(view: &View, key: TxKey) -> ApiResult<Option<u32>> {
     Ok(view
         .block_hash(key.chain(), key.height())?
@@ -118,6 +339,112 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Tokens stock chainweb-data minted on mainnet (2026-11-28): account transfers and
+    /// events carry `((height, request key, idx), offset)`, search `((height, request
+    /// key), offset)`.
+    #[test]
+    fn stock_tokens_decode() {
+        let real: [(&str, i64, &str, Option<i64>); 5] = [
+            // The brief's real case: `/txs/account/antpoolkda`.
+            (
+                "KCg3NDQwNjk4LCJmZWUrbzhFT2xKYS1PRzdHaTM5N0NWcjhmd2NMTUJYcHVBMGI0MkNCOHdWblVtbyIsMSksMCk",
+                7_440_698,
+                "fee+o8EOlJa-OG7Gi397CVr8fwcLMBXpuA0b42CB8wVnUmo",
+                Some(1),
+            ),
+            (
+                "KCg3NDQzOTI4LCJ4WG91T3VzVlZxa1ptYi1HZXJrUE9zRE04dXYxUU5val9aaEY1T0M3MThNIiwwKSwwKQ",
+                7_443_928,
+                "xXouOusVVqkZmb-GerkPOsDM8uv1QNoj_ZhF5OC718M",
+                Some(0),
+            ),
+            (
+                "KCg3NDM3ODk3LCI1ZTZfaWlzS09GQ3hBQnVNVVUxZ2QzeWlKRmJDcVRNVWdreXdBMzZDMVIwIiwxKSwwKQ",
+                7_437_897,
+                "5e6_iisKOFCxABuMUU1gd3yiJFbCqTMUgkywA36C1R0",
+                Some(1),
+            ),
+            // `/txs/events`, a coinbase row.
+            ("KCg3NDQzOTEwLCJjYiIsMCksMCk", 7_443_910, "cb", Some(0)),
+            // `/txs/search`.
+            (
+                "KCg3NDQzOTAzLCItZThfOElaQU9ub2RNQUFkNzJON21WN2JfWEpLVTJQSXpXS05yOXA0bDZ3IiksMCk",
+                7_443_903,
+                "-e8_8IZAOnodMAAd72N7mV7b_XJKU2PIzWKNr9p4l6w",
+                None,
+            ),
+        ];
+        for (tok, h, rk, idx) in real {
+            let c = StockCursor::decode(tok).unwrap_or_else(|| panic!("{tok}"));
+            assert_eq!(
+                (c.height, c.rk(), c.idx, c.offset),
+                (h, rk.as_bytes(), idx, 0)
+            );
+            // Not one of ours, and ours are not stock's.
+            assert!(Cursor::decode(tok).is_err());
+            // Padded: still the same.
+            assert_eq!(StockCursor::decode(&format!("{tok}==")), Some(c));
+        }
+        let ours = Cursor {
+            key: TxKey::new(4_000_000, 19, 7),
+            sub: 3,
+            fp: 0xdead_beef,
+        };
+        assert_eq!(StockCursor::decode(&ours.encode()), None);
+        // An offset, whitespace, parentheses, negatives and escapes, as Haskell reads them.
+        let c = StockCursor::decode("KCg3NDQwNjk4LCJhIiwxKSwzKQ").unwrap();
+        assert_eq!(
+            (c.height, c.rk(), c.idx, c.offset),
+            (7_440_698, &b"a"[..], Some(1), 3)
+        );
+        let c = StockCursor::decode("KCggNSAsICJhYiIgLCAoLTIpICkgLCAtNCAp").unwrap();
+        assert_eq!(
+            (c.height, c.rk(), c.idx, c.offset),
+            (5, &b"ab"[..], Some(-2), 0)
+        );
+        let c = StockCursor::decode("KCgtMSwiXCJ4XFwiLDIpLDAp").unwrap();
+        assert_eq!((c.height, c.rk(), c.idx), (-1, &b"\"x\\"[..], Some(2)));
+        // Garbage: never a panic, always `None`.
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD_NO_PAD.encode(t);
+        for bad in [
+            String::new(),
+            "x".into(),
+            "!!!!".into(),
+            "A".repeat(3000),
+            enc("((1,\"a\",1))"),
+            enc("((1,\"a\",1),0) junk"),
+            enc("((1,\"a\",1,2),0)"),
+            enc("((1,a,1),0)"),
+            enc("((1,\"a,1),0)"),
+            enc("((99999999999999999999,\"a\",1),0)"),
+            enc("((1,\"a\",1),10001)"),
+            enc("((1,\"a\\q\",1),0)"),
+            enc(&format!("((1,\"{}\",1),0)", "a".repeat(65))),
+            enc("((0x10,\"a\",1),0)"),
+            enc("((1,\"\\1114112\",1),0)"),
+        ] {
+            assert_eq!(StockCursor::decode(&bad), None, "{bad}");
+        }
+    }
+
+    /// Stock's order: height desc, request key desc (bytewise), idx asc; strictly after.
+    #[test]
+    fn stock_cursor_admits() {
+        let c = StockCursor::new(10, b"fee+x", Some(1), 0).unwrap();
+        assert!(c.admits(9, b"zzz", 0));
+        assert!(!c.admits(11, b"aaa", 9));
+        assert!(c.admits(10, b"bm86", 0));
+        assert!(c.admits(10, b"Z", 0));
+        assert!(!c.admits(10, b"fee_", 0));
+        assert!(!c.admits(10, b"fee+x", 1));
+        assert!(!c.admits(10, b"fee+x", 0));
+        assert!(c.admits(10, b"fee+x", 2));
+        // The (height, request key) form skips every row of that tx.
+        let t = StockCursor::new(10, b"cb", None, 0).unwrap();
+        assert!(!t.admits(10, b"cb", i64::MAX));
+        assert!(t.admits(10, b"Zz", 0));
     }
 
     /// R6/R7: a cut token fingerprints a chain that has a block at `done` (chain 0 lags

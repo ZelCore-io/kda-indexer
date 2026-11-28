@@ -190,7 +190,7 @@ impl RowSource for Src {
     }
 }
 
-fn page(
+pub(super) fn page(
     view: &View,
     account: &str,
     token: &str,

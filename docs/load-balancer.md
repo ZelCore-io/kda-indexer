@@ -257,9 +257,11 @@ when no later step is applied (their `use_backend` lines use both); leaving them
 To undo everything, delete the kdx lines rather than restoring an old copy of the file, so
 that unrelated edits made in between are not lost.
 
-**Known transients.** A client that is paging with a `next` token when its route moves (or
-falls back) gets an error for that token from the other implementation ("Invalid next token" from
-kda-indexer), because the two token formats differ. It restarts from the first page. `offset` paging is not affected.
+**Known transients.** kda-indexer accepts the `next` tokens chainweb-data issues and serves
+the page chainweb-data would (see [api.md](api.md), compat notes), so a client paging when
+its route moves to kda-indexer carries on. The reverse is not so: chainweb-data does not
+understand kda-indexer's tokens, so a client paging when its route falls back to chainweb-data
+gets "Invalid next token" and restarts from the first page. `offset` paging is not affected.
 
 ## 5. Planned restarts of the indexer
 
