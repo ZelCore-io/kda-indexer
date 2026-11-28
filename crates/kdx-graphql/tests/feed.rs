@@ -50,6 +50,7 @@ fn fixture() -> Fixture {
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
+        heavy_waiting_per_client: 32,
     };
     let st = Api::new(store, settings, TipWatch::default()).state();
     Fixture { _dir: d, hot, st }

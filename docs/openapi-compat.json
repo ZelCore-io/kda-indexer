@@ -74,13 +74,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -172,13 +172,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -372,13 +372,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -585,13 +585,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -666,13 +666,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -871,13 +871,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -970,13 +970,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -1072,13 +1072,13 @@
             }
           },
           "503": {
-            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`). Search refusals, the\nheavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size\nrefusals do not.",
+            "description": "`api.max_in_flight` requests are running, the answer would exceed `api.max_body_mb`\n(`response larger than N MB: narrow the query`), `search.concurrency` searches are\nrunning, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`\nand `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one\nheavy request and has others waiting is refused too (`this client already runs a heavy\nrequest and has others waiting: retry when they are done`; the queue holds\n`api.heavy_waiting_per_client` waiting requests, 32 by default). Search refusals, the\nin-flight and heavy-read refusals and `/stats` carry `Retry-After`; the body-size\nrefusal does not.",
             "headers": {
               "Retry-After": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "Seconds to wait; absent on the in-flight and body-size refusals."
+                "description": "Seconds to wait; absent on the body-size refusal."
               }
             },
             "content": {
@@ -1204,7 +1204,15 @@
             }
           },
           "503": {
-            "description": "Refused: `api.max_in_flight` requests are running; no `/v1/txs` slot freed within\n`api.deadline_ms` (5 s by default), `too many /v1/txs requests running: retry later`;\nthe client already runs a heavy request and has others waiting (`this client already\nruns a heavy request and has others waiting: retry when they are done`, the only one\nwith `Retry-After: 1`); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`).",
+            "description": "Refused: `api.max_in_flight` requests are running (`too many requests in flight`);\nno `/v1/txs` slot freed within `api.deadline_ms` (5 s by default),\n`too many /v1/txs requests running: retry later`; the client already runs a heavy\nrequest and has others waiting (`this client already runs a heavy request and has\nothers waiting: retry when they are done`; up to `api.heavy_waiting_per_client`, 32\nby default, may wait); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`). The in-flight, slot and\nheavy-queue refusals carry `Retry-After: 1`; the body-size refusal does not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1); absent on the body-size refusal."
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1326,7 +1334,15 @@
             }
           },
           "503": {
-            "description": "Refused: `api.max_in_flight` requests are running; no `/v1/txs` slot freed within\n`api.deadline_ms` (5 s by default), `too many /v1/txs requests running: retry later`;\nthe client already runs a heavy request and has others waiting (`this client already\nruns a heavy request and has others waiting: retry when they are done`, the only one\nwith `Retry-After: 1`); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`).",
+            "description": "Refused: `api.max_in_flight` requests are running (`too many requests in flight`);\nno `/v1/txs` slot freed within `api.deadline_ms` (5 s by default),\n`too many /v1/txs requests running: retry later`; the client already runs a heavy\nrequest and has others waiting (`this client already runs a heavy request and has\nothers waiting: retry when they are done`; up to `api.heavy_waiting_per_client`, 32\nby default, may wait); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`). The in-flight, slot and\nheavy-queue refusals carry `Retry-After: 1`; the body-size refusal does not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1); absent on the body-size refusal."
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {

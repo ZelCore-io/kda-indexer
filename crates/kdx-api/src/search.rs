@@ -64,9 +64,10 @@ impl SearchCtx {
 // ---------------------------------------------------------------------------------------
 // Gate
 
-/// Searches one client key may have waiting behind its `per_client` running ones: the same
-/// depth as the per-client heavy-read queue (H-1). Past it a search is refused at once (429).
-pub const SEARCH_WAITING_PER_CLIENT: usize = crate::server::HEAVY_WAITING_PER_CLIENT;
+/// Searches one client key may have waiting behind its `per_client` running ones. Past it a
+/// search is refused at once (429). Fixed: unlike the heavy-read queue
+/// (`api.heavy_waiting_per_client`) it is not configurable.
+pub const SEARCH_WAITING_PER_CLIENT: usize = 3;
 
 /// How long before the request deadline a queued search gives up, so its own refusal
 /// (counted as `wait_timeout`) answers before the listener's deadline cuts the request.

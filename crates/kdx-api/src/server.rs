@@ -42,6 +42,8 @@ pub struct ApiSettings {
     pub read_threads: usize,
     pub ready_max_lag: u32,
     pub max_event_lists: usize,
+    /// Heavy reads one client key may have waiting behind its running one (`api.heavy_waiting_per_client`).
+    pub heavy_waiting_per_client: usize,
 }
 
 /// Listen addresses, any number per listener; an empty list = not bound. A listener serves
@@ -135,7 +137,7 @@ pub struct ApiState {
     /// slot: [`v1txs_slots`] of the pool, so a long one never holds a slot of the GraphQL
     /// or compat lists (FIX-4 part C, S-1).
     v1txs: Arc<Semaphore>,
-    /// Heavy reads per client key (H-1): one runs, [`HEAVY_WAITING_PER_CLIENT`] wait.
+    /// Heavy reads per client key (H-1): one runs, `heavy_waiting_per_client` wait.
     heavy_clients: Arc<HeavyClients>,
     in_flight: Arc<Semaphore>,
     limiter: RateLimiter,
@@ -165,11 +167,6 @@ pub async fn as_client<F: std::future::Future>(ip: std::net::IpAddr, f: F) -> F:
     CLIENT.scope(bucket_key(ip), f).await
 }
 
-/// Heavy reads one client key may have waiting behind its running one (H-1); past that a
-/// heavy read is refused at once (503, GraphQL `LIMIT`). A client never holds more than one
-/// heavy slot, so with two or more slots one client cannot stall another's lists.
-pub const HEAVY_WAITING_PER_CLIENT: usize = 3;
-
 /// The 503 text of a client whose heavy-read queue is full (with `Retry-After: 1`).
 pub(crate) const HEAVY_BUSY: &str =
     "this client already runs a heavy request and has others waiting: retry when they are done";
@@ -189,12 +186,20 @@ struct HeavyTicket {
 }
 
 impl HeavyClients {
-    fn enter(self: &Arc<Self>, key: std::net::IpAddr) -> ApiResult<HeavyTicket> {
+    /// Join client `key`'s heavy reads: one runs and `max_waiting` (`api.heavy_waiting_per_client`)
+    /// may wait behind it (H-1); past that a heavy read is refused at once (503, GraphQL
+    /// `LIMIT`). Waiters are bounded by the request deadline, and a client never holds more
+    /// than one heavy slot, so with two or more slots one client cannot stall another's lists.
+    fn enter(
+        self: &Arc<Self>,
+        key: std::net::IpAddr,
+        max_waiting: usize,
+    ) -> ApiResult<HeavyTicket> {
         let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let e = m
             .entry(key)
             .or_insert_with(|| (Arc::new(Semaphore::new(1)), 0));
-        if e.1 > HEAVY_WAITING_PER_CLIENT {
+        if e.1 > max_waiting {
             tracing::debug!(client = %key, "api: heavy read refused, client queue full");
             return Err(ApiError::Busy(crate::Limiter::HeavyQueue));
         }
@@ -442,7 +447,9 @@ impl ApiState {
         let own: Option<(HeavyTicket, OwnedSemaphorePermit)> = match first {
             Some(_) => match CLIENT.try_with(|c| *c) {
                 Ok(key) => {
-                    let t = self.heavy_clients.enter(key)?;
+                    let t = self
+                        .heavy_clients
+                        .enter(key, self.settings.heavy_waiting_per_client)?;
                     let p = acquire(&t.slot)
                         .await
                         .map_err(|_| late())?
@@ -513,8 +520,8 @@ impl IntoResponse for ApiError {
         };
         // Which of our own limits refused (typed, not matched on the text), for the request
         // log: a limiter's 503, or a read that ran out of the request deadline (the same
-        // `deadline` tag as the listener's cut). The per-client heavy queue's 503 carries
-        // `Retry-After` like the other limiter refusals.
+        // `deadline` tag as the listener's cut). The in-flight, heavy-queue and `/v1/txs`
+        // slot 503s carry `Retry-After`.
         let reject = match &self {
             ApiError::Busy(l) => Some(l.reject()),
             ApiError::Deadline => Some("deadline"),
@@ -526,7 +533,12 @@ impl IntoResponse for ApiError {
             text,
         )
             .into_response();
-        if matches!(self, ApiError::Busy(crate::Limiter::HeavyQueue)) {
+        if matches!(
+            self,
+            ApiError::Busy(
+                crate::Limiter::HeavyQueue | crate::Limiter::InFlight | crate::Limiter::V1txsSlots
+            )
+        ) {
             r.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
@@ -1205,6 +1217,7 @@ pub(crate) mod tests {
             read_threads,
             ready_max_lag: 10,
             max_event_lists: 64,
+            heavy_waiting_per_client: 32,
         }
     }
 
@@ -1641,9 +1654,10 @@ pub(crate) mod tests {
         assert_eq!(reject(&r), Some("heavy_queue"));
         let r = ApiError::Busy(crate::Limiter::InFlight).into_response();
         assert_eq!(reject(&r), Some("in_flight"));
-        assert!(r.headers().get(header::RETRY_AFTER).is_none());
+        assert_eq!(r.headers()[header::RETRY_AFTER], "1");
         let r = ApiError::Busy(crate::Limiter::V1txsSlots).into_response();
         assert_eq!(reject(&r), Some("v1txs_slots"));
+        assert_eq!(r.headers()[header::RETRY_AFTER], "1");
         // The tag is typed: another 503, even one with a limiter's text, carries none.
         for t in [
             "no code index is built",
@@ -1671,7 +1685,10 @@ pub(crate) mod tests {
     async fn one_client_holds_at_most_one_heavy_slot() {
         let (_d, store) = crate::testutil::store();
         // 4 read threads: 2 heavy slots.
-        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        let mut cfg = settings(4);
+        cfg.heavy_waiting_per_client = 3;
+        let waiting_max = cfg.heavy_waiting_per_client;
+        let st = Api::new(store, cfg, TipWatch::default()).state();
         let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
         let b: std::net::IpAddr = "198.51.100.7".parse().unwrap();
         // Two deadline-long scans from client A.
@@ -1702,21 +1719,30 @@ pub(crate) mod tests {
             "{:?}",
             t.elapsed()
         );
-        // A's queue is bounded: past one running and HEAVY_WAITING_PER_CLIENT waiting, a
-        // heavy read is refused at once.
+        // A's queue is bounded: past one running and `heavy_waiting_per_client` waiting, a
+        // heavy read is refused at once, with `Retry-After` and the `heavy_queue` tag.
         let mut waiting = Vec::new();
-        for _ in 2..=HEAVY_WAITING_PER_CLIENT {
+        for _ in 2..=waiting_max {
             waiting.push(scan(st.clone(), rx.clone()));
         }
-        while st.heavy_clients.users(bucket_key(a)) < HEAVY_WAITING_PER_CLIENT + 1 {
+        while st.heavy_clients.users(bucket_key(a)) < waiting_max + 1 {
             tokio::task::yield_now().await;
         }
         let t = Instant::now();
         let r = as_client(a, st.read_heavy(|_| Ok(()))).await;
         assert!(matches!(r, Err(ApiError::Busy(_))), "{r:?}");
         assert!(t.elapsed() < Duration::from_millis(100));
+        let resp = r.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(
+            resp.extensions()
+                .get::<crate::reqlog::Reject>()
+                .map(|x| x.0),
+            Some("heavy_queue")
+        );
         // Release the scans: every slot and every client entry comes back.
-        for _ in 0..=HEAVY_WAITING_PER_CLIENT + 1 {
+        for _ in 0..=waiting_max + 1 {
             let _ = tx.send(());
         }
         for h in [s1, s2].into_iter().chain(waiting) {
@@ -1724,6 +1750,35 @@ pub(crate) mod tests {
         }
         assert_eq!(st.heavy_clients.users(bucket_key(a)), 0);
         assert_eq!(st.heavy.available_permits(), 2);
+    }
+
+    /// A client with several accounts sends eight heavy reads at once (well within the
+    /// default `api.heavy_waiting_per_client` of 32): none is refused; they run one after
+    /// another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eight_concurrent_heavy_reads_of_one_client_all_succeed() {
+        let (_d, store) = crate::testutil::store();
+        let cfg = settings(4);
+        assert_eq!(cfg.heavy_waiting_per_client, 32);
+        let st = Api::new(store, cfg, TipWatch::default()).state();
+        let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let st = st.clone();
+                tokio::spawn(as_client(a, async move {
+                    st.read_heavy(|_| {
+                        std::thread::sleep(Duration::from_millis(10));
+                        Ok(())
+                    })
+                    .await
+                }))
+            })
+            .collect();
+        for h in hs {
+            let r = h.await.unwrap();
+            assert!(r.is_ok(), "{r:?}");
+        }
+        assert_eq!(st.heavy_clients.users(bucket_key(a)), 0);
     }
 
     /// Two pagers of one client search at once (`search.per_client = 1`); the first's search

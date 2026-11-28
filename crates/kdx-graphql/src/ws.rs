@@ -665,7 +665,7 @@ mod tests {
         let ip: IpAddr = "192.0.2.9".parse().unwrap();
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut held = Vec::new();
-        for _ in 0..=kdx_api::server::HEAVY_WAITING_PER_CLIENT {
+        for _ in 0..=st.settings.heavy_waiting_per_client {
             let (st, mut rx) = (st.clone(), rx.clone());
             held.push(tokio::spawn(kdx_api::server::as_client(ip, async move {
                 st.read_heavy(move |_| {

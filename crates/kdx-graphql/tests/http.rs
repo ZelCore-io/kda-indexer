@@ -37,6 +37,7 @@ fn fixture() -> Fixture {
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
+        heavy_waiting_per_client: 32,
     };
     let st = Api::new(store, settings, TipWatch::default()).state();
     Fixture { _dir: d, st }
@@ -955,6 +956,7 @@ async fn logged_lines(posts: Vec<(&'static str, String)>, max_body_bytes: usize)
             read_threads: 2,
             ready_max_lag: 10,
             max_event_lists: 64,
+            heavy_waiting_per_client: 32,
         },
         TipWatch::default(),
     )

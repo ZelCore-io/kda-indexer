@@ -75,6 +75,7 @@ fn api_state(dir: &std::path::Path, ctx: &kdx_ingest::Ctx) -> Arc<kdx_api::ApiSt
         read_threads: 2,
         ready_max_lag: 10,
         max_event_lists: 64,
+        heavy_waiting_per_client: 32,
     };
     Api::new(store, settings, TipWatch::default()).state()
 }

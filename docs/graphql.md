@@ -276,7 +276,7 @@ store read it would need. It is answered from the pair already loaded and reads 
 
 List pages (`transactions`, `transfers`, `events` and the other lists) share the API's heavy
 read slots (half the read threads). Each client key (an IPv4 address or an IPv6 /64, as the
-rate limiter keys it) holds at most one of them. Up to 3 more of its heavy reads wait behind
+rate limiter keys it) holds at most one of them. Up to `api.heavy_waiting_per_client` (32 by default) more of its heavy reads wait behind
 that one. Past that, one is refused at once with `LIMIT`. One page scans for at most 1 s; a
 sparse or empty match then ends with `TIMEOUT`: narrow the filter. A connection nested in one
 block (`Block.transactions`, `Block.events`), and the root `transactions`, `events` and
