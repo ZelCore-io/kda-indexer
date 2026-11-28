@@ -1204,7 +1204,15 @@
             }
           },
           "503": {
-            "description": "Refused: `api.max_in_flight` requests are running (`too many requests in flight`); no `/v1/txs` slot freed within\n`api.deadline_ms` (5 s by default), `too many /v1/txs requests running: retry later`;\nthe client already runs a heavy request and has others waiting (`this client already\nruns a heavy request and has others waiting: retry when they are done`; up to\n`api.heavy_waiting_per_client`, 32 by default, may wait); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`). The in-flight and heavy-queue\nrefusals carry `Retry-After: 1`.",
+            "description": "Refused: `api.max_in_flight` requests are running (`too many requests in flight`);\nno `/v1/txs` slot freed within `api.deadline_ms` (5 s by default),\n`too many /v1/txs requests running: retry later`; the client already runs a heavy\nrequest and has others waiting (`this client already runs a heavy request and has\nothers waiting: retry when they are done`; up to `api.heavy_waiting_per_client`, 32\nby default, may wait); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`). The in-flight, slot and\nheavy-queue refusals carry `Retry-After: 1`; the body-size refusal does not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1); absent on the body-size refusal."
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -1326,7 +1334,15 @@
             }
           },
           "503": {
-            "description": "Refused: `api.max_in_flight` requests are running (`too many requests in flight`); no `/v1/txs` slot freed within\n`api.deadline_ms` (5 s by default), `too many /v1/txs requests running: retry later`;\nthe client already runs a heavy request and has others waiting (`this client already\nruns a heavy request and has others waiting: retry when they are done`; up to\n`api.heavy_waiting_per_client`, 32 by default, may wait); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`). The in-flight and heavy-queue\nrefusals carry `Retry-After: 1`.",
+            "description": "Refused: `api.max_in_flight` requests are running (`too many requests in flight`);\nno `/v1/txs` slot freed within `api.deadline_ms` (5 s by default),\n`too many /v1/txs requests running: retry later`; the client already runs a heavy\nrequest and has others waiting (`this client already runs a heavy request and has\nothers waiting: retry when they are done`; up to `api.heavy_waiting_per_client`, 32\nby default, may wait); or the answer is larger than `api.v1txs_max_body_mb`\n(`response larger than N MB: use a smaller limit`). The in-flight, slot and\nheavy-queue refusals carry `Retry-After: 1`; the body-size refusal does not.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait (1); absent on the body-size refusal."
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {

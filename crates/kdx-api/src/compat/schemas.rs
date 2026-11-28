@@ -242,14 +242,19 @@ pub enum V1TxsLimitErrors {
         headers(("Retry-After" = String, description = "Seconds to wait (1)."))
     )]
     TooManyRequests(String),
-    /// Refused: `api.max_in_flight` requests are running (`too many requests in flight`); no `/v1/txs` slot freed within
-    /// `api.deadline_ms` (5 s by default), `too many /v1/txs requests running: retry later`;
-    /// the client already runs a heavy request and has others waiting (`this client already
-    /// runs a heavy request and has others waiting: retry when they are done`; up to
-    /// `api.heavy_waiting_per_client`, 32 by default, may wait); or the answer is larger than `api.v1txs_max_body_mb`
-    /// (`response larger than N MB: use a smaller limit`). The in-flight and heavy-queue
-    /// refusals carry `Retry-After: 1`.
-    #[response(status = 503, content_type = "text/plain")]
+    /// Refused: `api.max_in_flight` requests are running (`too many requests in flight`);
+    /// no `/v1/txs` slot freed within `api.deadline_ms` (5 s by default),
+    /// `too many /v1/txs requests running: retry later`; the client already runs a heavy
+    /// request and has others waiting (`this client already runs a heavy request and has
+    /// others waiting: retry when they are done`; up to `api.heavy_waiting_per_client`, 32
+    /// by default, may wait); or the answer is larger than `api.v1txs_max_body_mb`
+    /// (`response larger than N MB: use a smaller limit`). The in-flight, slot and
+    /// heavy-queue refusals carry `Retry-After: 1`; the body-size refusal does not.
+    #[response(
+        status = 503,
+        content_type = "text/plain",
+        headers(("Retry-After" = String, description = "Seconds to wait (1); absent on the body-size refusal."))
+    )]
     Unavailable(String),
     /// A read failed; the cause is logged, the body is `internal error`.
     #[response(status = 500, content_type = "text/plain")]

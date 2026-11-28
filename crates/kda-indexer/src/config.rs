@@ -341,7 +341,8 @@ pub struct ApiConfig {
     /// Most event-name lists one event query expands to.
     pub max_event_lists: usize,
     /// Heavy reads (event scans, account lists, `/v1/txs`) one client may have waiting
-    /// behind its running one (1 to 256). A client never runs more than one at a time; the
+    /// behind its running one (1 to 256, and at most `max_in_flight / 8` minus 1: a waiting read
+    /// holds an in-flight permit). A client never runs more than one at a time; the
     /// waiting ones are bounded by the request deadline, and one past this many is refused
     /// at once (503, `Retry-After: 1`).
     pub heavy_waiting_per_client: usize,
@@ -1336,6 +1337,13 @@ impl Config {
             (1..=256).contains(&a.heavy_waiting_per_client),
             "api.heavy_waiting_per_client must be 1 to 256"
         );
+        // A waiting heavy read holds a global in-flight permit, so one client's queue must
+        // stay a small share of `max_in_flight`.
+        anyhow::ensure!(
+            (a.heavy_waiting_per_client + 1) * 8 <= a.max_in_flight,
+            "api.heavy_waiting_per_client + 1 must be at most api.max_in_flight / 8 \
+             (a waiting heavy read holds an in-flight permit)"
+        );
         let g = &self.graphql;
         anyhow::ensure!(
             g.ws_subs_per_conn <= g.ws_subs_per_ip.min(100)
@@ -1857,6 +1865,31 @@ mod ws_bound_tests {
         assert!(!c.graphql.sender_index);
     }
 
+    /// A client's heavy queue may hold at most 1/8 of `api.max_in_flight` (each waiting
+    /// read holds an in-flight permit): the default passes with 512, 64 does not, and it
+    /// passes once `max_in_flight` is raised.
+    #[test]
+    fn heavy_waiting_per_client_is_a_share_of_max_in_flight() {
+        let parse = |a: &str| {
+            let text = format!(
+                "network = \"mainnet01\"\ndata_dir = \"data\"\n[node]\n\
+                 url = \"http://127.0.0.1:1848\"\n[api]\n{a}\n"
+            );
+            toml::from_str::<Config>(&text).unwrap()
+        };
+        parse("max_in_flight = 512").validate().unwrap();
+        let e = parse("heavy_waiting_per_client = 64\nmax_in_flight = 512")
+            .validate()
+            .expect_err("64 with 512");
+        assert!(format!("{e:#}").contains("max_in_flight / 8"), "{e:#}");
+        parse("heavy_waiting_per_client = 63\nmax_in_flight = 512")
+            .validate()
+            .unwrap();
+        parse("heavy_waiting_per_client = 64\nmax_in_flight = 520")
+            .validate()
+            .unwrap();
+    }
+
     /// `api.heavy_waiting_per_client` defaults to 32, reaches the API settings, and is
     /// bounded to 1..=256; both example configs and the docs name it.
     #[test]
@@ -1878,10 +1911,13 @@ mod ws_bound_tests {
                 .heavy_waiting_per_client,
             32
         );
-        for ok in ["1", "256"] {
+        for ok in ["1", "63"] {
             let c = parse(&format!("heavy_waiting_per_client = {ok}"));
             c.validate().unwrap();
         }
+        // The upper bound needs a matching `max_in_flight` (see the next test).
+        let c = parse("heavy_waiting_per_client = 256\nmax_in_flight = 2056");
+        c.validate().unwrap();
         for bad in ["0", "257"] {
             let c = parse(&format!("heavy_waiting_per_client = {bad}"));
             let e = c.validate().expect_err(bad);

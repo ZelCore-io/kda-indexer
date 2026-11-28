@@ -520,8 +520,8 @@ impl IntoResponse for ApiError {
         };
         // Which of our own limits refused (typed, not matched on the text), for the request
         // log: a limiter's 503, or a read that ran out of the request deadline (the same
-        // `deadline` tag as the listener's cut). The per-client heavy queue's 503 carries
-        // `Retry-After` like the other limiter refusals.
+        // `deadline` tag as the listener's cut). The in-flight, heavy-queue and `/v1/txs`
+        // slot 503s carry `Retry-After`.
         let reject = match &self {
             ApiError::Busy(l) => Some(l.reject()),
             ApiError::Deadline => Some("deadline"),
@@ -535,7 +535,9 @@ impl IntoResponse for ApiError {
             .into_response();
         if matches!(
             self,
-            ApiError::Busy(crate::Limiter::HeavyQueue | crate::Limiter::InFlight)
+            ApiError::Busy(
+                crate::Limiter::HeavyQueue | crate::Limiter::InFlight | crate::Limiter::V1txsSlots
+            )
         ) {
             r.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -1655,6 +1657,7 @@ pub(crate) mod tests {
         assert_eq!(r.headers()[header::RETRY_AFTER], "1");
         let r = ApiError::Busy(crate::Limiter::V1txsSlots).into_response();
         assert_eq!(reject(&r), Some("v1txs_slots"));
+        assert_eq!(r.headers()[header::RETRY_AFTER], "1");
         // The tag is typed: another 503, even one with a limiter's text, carries none.
         for t in [
             "no code index is built",
@@ -1749,8 +1752,9 @@ pub(crate) mod tests {
         assert_eq!(st.heavy.available_permits(), 2);
     }
 
-    /// A client with several accounts sends eight heavy reads at once (the default
-    /// `api.heavy_waiting_per_client`): none is refused; they run one after another.
+    /// A client with several accounts sends eight heavy reads at once (well within the
+    /// default `api.heavy_waiting_per_client` of 32): none is refused; they run one after
+    /// another.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn eight_concurrent_heavy_reads_of_one_client_all_succeed() {
         let (_d, store) = crate::testutil::store();
