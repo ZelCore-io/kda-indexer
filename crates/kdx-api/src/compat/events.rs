@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -268,7 +268,7 @@ fn page(
     }
     let limits = ScanLimits {
         max_heights: search.max_scan_heights.max(1),
-        until: (Instant::now() + Duration::from_millis(search.timeout_ms)).min(view.deadline),
+        until: super::search::search_until(view, search.timeout_ms),
     };
     let page = collect_page(
         view,

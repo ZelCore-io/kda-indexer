@@ -21,7 +21,7 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::Query;
 use axum::response::{IntoResponse, Response};
@@ -33,7 +33,7 @@ use serde_json::json;
 use super::{
     as_of, list_params, page_rows, parse_query, txs::summary, ListParams, Lp, Order, St, Q,
 };
-use crate::compat::search::{half_left, index_path, IndexPath};
+use crate::compat::search::{half_left, index_path, search_until, IndexPath};
 use crate::compat::Paging;
 use crate::cursor::Cursor;
 use crate::search::{check_pattern, literal_chars, rejected, ClientIp, SearchCtx};
@@ -114,8 +114,7 @@ pub async fn code(
     let res =
         st.0.read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
-            let until = (Instant::now() + Duration::from_millis(ctx.settings.timeout_ms))
-                .min(view.deadline);
+            let until = search_until(view, ctx.settings.timeout_ms);
             // Keys up to and including the cursor's tx (it may have rows left).
             let before = lp
                 .cursor

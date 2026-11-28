@@ -1734,8 +1734,11 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_late_search_reads_only_until_the_request_deadline() {
         let (_d, store) = crate::testutil::store();
-        // settings(): a 500 ms request deadline.
-        let st = Api::new(store, settings(4), TipWatch::default()).state();
+        // A 1.5 s request deadline: the first pager holds 800 ms, so the second's turn comes
+        // with about 700 ms left, and a loaded machine has hundreds of ms of slack.
+        let mut cfg = settings(4);
+        cfg.deadline = Duration::from_millis(1500);
+        let st = Api::new(store, cfg, TipWatch::default()).state();
         let gate = Arc::new(crate::search::SearchGate::new(4, 1));
         let ip = std::net::IpAddr::from([127, 0, 0, 1]);
         let (heavy, reads) = (st.heavy.available_permits(), st.reads.available_permits());
@@ -1765,7 +1768,7 @@ pub(crate) mod tests {
                 (r, Instant::now() <= until)
             })
         };
-        let first = pager(Some(Duration::from_millis(400)));
+        let first = pager(Some(Duration::from_millis(800)));
         while gate.in_flight() < 1 {
             tokio::task::yield_now().await;
         }
