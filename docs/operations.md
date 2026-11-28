@@ -504,6 +504,7 @@ One line, for example:
 | `status`, `ms` | status the client got (the limits' 429/503/504 included) and the time to the response head |
 | `client` | keyed hash of the client address (after `api.trusted_proxies`); absent with `client_ip = "omit"` |
 | `local` | `true` when the client address (as for `client`, after `api.trusted_proxies`) is loopback (127.0.0.0/8 or ::1); absent otherwise, and written with `client_ip = "omit"` too. The address itself is never written. `hourly_check.py` skips these lines, so its own loopback replays are not sampled again |
+| `reject` | which of our own limits refused the request; absent when none did. `rate` (429, the per-client token bucket), `in_flight` (503, `api.max_in_flight`), `deadline` (504, the request deadline passed: the listener cut the request, or its read ran out of time), `heavy_queue` (503, the client's heavy-read queue is full), `v1txs_slots` (503, no `/v1/txs` slot within the deadline), `search_client` (429, the client's search queue is full), `search_wait` (504, the deadline passed while the search waited behind the client's earlier ones), `search_global` (503, `search.concurrency` searches run) |
 | `tip_min`, `tip_max`, `lag_max` | lowest and highest indexed chain height and the largest chain lag, as last sampled for `/metrics` (at most 10 s old) |
 | `gql` | GraphQL POST only: the body's `operationName`, `query` and `variables` (each request of a batch) |
 | `gql_cut`, `gql_len` | instead of `gql`, when the body is over `max_body_bytes` or not JSON (a 400 for a body that is not JSON or not a valid request is logged too) |
@@ -570,6 +571,7 @@ up their stock rates. `--dry-run` samples and runs the chain checks without repl
    | Class | Meaning | Fails the hour |
    |---|---|---|
    | `equal` | same answer | no |
+   | `legacy-equal` | kda-compare's `legacy-cmd` against the node with an empty difference list: an old tx whose cmd the node serves re-encoded (it does not hash to the request key), every compared field equal. A `legacy-cmd` with any difference stays `unexplained` | no |
    | `allowlisted` (a) | a documented difference ([comparison.md](comparison.md)) | no |
    | `known-gap` (d) | a known gap the allowlist names | no |
    | `timing` (c) | a tip race, a balance row read while the drain had it stale, or a difference the re-check finds `equal` or `allowlisted` | no |

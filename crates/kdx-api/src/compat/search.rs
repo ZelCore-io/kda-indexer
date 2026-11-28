@@ -101,6 +101,7 @@ pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(ctx): Extension<Arc<SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     headers: HeaderMap,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -129,13 +130,13 @@ pub async fn handler(
             if let Err(t) = check_pattern("search", s) {
                 return text(StatusCode::BAD_REQUEST, t);
             }
-            let permit = match ctx.gate.try_acquire(ip) {
+            let permit = match ctx.gate.acquire(ip, until).await {
                 Ok(p) => p,
                 Err(r) => return r,
             };
             let raw = s.to_owned();
             let res = st
-                .read_heavy(move |view| {
+                .read_heavy_until(permit.deadline(), move |view| {
                     let _permit = permit;
                     search_page(view, &ctx, &raw, &pg)
                 })
@@ -296,6 +297,14 @@ pub fn half_left(view: &View) -> Instant {
     now + view.deadline.saturating_duration_since(now) / 2
 }
 
+/// Where a search's scan ends: `timeout_ms` from now, but never later than `half_left`.
+/// A search whose turn comes late (the gate queued it) has less than `timeout_ms` left to the
+/// request deadline; ending the scan at that deadline would let the listener answer 504 before
+/// the partial page is built, so the scan stops early enough to answer a truncated page.
+pub fn search_until(view: &View, timeout_ms: u64) -> Instant {
+    (Instant::now() + Duration::from_millis(timeout_ms)).min(half_left(view))
+}
+
 /// One `search` page (index path, else the bounded scan): also GraphQL's
 /// `transactionsByPactCode`.
 pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiResult<Page> {
@@ -312,7 +321,7 @@ pub fn search_page(view: &View, ctx: &SearchCtx, raw: &str, pg: &Paging) -> ApiR
     }
     let max_h = resume_max(pg);
     let set = ctx.settings;
-    let until = (Instant::now() + Duration::from_millis(set.timeout_ms)).min(view.deadline);
+    let until = search_until(view, set.timeout_ms);
     let limits = ScanLimits {
         max_heights: set.max_scan_heights.max(1),
         until,
@@ -798,6 +807,30 @@ mod tests {
         // Hits in the window: served, marked truncated (the scan is not run).
         assert_eq!(heights(&paging(None, None)), vec![3]);
         assert_eq!(heights(&paging(Some(5), None)), vec![9]);
+    }
+
+    /// A search whose turn comes with less than `search.timeout_ms` left to the request
+    /// deadline (compat search, compat events and the native routes all take their scan end
+    /// from `search_until`) stops its scan before that deadline, with time to build the
+    /// truncated page. With time to spare it keeps `timeout_ms`.
+    #[test]
+    fn a_late_turns_scan_ends_before_the_request_deadline() {
+        let (_d, store) = crate::testutil::store();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let view = store.view(deadline).unwrap();
+        // Late: 10 s of search budget, about 2 s left.
+        let until = search_until(&view, 10_000);
+        assert!(until < deadline, "the scan must end before the deadline");
+        assert!(
+            deadline.saturating_duration_since(until) >= Duration::from_millis(500),
+            "time is left to build the page"
+        );
+        // Not late: the search budget is the earlier end.
+        let until = search_until(&view, 100);
+        assert!(until <= Instant::now() + Duration::from_millis(100));
+        // Past the deadline: the scan has no time at all (a truncated page, not an error).
+        let past = store.view(Instant::now()).unwrap();
+        assert!(search_until(&past, 10_000) <= Instant::now());
     }
 
     /// N-02: a scan out of time before its first height returns no cursor (one naming the

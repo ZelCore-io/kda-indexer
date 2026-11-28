@@ -950,11 +950,14 @@ impl TransactionSummary {
     }
 }
 
-/// A search-gate permit for the client at `ip`. An operation whose client address is not
-/// known is refused: sharing one bucket among such clients would defeat the per-client limit.
-pub fn search_permit(
+/// A search-gate permit for the client at `ip`: past `search.per_client` the search waits its
+/// turn until `deadline`, as on the HTTP search routes. An operation whose client address is
+/// not known is refused: sharing one bucket among such clients would defeat the per-client
+/// limit.
+pub async fn search_permit(
     gate: &Arc<kdx_api::search::SearchGate>,
     ip: Option<std::net::IpAddr>,
+    deadline: std::time::Instant,
 ) -> Result<kdx_api::search::SearchPermit> {
     let ip = ip.ok_or_else(|| {
         err(
@@ -962,12 +965,20 @@ pub fn search_permit(
             "search needs a known client address (HTTP or an accepted websocket)",
         )
     })?;
-    gate.try_acquire(ip).map_err(|_| {
-        err(
-            Code::Limit,
-            "too many searches in flight: try again shortly",
-        )
-    })
+    gate.acquire(ip, deadline)
+        .await
+        .map_err(|r| match r.status() {
+            axum::http::StatusCode::TOO_MANY_REQUESTS => {
+                err(Code::Limit, kdx_api::search::CLIENT_BUSY)
+            }
+            axum::http::StatusCode::GATEWAY_TIMEOUT => {
+                err(Code::Timeout, kdx_api::search::WAIT_TIMEOUT)
+            }
+            _ => err(
+                Code::Limit,
+                "too many searches in flight: try again shortly",
+            ),
+        })
 }
 
 /// A number's exact text (a string or `{"decimal": ..}` unwrapped); "0" when absent.
@@ -1014,12 +1025,12 @@ pub async fn query_transactions_by_pact_code(
         Some(PageCursor::Block(_)) => return Err(bad_input("invalid cursor")),
     };
     let had_cursor = next.is_some();
-    let permit = search_permit(&search.gate, crate::client_ip(ctx))?;
+    let permit = search_permit(&search.gate, crate::client_ip(ctx), crate::deadline(ctx)).await?;
     let n = page.n;
     let (rows, resume, truncated) = g
         .state()?
         .clone()
-        .read_heavy(move |view| {
+        .read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
             let pg = Paging {
                 limit: n,
@@ -1108,21 +1119,33 @@ mod tests {
         assert_eq!(s.clist[0].args, "[]");
     }
 
-    #[test]
-    fn search_permits_are_per_client_and_need_an_address() {
+    #[tokio::test]
+    async fn search_permits_are_per_client_and_need_an_address() {
         use std::net::{IpAddr, Ipv4Addr};
+        use std::time::{Duration, Instant};
         let gate = Arc::new(kdx_api::search::SearchGate::new(8, 1));
         let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let b = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
-        let pa = search_permit(&gate, Some(a)).expect("first client");
-        let _pb = search_permit(&gate, Some(b)).expect("a second client has its own bucket");
+        let soon = |ms| Instant::now() + Duration::from_millis(ms);
+        let pa = search_permit(&gate, Some(a), soon(5_000))
+            .await
+            .expect("first client");
+        let _pb = search_permit(&gate, Some(b), soon(5_000))
+            .await
+            .expect("a second client has its own bucket");
         assert!(
-            search_permit(&gate, Some(a)).is_err(),
-            "per-client limit holds"
+            search_permit(&gate, Some(a), soon(150)).await.is_err(),
+            "per-client limit holds: the second waits, here past its deadline"
         );
-        assert!(search_permit(&gate, None).is_err(), "no address: refused");
+        assert!(
+            search_permit(&gate, None, soon(5_000)).await.is_err(),
+            "no address: refused"
+        );
         drop(pa);
-        assert!(search_permit(&gate, Some(a)).is_ok(), "released on drop");
+        assert!(
+            search_permit(&gate, Some(a), soon(5_000)).await.is_ok(),
+            "released on drop"
+        );
     }
 
     /// Wire formats of the deployed oracle (R-P5P9-19): `gasLimit`, `ttl`, `gas`, `transactionId`,

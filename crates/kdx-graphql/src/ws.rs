@@ -681,7 +681,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let t = Instant::now();
         let r = in_session(ip, st.read_heavy(|_| Ok(()))).await;
-        assert!(matches!(r, Err(kdx_api::ApiError::Unavailable(_))), "{r:?}");
+        assert!(matches!(r, Err(kdx_api::ApiError::Busy(_))), "{r:?}");
         assert!(t.elapsed() < Duration::from_millis(100));
         let _ = tx.send(true);
         for h in held {

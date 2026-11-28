@@ -21,7 +21,7 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::Query;
 use axum::response::{IntoResponse, Response};
@@ -33,7 +33,7 @@ use serde_json::json;
 use super::{
     as_of, list_params, page_rows, parse_query, txs::summary, ListParams, Lp, Order, St, Q,
 };
-use crate::compat::search::{half_left, index_path, IndexPath};
+use crate::compat::search::{half_left, index_path, search_until, IndexPath};
 use crate::compat::Paging;
 use crate::cursor::Cursor;
 use crate::search::{check_pattern, literal_chars, rejected, ClientIp, SearchCtx};
@@ -80,7 +80,8 @@ fn inputs(q: &Q, ctx: &SearchCtx) -> ApiResult<(String, Lp)> {
     responses(
         (status = 200, description = "`items` of tx summaries, `next_cursor`, `truncated`, `partial`, `as_of`"),
         (status = 400, description = "q missing, too short, too long or without a 3-character run"),
-        (status = 429, description = "This client already runs a search"),
+        (status = 429, description = "This client already runs search.per_client searches and has 3 more waiting"),
+        (status = 504, description = "The request deadline passed, also while waiting behind this client's earlier searches"),
         (status = 503, description = "Too many searches in flight, or no code index built"),
     )
 )]
@@ -88,6 +89,7 @@ pub async fn code(
     st: St,
     Extension(ctx): Extension<Arc<SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     q: QueryQ,
 ) -> Response {
     let q = match parse_query(q) {
@@ -105,15 +107,14 @@ pub async fn code(
         )
         .into_response();
     }
-    let permit = match ctx.gate.try_acquire(ip) {
+    let permit = match ctx.gate.acquire(ip, until).await {
         Ok(p) => p,
         Err(r) => return r,
     };
     let res =
-        st.0.read_heavy(move |view| {
+        st.0.read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
-            let until = (Instant::now() + Duration::from_millis(ctx.settings.timeout_ms))
-                .min(view.deadline);
+            let until = search_until(view, ctx.settings.timeout_ms);
             // Keys up to and including the cursor's tx (it may have rows left).
             let before = lp
                 .cursor
@@ -216,7 +217,8 @@ pub async fn code(
     responses(
         (status = 200, description = "`items` of events with their tx context, `next_cursor`, `truncated`, `as_of`"),
         (status = 400, description = "q missing, too short or too long"),
-        (status = 429, description = "This client already runs a search"),
+        (status = 429, description = "This client already runs search.per_client searches and has 3 more waiting"),
+        (status = 504, description = "The request deadline passed, also while waiting behind this client's earlier searches"),
         (status = 503, description = "Too many searches in flight"),
     )
 )]
@@ -224,6 +226,7 @@ pub async fn events(
     st: St,
     Extension(ctx): Extension<Arc<SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     q: QueryQ,
 ) -> Response {
     let q = match parse_query(q) {
@@ -238,12 +241,12 @@ pub async fn events(
         return ApiError::BadRequest("chain is not supported on /search/events".into())
             .into_response();
     }
-    let permit = match ctx.gate.try_acquire(ip) {
+    let permit = match ctx.gate.acquire(ip, until).await {
         Ok(p) => p,
         Err(r) => return r,
     };
     let res =
-        st.0.read_heavy(move |view| {
+        st.0.read_heavy_until(permit.deadline(), move |view| {
             let _permit = permit;
             let pg = Paging {
                 limit: lp.limit,

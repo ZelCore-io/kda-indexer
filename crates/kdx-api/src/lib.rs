@@ -39,9 +39,44 @@ pub enum ApiError {
     /// 503 with this text (store not ready, body too large, overloaded).
     #[error("{0}")]
     Unavailable(String),
+    /// 503 from one of our own limiters: the request log names it (`reject`), whatever the
+    /// text says.
+    #[error("{}", .0.text())]
+    Busy(Limiter),
     /// 500; the cause is logged, not sent.
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
+}
+
+/// The limiter behind an [`ApiError::Busy`] 503.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limiter {
+    /// The client's heavy-read queue is full (H-1; with `Retry-After: 1`).
+    HeavyQueue,
+    /// No `/v1/txs` slot came within the normal deadline (S-1).
+    V1txsSlots,
+    /// `api.max_in_flight` requests run.
+    InFlight,
+}
+
+impl Limiter {
+    /// The 503 text.
+    pub fn text(self) -> &'static str {
+        match self {
+            Limiter::HeavyQueue => server::HEAVY_BUSY,
+            Limiter::V1txsSlots => server::V1TXS_BUSY,
+            Limiter::InFlight => server::IN_FLIGHT_BUSY,
+        }
+    }
+
+    /// The request log's `reject` tag.
+    pub fn reject(self) -> &'static str {
+        match self {
+            Limiter::HeavyQueue => "heavy_queue",
+            Limiter::V1txsSlots => "v1txs_slots",
+            Limiter::InFlight => "in_flight",
+        }
+    }
 }
 
 impl From<kdx_types::Error> for ApiError {

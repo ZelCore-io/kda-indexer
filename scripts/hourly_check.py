@@ -31,7 +31,8 @@ Steps:
      pass, 1 = fail, 2 = the check itself could not run (or another run holds the lock:
      "busy"), 3 = inconclusive (too few requests compared; not a pass).
 
-Classes (the G4 triage classes): equal; (a) allowlisted (a documented, accepted difference);
+Classes (the G4 triage classes): equal; legacy-equal (kda-compare's legacy-cmd with no
+difference: the node re-encoded an old tx's cmd, every compared field agrees); (a) allowlisted (a documented, accepted difference);
 (d) known-gap; (c) timing: a tip race or a balance row read while the drain had it stale
 (the harness's skew/reorg rules), or a difference the re-check finds equal or allowlisted
 (a re-check that answers ours-error counts as ours-error; any other re-check keeps the
@@ -98,12 +99,17 @@ TIMING = {"skew", "reorg", "oracle-tip"}
 STOCK = {"b-error"}
 NOT_COMPARED = {"no-oracle", "bad-request", "a-paused", "gen-error"}
 OURS = {"a-error"}
+# kda-compare's `legacy-cmd`: the node serves a re-encoded cmd for an old tx (it does not hash
+# to the request key), so the outcome is flagged even when every projected field agrees. With
+# no difference recorded it is `legacy-equal`; with any difference it stays unexplained.
+LEGACY = {"legacy-cmd"}
 # Worst first: an item takes the worst class of its pairs.
-ORDER = ["ours-error", "unexplained", "timing", "known-gap", "allowlisted", "equal",
+ORDER = ["ours-error", "unexplained", "timing", "known-gap", "allowlisted", "legacy-equal", "equal",
          "stock-unavailable", "not-compared"]
 LETTER = {"allowlisted": "a", "known-gap": "d", "timing": "c", "unexplained": "b?"}
 # Classes of an item whose answers were compared (a difference was compared too).
-COMPARED = ("equal", "allowlisted", "known-gap", "timing", "unexplained", "ours-error")
+COMPARED = ("equal", "legacy-equal", "allowlisted", "known-gap", "timing", "unexplained",
+            "ours-error")
 # A re-check that answers one of these turns a difference into (c) timing.
 RECHECK_CLEARS = ("equal", "allowlisted")
 EXIT = {"PASS": 0, "FAIL": 1, "INCONCLUSIVE": 3}
@@ -325,12 +331,21 @@ def item_class(line):
             classes.add("not-compared")
         elif c in OURS:
             classes.add("ours-error")
+        elif c in LEGACY and no_difference(o):
+            classes.add("legacy-equal")
         else:
             classes.add("unexplained")
     for c in ORDER:
         if c in classes:
             return c
     return "not-compared"
+
+
+def no_difference(outcome):
+    """True only when the outcome's record says, with an empty list, that nothing differed (a
+    missing record or diff is not proof of equality)."""
+    rec = outcome.get("record")
+    return isinstance(rec, dict) and rec.get("diff") == []
 
 
 def signature(rkey, line):

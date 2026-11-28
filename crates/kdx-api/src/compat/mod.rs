@@ -69,7 +69,8 @@ pub struct SearchSettings {
     pub timeout_ms: u64,
     /// Global concurrent searches (S-5, `503` beyond).
     pub concurrency: usize,
-    /// Concurrent searches per client (S-5, `429` beyond).
+    /// Concurrent searches per client (S-5); up to `SEARCH_WAITING_PER_CLIENT` more wait,
+    /// `429` beyond.
     pub per_client: usize,
     /// Prefilter hits one code search examines.
     pub max_candidates: usize,

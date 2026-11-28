@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -268,7 +268,7 @@ pub(super) fn page(
     }
     let limits = ScanLimits {
         max_heights: search.max_scan_heights.max(1),
-        until: Instant::now() + Duration::from_millis(search.timeout_ms),
+        until: super::search::search_until(view, search.timeout_ms),
     };
     let page = collect_page(
         view,
@@ -360,6 +360,7 @@ pub async fn handler(
     Extension(search): Extension<SearchSettings>,
     Extension(ctx): Extension<Arc<crate::search::SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     headers: HeaderMap,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -379,22 +380,25 @@ pub async fn handler(
     let heavy = f.heavy();
     // `search` is a text search: it takes a search gate slot (S-5), held by the read.
     let permit = if f.search.is_some() {
-        match ctx.gate.try_acquire(ip) {
+        match ctx.gate.acquire(ip, until).await {
             Ok(p) => Some(p),
             Err(r) => return r,
         }
     } else {
         None
     };
+    // A search read ends by the request deadline its gate wait used (it may start late).
+    let end = permit.as_ref().map(|p| p.deadline());
     let run = move |v: &View| {
         let _permit = permit;
         page(v, f, &pg, search, cap, false)
     };
     // Without modulename the request may take the scan path: an expensive class.
-    let res = if heavy {
-        st.read_heavy(run).await
-    } else {
-        st.read(run).await
+    let res = match (heavy, end) {
+        (true, Some(d)) => st.read_heavy_until(d, run).await,
+        (true, None) => st.read_heavy(run).await,
+        (false, Some(d)) => st.read_until(d, run).await,
+        (false, None) => st.read(run).await,
     };
     match res {
         Ok(p) => page_response(p),
