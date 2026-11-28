@@ -80,7 +80,8 @@ fn inputs(q: &Q, ctx: &SearchCtx) -> ApiResult<(String, Lp)> {
     responses(
         (status = 200, description = "`items` of tx summaries, `next_cursor`, `truncated`, `partial`, `as_of`"),
         (status = 400, description = "q missing, too short, too long or without a 3-character run"),
-        (status = 429, description = "This client already runs a search"),
+        (status = 429, description = "This client already runs search.per_client searches and has 3 more waiting"),
+        (status = 504, description = "The request deadline passed, also while waiting behind this client's earlier searches"),
         (status = 503, description = "Too many searches in flight, or no code index built"),
     )
 )]
@@ -88,6 +89,7 @@ pub async fn code(
     st: St,
     Extension(ctx): Extension<Arc<SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     q: QueryQ,
 ) -> Response {
     let q = match parse_query(q) {
@@ -105,7 +107,7 @@ pub async fn code(
         )
         .into_response();
     }
-    let permit = match ctx.gate.try_acquire(ip) {
+    let permit = match ctx.gate.acquire(ip, until).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -216,7 +218,8 @@ pub async fn code(
     responses(
         (status = 200, description = "`items` of events with their tx context, `next_cursor`, `truncated`, `as_of`"),
         (status = 400, description = "q missing, too short or too long"),
-        (status = 429, description = "This client already runs a search"),
+        (status = 429, description = "This client already runs search.per_client searches and has 3 more waiting"),
+        (status = 504, description = "The request deadline passed, also while waiting behind this client's earlier searches"),
         (status = 503, description = "Too many searches in flight"),
     )
 )]
@@ -224,6 +227,7 @@ pub async fn events(
     st: St,
     Extension(ctx): Extension<Arc<SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     q: QueryQ,
 ) -> Response {
     let q = match parse_query(q) {
@@ -238,7 +242,7 @@ pub async fn events(
         return ApiError::BadRequest("chain is not supported on /search/events".into())
             .into_response();
     }
-    let permit = match ctx.gate.try_acquire(ip) {
+    let permit = match ctx.gate.acquire(ip, until).await {
         Ok(p) => p,
         Err(r) => return r,
     };

@@ -101,6 +101,7 @@ pub async fn handler(
     State(st): State<Arc<ApiState>>,
     Extension(ctx): Extension<Arc<SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     headers: HeaderMap,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -129,7 +130,7 @@ pub async fn handler(
             if let Err(t) = check_pattern("search", s) {
                 return text(StatusCode::BAD_REQUEST, t);
             }
-            let permit = match ctx.gate.try_acquire(ip) {
+            let permit = match ctx.gate.acquire(ip, until).await {
                 Ok(p) => p,
                 Err(r) => return r,
             };

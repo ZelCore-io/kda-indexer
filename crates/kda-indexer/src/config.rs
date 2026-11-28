@@ -983,7 +983,8 @@ pub struct SearchConfig {
     pub commit_secs: u64,
     /// Concurrent searches (all search routes together); more answer 503.
     pub concurrency: u32,
-    /// Concurrent searches per client; more answer 429.
+    /// Concurrent searches per client; up to 3 more wait their turn (bounded by the request
+    /// deadline, 504 past it), and more than that answer 429.
     pub per_client: u32,
     /// `search rebuild` threads (decode and tantivy writer).
     pub build_threads: u32,

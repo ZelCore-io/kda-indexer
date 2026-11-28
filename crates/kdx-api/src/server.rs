@@ -13,7 +13,7 @@ use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use axum::body::{Body, HttpBody};
 use axum::extract::{ConnectInfo, MatchedPath, Request, State};
-use axum::http::{header, HeaderName, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::serve::ListenerExt;
@@ -170,7 +170,7 @@ pub async fn as_client<F: std::future::Future>(ip: std::net::IpAddr, f: F) -> F:
 /// heavy slot, so with two or more slots one client cannot stall another's lists.
 pub const HEAVY_WAITING_PER_CLIENT: usize = 3;
 
-/// The 503 text of a client whose heavy-read queue is full (no `Retry-After`).
+/// The 503 text of a client whose heavy-read queue is full (with `Retry-After: 1`).
 pub(crate) const HEAVY_BUSY: &str =
     "this client already runs a heavy request and has others waiting: retry when they are done";
 
@@ -442,6 +442,9 @@ struct Slots<'a> {
     late: fn() -> ApiError,
 }
 
+/// The 503 of a request refused because `api.max_in_flight` requests run.
+pub(crate) const IN_FLIGHT_BUSY: &str = "too many requests in flight";
+
 /// The 503 of a `/v1/txs` read that found no slot within the normal deadline.
 pub(crate) const V1TXS_BUSY: &str = "too many /v1/txs requests running: retry later";
 
@@ -462,12 +465,28 @@ impl IntoResponse for ApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
         };
-        (
+        // Our own limiters' 503s: which one refused, for the request log; the per-client
+        // heavy queue's carries `Retry-After` like the other limiter refusals.
+        let reject = match &self {
+            ApiError::Unavailable(t) if t == HEAVY_BUSY => Some("heavy_queue"),
+            ApiError::Unavailable(t) if t == V1TXS_BUSY => Some("v1txs_slots"),
+            ApiError::Unavailable(t) if t == IN_FLIGHT_BUSY => Some("in_flight"),
+            _ => None,
+        };
+        let mut r = (
             code,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             text,
         )
-            .into_response()
+            .into_response();
+        if reject == Some("heavy_queue") {
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        if let Some(x) = reject {
+            r.extensions_mut().insert(crate::reqlog::Reject(x));
+        }
+        r
     }
 }
 
@@ -542,17 +561,19 @@ impl RunDeadline {
 /// Limits of a data listener: in-flight cap, per-IP rate, deadline, body cap.
 pub async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) -> Response {
     let Ok(slot) = st.in_flight.clone().try_acquire_owned() else {
-        return ApiError::Unavailable("too many requests in flight".into()).into_response();
+        return ApiError::Unavailable(IN_FLIGHT_BUSY.into()).into_response();
     };
     if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
         let ip = client_ip(*peer, req.headers(), &st.settings.trusted_proxies);
         if !st.limiter.allow(ip) {
-            return (
+            let mut r = (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, "1")],
                 "rate limit exceeded",
             )
                 .into_response();
+            r.extensions_mut().insert(crate::reqlog::Reject("rate"));
+            return r;
         }
     }
     let path = req.uri().path();
@@ -597,7 +618,11 @@ pub async fn guard(State(st): State<Arc<ApiState>>, req: Request, next: Next) ->
     };
     let resp = match run_deadline.run(Duration::ZERO, run).await {
         Some(r) => r,
-        None => return ApiError::Deadline.into_response(),
+        None => {
+            let mut r = ApiError::Deadline.into_response();
+            r.extensions_mut().insert(crate::reqlog::Reject("deadline"));
+            return r;
+        }
     };
     // Handlers build whole bodies (exact size hint); one over the cap is refused.
     if resp.body().size_hint().lower() > cap as u64 {
@@ -1556,6 +1581,26 @@ pub(crate) mod tests {
             Err(ApiError::Deadline)
         ));
         assert!(st.read(|_| Ok(())).await.is_ok());
+    }
+
+    /// The heavy-queue 503 carries `Retry-After: 1` like the other limiter refusals, and our
+    /// limiters' 503s name themselves to the request log; other 503s do neither.
+    #[test]
+    fn limiter_503s_name_the_limiter() {
+        let reject = |r: &Response| r.extensions().get::<crate::reqlog::Reject>().map(|x| x.0);
+        let r = ApiError::Unavailable(HEAVY_BUSY.into()).into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(reject(&r), Some("heavy_queue"));
+        let r = ApiError::Unavailable(IN_FLIGHT_BUSY.into()).into_response();
+        assert_eq!(reject(&r), Some("in_flight"));
+        assert!(r.headers().get(header::RETRY_AFTER).is_none());
+        let r = ApiError::Unavailable(V1TXS_BUSY.into()).into_response();
+        assert_eq!(reject(&r), Some("v1txs_slots"));
+        let r = ApiError::Unavailable("no code index is built".into()).into_response();
+        assert_eq!(reject(&r), None);
+        assert!(r.headers().get(header::RETRY_AFTER).is_none());
+        assert_eq!(reject(&ApiError::Deadline.into_response()), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

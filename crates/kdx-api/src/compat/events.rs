@@ -360,6 +360,7 @@ pub async fn handler(
     Extension(search): Extension<SearchSettings>,
     Extension(ctx): Extension<Arc<crate::search::SearchCtx>>,
     ClientIp(ip): ClientIp,
+    crate::search::SearchDeadline(until): crate::search::SearchDeadline,
     headers: HeaderMap,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
@@ -379,7 +380,7 @@ pub async fn handler(
     let heavy = f.heavy();
     // `search` is a text search: it takes a search gate slot (S-5), held by the read.
     let permit = if f.search.is_some() {
-        match ctx.gate.try_acquire(ip) {
+        match ctx.gate.acquire(ip, until).await {
             Ok(p) => Some(p),
             Err(r) => return r,
         }

@@ -19,7 +19,8 @@ maxheight and chain, and answer {items, next_cursor, as_of}. A filtered page can
 limit while next_cursor is set: follow it until it is null. A cursor whose block was reorged away \
 answers 400 'cursor invalidated by reorg'. Balances and tokens come from /local reconciles: every \
 balance row carries as_of_height and stale. Search routes run under a shared gate (503 when \
-search.concurrency searches run, 429 when the client already runs search.per_client) and answer \
+search.concurrency searches run; past search.per_client a client's searches wait their turn, 429 \
+only when 3 more already wait, 504 when the deadline passes while waiting) and answer \
 truncated: true when their deadline or a cap cut them. NFT holdings come from marmalade ledger events and /local \
 (source event or local)."
     ),
@@ -67,8 +68,8 @@ Errors are plain text. List routes (/txs/account, /txs/events, /txs/search) take
 and answer a JSON array with the next page's token in the Chainweb-Next header. Genesis \
 transactions are hidden on the list routes. Every data route answers 429 (per-client rate), \
 503 (too many requests in flight, or an answer over api.max_body_mb) and 504 (the 5 s \
-deadline; /v1/txs has its own 30 s deadline, slot pool and body cap, see the route). Search routes run under a shared gate (503 when search.concurrency searches run, \
-429 when the client already runs search.per_client). CORS is open and Chainweb-Next and \
+deadline; /v1/txs has its own 30 s deadline, slot pool and body cap, see the route). Search routes run under a shared gate (503 when search.concurrency searches run; \
+past search.per_client a client's searches wait their turn, 429 only when 3 more already wait). CORS is open and Chainweb-Next and \
 X-Count-Age are exposed."
     ),
     servers((url = "/", description = "This server (same origin)")),

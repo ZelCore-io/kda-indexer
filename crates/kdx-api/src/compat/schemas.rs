@@ -194,8 +194,9 @@ pub struct Stats {
 #[derive(IntoResponses)]
 pub enum LimitErrors {
     /// The per-client request rate (`api.rate_per_ip`, `api.rate_burst`) is used up, or, on a
-    /// search route, the client already runs `search.per_client` searches. Retry after the
-    /// `Retry-After` seconds.
+    /// search route, the client already runs `search.per_client` searches and has 3 more
+    /// waiting (a search past `search.per_client` waits its turn, it is not refused). Retry
+    /// after the `Retry-After` seconds.
     #[response(
         status = 429,
         content_type = "text/plain",
@@ -207,18 +208,22 @@ pub enum LimitErrors {
     /// running, or (on `/stats`) the first count is not ready. On `/txs/events`, `/txs/search`
     /// and `/v1/txs`, which take a per-client heavy-read slot, a client that already runs one
     /// heavy request and has others waiting is refused too (`this client already runs a heavy
-    /// request and has others waiting: retry when they are done`). Search refusals and
-    /// `/stats` carry `Retry-After`; the in-flight, body-size and heavy-read refusals do not.
+    /// request and has others waiting: retry when they are done`). Search refusals, the
+    /// heavy-read refusal and `/stats` carry `Retry-After`; the in-flight and body-size
+    /// refusals do not.
     #[response(
         status = 503,
         content_type = "text/plain",
-        headers(("Retry-After" = String, description = "Seconds to wait; absent on the in-flight, body-size and heavy-read refusals."))
+        headers(("Retry-After" = String, description = "Seconds to wait; absent on the in-flight and body-size refusals."))
     )]
     Unavailable(String),
     /// A read failed; the cause is logged, the body is `internal error`.
     #[response(status = 500, content_type = "text/plain")]
     Internal(String),
     /// The request ran past `api.deadline_ms` (5 s by default): `request deadline exceeded`.
+    /// On a search route, a search still waiting behind the client's earlier ones at the
+    /// deadline answers `request deadline exceeded while waiting for this client's earlier
+    /// searches`, with `Retry-After: 1`.
     #[response(status = 504, content_type = "text/plain")]
     Deadline(String),
 }
@@ -235,11 +240,11 @@ pub enum V1TxsLimitErrors {
         headers(("Retry-After" = String, description = "Seconds to wait (1)."))
     )]
     TooManyRequests(String),
-    /// Refused, without `Retry-After`: `api.max_in_flight` requests are running; no
-    /// `/v1/txs` slot freed within `api.deadline_ms` (5 s by default), `too many /v1/txs
-    /// requests running: retry later`; the client already runs a heavy request and has others
-    /// waiting (`this client already runs a heavy request and has others waiting: retry when
-    /// they are done`); or the answer is larger than `api.v1txs_max_body_mb`
+    /// Refused: `api.max_in_flight` requests are running; no `/v1/txs` slot freed within
+    /// `api.deadline_ms` (5 s by default), `too many /v1/txs requests running: retry later`;
+    /// the client already runs a heavy request and has others waiting (`this client already
+    /// runs a heavy request and has others waiting: retry when they are done`, the only one
+    /// with `Retry-After: 1`); or the answer is larger than `api.v1txs_max_body_mb`
     /// (`response larger than N MB: use a smaller limit`).
     #[response(status = 503, content_type = "text/plain")]
     Unavailable(String),

@@ -78,6 +78,12 @@ pub struct GraphqlBody {
     pub len: usize,
 }
 
+/// Which of our own limiters refused the request, handed to the log in the response's
+/// extensions by the refusal (`rate`, `in_flight`, `deadline`, `heavy_queue`, `v1txs_slots`,
+/// `search_client`, `search_wait`, `search_global`). Absent when no limiter refused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reject(pub &'static str);
+
 /// One request, as the request path hands it to the writer.
 #[derive(Debug)]
 pub struct Entry {
@@ -94,6 +100,8 @@ pub struct Entry {
     pub tips: Option<(i64, i64)>,
     pub lag: Option<i64>,
     pub body: Option<GraphqlBody>,
+    /// [`Reject`]: the limiter that refused the request.
+    pub reject: Option<&'static str>,
 }
 
 impl Entry {
@@ -139,6 +147,9 @@ impl Entry {
         }
         if self.local {
             v["local"] = Value::Bool(true);
+        }
+        if let Some(r) = self.reject {
+            v["reject"] = Value::String(r.into());
         }
         if let Some((lo, hi)) = self.tips {
             v["tip_min"] = lo.into();
@@ -466,6 +477,7 @@ pub async fn layer(
     let local = ip.is_some_and(is_loopback);
     let mut resp = next.run(req).await;
     let body = resp.extensions_mut().remove::<GraphqlBody>();
+    let reject = resp.extensions().get::<Reject>().map(|r| r.0);
     let m = kdx_metrics::get();
     log.submit(Entry {
         unix_ms,
@@ -480,6 +492,7 @@ pub async fn layer(
         tips: m.indexed_tip_range(),
         lag: m.max_chain_lag(),
         body,
+        reject,
     });
     resp
 }
@@ -518,7 +531,19 @@ mod tests {
                 body: Some(Bytes::from(b.to_string())),
                 len: b.len(),
             }),
+            reject: None,
         }
+    }
+
+    #[test]
+    fn reject_only_when_a_limiter_refused() {
+        let mut e = entry(None);
+        let v: Value = serde_json::from_str(&e.to_line(4096)).unwrap();
+        assert!(v.get("reject").is_none(), "{v}");
+        e.status = 429;
+        e.reject = Some("search_client");
+        let v: Value = serde_json::from_str(&e.to_line(4096)).unwrap();
+        assert_eq!(v["reject"], "search_client");
     }
 
     #[test]
