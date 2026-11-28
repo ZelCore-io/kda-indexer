@@ -159,12 +159,31 @@ class Classes(unittest.TestCase):
         self.assertEqual(H.item_class(verdict_line(1, "match", "allowlisted")), "allowlisted")
         self.assertEqual(H.item_class(verdict_line(1, "match", "skew")), "timing")
         self.assertEqual(H.item_class(verdict_line(1, "match", "diff")), "unexplained")
-        self.assertEqual(H.item_class(verdict_line(1, "legacy-cmd")), "unexplained")
+        self.assertEqual(H.item_class(verdict_line(1, "legacy-cmd")), "unexplained",
+                         "no record: not proof of equality")
         self.assertEqual(H.item_class(verdict_line(1, "something-new")), "unexplained")
         self.assertEqual(H.item_class(verdict_line(1, "b-error")), "stock-unavailable")
         self.assertEqual(H.item_class(verdict_line(1, "a-error", "diff")), "ours-error")
         self.assertEqual(H.item_class(verdict_line(1, skip="tip-only")), "not-compared")
         self.assertEqual(H.item_class(verdict_line(1, "known-gap", "match")), "known-gap")
+
+    def test_legacy_cmd_without_differences_is_legacy_equal(self):
+        # 2026-11-28T09: two old /txs/txs?requestkey= replays came back legacy-cmd on the node
+        # pair with diff [] (every field equal) and failed the hour as unexplained.
+        def legacy(diff, *others):
+            line = verdict_line(1, *others)
+            line["outcomes"].append({"class": "legacy-cmd", "allowlist": [],
+                                     "record": {"a_target": "compat", "b_target": "node", "diff": diff}})
+            return line
+        self.assertEqual(H.item_class(legacy([], "match", "match")), "legacy-equal")
+        self.assertEqual(H.item_class(legacy([])), "legacy-equal")
+        # Any difference stays unexplained; so does a worse class of another pair.
+        self.assertEqual(H.item_class(legacy([{"path": "/0/code", "kind": "Changed"}], "match")),
+                         "unexplained")
+        self.assertEqual(H.item_class(legacy([], "diff")), "unexplained")
+        self.assertEqual(H.item_class(legacy([], "a-error")), "ours-error")
+        self.assertEqual(H.item_class(legacy(None, "match")), "unexplained")
+        self.assertIn("legacy-equal", H.COMPARED)
 
     def test_signature_ignores_numbers_in_paths(self):
         a = {"outcomes": [{"class": "diff", "record": {"diff": [{"path": "/rows/3/amount", "kind": "Changed"}]}}]}
